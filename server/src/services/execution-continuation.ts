@@ -14,6 +14,13 @@ import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
+export class StaleExecutionContinuationError extends Error {
+  constructor(readonly code: "continuation_task_ownership_changed") {
+    super(code);
+    this.name = "StaleExecutionContinuationError";
+  }
+}
+
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
     ? (v as Record<string, unknown>)
@@ -103,7 +110,7 @@ export async function buildExecutionContinuation(input: {
     issue.assigneeAgentId !== input.agentId ||
     ["done", "cancelled"].includes(issue.status)
   )
-    throw new Error("continuation_task_ownership_changed");
+    throw new StaleExecutionContinuationError("continuation_task_ownership_changed");
   const rows = await db
     .select()
     .from(issueComments)

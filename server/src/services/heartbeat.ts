@@ -6886,6 +6886,10 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
+  // A parked backlog issue stays parked unless it is explicitly assigned.
+  // Continuation, timer and comment wakes used to flip it back to
+  // in_progress, which let a parked issue loop.
+  if (issueStatus === "backlog" && wakeReason !== "issue_assigned") return false;
 
   return true;
 }

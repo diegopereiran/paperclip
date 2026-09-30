@@ -121,6 +121,28 @@ export function assertCompanyAccess(req: Request, companyId: string) {
 }
 
 /**
+ * True for a signed-in board user whose membership in `companyId` has the
+ * viewer role. Instance admins and local-implicit actors are never viewers.
+ */
+export function isCompanyViewer(req: Request, companyId: string): boolean {
+  if (req.actor.type !== "board" || req.actor.source === "local_implicit") return false;
+  if (req.actor.isInstanceAdmin || !Array.isArray(req.actor.memberships)) return false;
+  const membership = req.actor.memberships.find((item) => item.companyId === companyId);
+  return membership?.membershipRole === "viewer";
+}
+
+/**
+ * Viewers follow issue work but do not read company internals (agent
+ * configuration, run transcripts, costs, activity, secrets). Call after the
+ * route's company access check.
+ */
+export function assertNotCompanyViewer(req: Request, companyId: string, subject: string) {
+  if (isCompanyViewer(req, companyId)) {
+    throw forbidden(`Viewer access does not include ${subject}`);
+  }
+}
+
+/**
  * Non-throwing access check for routes that look up a resource by id
  * before responding. Prefer this over `assertCompanyAccess` whenever the
  * route can reach the access check only after a successful `getById`

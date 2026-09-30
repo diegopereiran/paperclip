@@ -423,19 +423,21 @@ export function Dashboard() {
                 </span>
               }
             />
-            <MetricCard
-              icon={DollarSign}
-              value={formatCents(data.costs.monthSpendCents)}
-              label="Month Spend"
-              to="/costs"
-              description={
-                <span>
-                  {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
-                </span>
-              }
-            />
+            {data.costs && (
+              <MetricCard
+                icon={DollarSign}
+                value={formatCents(data.costs.monthSpendCents)}
+                label="Month Spend"
+                to="/costs"
+                description={
+                  <span>
+                    {data.costs.monthBudgetCents > 0
+                      ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
+                      : "Unlimited budget"}
+                  </span>
+                }
+              />
+            )}
             <MetricCard
               icon={ShieldCheck}
               value={data.pendingApprovals + data.budgets.pendingApprovals}

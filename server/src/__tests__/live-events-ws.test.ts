@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
+import { liveEventForSubscriber, setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
 
 vi.mock("../middleware/logger.js", () => ({
@@ -179,5 +179,35 @@ describe("setupLiveEventsWebSocketServer", () => {
 
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
+  });
+});
+
+describe("liveEventForSubscriber (viewer transcript filter)", () => {
+  const viewer = { viewer: true };
+  const member = { viewer: false };
+
+  it.each(["heartbeat.run.log", "heartbeat.run.event"])("drops %s for a viewer", (type) => {
+    expect(liveEventForSubscriber(viewer, { type, payload: { runId: "run-1", chunk: "transcript" } })).toBeNull();
+  });
+
+  it("blanks the assistant snippet and tool name in run progress for a viewer", () => {
+    const event = {
+      type: "heartbeat.run.progress",
+      payload: { runId: "run-1", phase: "running", lastAssistantSnippet: "transcript text", currentToolName: "Bash" },
+    };
+    expect(liveEventForSubscriber(viewer, event)).toEqual({
+      type: "heartbeat.run.progress",
+      payload: { runId: "run-1", phase: "running", lastAssistantSnippet: null, currentToolName: null },
+    });
+  });
+
+  it("keeps run status events for a viewer", () => {
+    const event = { type: "heartbeat.run.status", payload: { runId: "run-1", status: "running" } };
+    expect(liveEventForSubscriber(viewer, event)).toBe(event);
+  });
+
+  it("passes every event unchanged to a non-viewer", () => {
+    const event = { type: "heartbeat.run.log", payload: { runId: "run-1", chunk: "transcript" } };
+    expect(liveEventForSubscriber(member, event)).toBe(event);
   });
 });

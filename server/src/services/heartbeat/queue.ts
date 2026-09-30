@@ -39,6 +39,7 @@ import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
+import { createStageWakeLeaseRetry } from "../stage-wake-lease-retry.js";
 import {
   getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
@@ -2128,6 +2129,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
+  const stageWakeLeaseRetry = createStageWakeLeaseRetry<WakeupOptions>({
+    enqueue: (retryAgentId, retryOpts) => enqueueWakeup(retryAgentId, retryOpts),
+    onGiveUp: (key, attempts) => logger.warn({ key, attempts }, "stage wake still blocked by environment lease; giving up"),
+    onError: (key, err) => logger.warn({ err, key }, "stage wake lease retry failed"),
+  });
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -3304,6 +3311,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
             } else {
+              // Local patch (paperclip#13532): a stage wake blocked only by an
+              // unreleased lease is retried after the lease is released.
+              if (executionBlocker.cause === "execution_owner_active" && !executionBlocker.recoveryActionId &&
+                  (parseObject(payload).executionStage || parseObject(enrichedContextSnapshot).executionStage)) {
+                stageWakeLeaseRetry.schedule(agentId, issue.id, opts);
+              }
               await recordExecutionWait(tx as unknown as Db, {
                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,
                 request: {

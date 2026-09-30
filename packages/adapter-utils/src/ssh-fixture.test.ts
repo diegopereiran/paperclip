@@ -272,6 +272,49 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toBe("hello over ssh stdin\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("stops the remote command when the local ssh client is killed (#14704)", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH remote orphan test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const marker = `pc-orphan-probe-${process.pid}-${Date.now()}`;
+    // Two commands keep the shell alive, so its command line carries the marker.
+    const target = await buildSshSpawnTarget({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      command: "sh",
+      args: ["-c", `sleep 120; echo ${marker}`],
+      env: {},
+    });
+    const remoteRunning = async () => {
+      const result = await new Promise<string>((resolve) => {
+        // Anchor on the remote shell's own command line; the local ssh client's
+        // arguments also contain the marker and must not count as "remote".
+        execFile("pgrep", ["-f", `^sh -c sleep 120; echo ${marker}$`], (_error, stdout) => resolve(stdout.trim()));
+      });
+      return result.length > 0;
+    };
+    const client = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"] });
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!(await remoteRunning()) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      expect(await remoteRunning()).toBe(true);
+
+      client.kill("SIGTERM");
+      const stopDeadline = Date.now() + 20_000;
+      while ((await remoteRunning()) && Date.now() < stopDeadline) await new Promise((r) => setTimeout(r, 250));
+      expect(await remoteRunning()).toBe(false);
+    } finally {
+      client.kill("SIGKILL");
+      // Kill the whole remote process group so no `sleep` child is left behind.
+      await new Promise<void>((resolve) =>
+        execFile("sh", ["-c", `for p in $(pgrep -f '^sh -c sleep 120; echo ${marker}$'); do kill -KILL -$(ps -o pgid= -p $p | tr -d ' ') 2>/dev/null; done; true`], () => resolve()),
+      );
+      await target.cleanup();
+    }
+  }, 45_000);
+
   it("does not treat an unrelated reused pid as the running fixture", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

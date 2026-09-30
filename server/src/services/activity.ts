@@ -189,6 +189,7 @@ export function activityService(db: Db) {
         status: issues.status,
         title: issues.title,
         description: issues.description,
+        workMode: issues.workMode,
       })
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))

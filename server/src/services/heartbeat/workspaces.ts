@@ -2877,6 +2877,19 @@ async function resolveInstructionsConfigFingerprintMetadata(
   return metadata;
 }
 
+// Heartbeat keys that only decide when runs start. They never change what a
+// session sees, so a caps-only edit must not throw away warm sessions.
+const SCHEDULER_ONLY_HEARTBEAT_KEYS = ["maxDailyRuns", "maxConcurrentRuns", "skipTimerWhenNoActionableWork"];
+
+function withoutSchedulerOnlyHeartbeatKeys(agentRuntimeConfig: unknown): unknown {
+  const runtime = parseObject(agentRuntimeConfig);
+  const heartbeat = parseObject(runtime.heartbeat);
+  if (!SCHEDULER_ONLY_HEARTBEAT_KEYS.some((key) => key in heartbeat)) return agentRuntimeConfig;
+  const kept = { ...heartbeat };
+  for (const key of SCHEDULER_ONLY_HEARTBEAT_KEYS) delete kept[key];
+  return { ...runtime, heartbeat: kept };
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -2902,6 +2915,9 @@ function buildSessionConfigCategoryValues(input: {
   // the timestamp here makes every comment invalidate an otherwise reusable
   // task session.
   delete workspaceConfig.issueConfigRevisionAt;
+  // Same for the project row: projectPolicy is hashed by content below, and
+  // any project edit (name, color, ...) advances updatedAt.
+  delete workspaceConfig.projectConfigRevisionAt;
   // This row is runtime state, not requested configuration. It is absent
   // before the first reusable run is realized and present on the next turn;
   // fingerprinting that transition would rotate the native session exactly
@@ -2910,6 +2926,19 @@ function buildSessionConfigCategoryValues(input: {
   // boundary; the reusable row and its evolving generation are state.
   delete workspaceConfig.existingExecutionWorkspace;
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
+  // The selected environment's config is hashed by content; its row timestamp
+  // advances on unrelated edits.
+  const environment = parseObject(input.environment);
+  const selectedEnvironment = parseObject(environment.selectedEnvironment);
+  const environmentForFingerprint =
+    "configRevisionAt" in selectedEnvironment
+      ? {
+          ...environment,
+          selectedEnvironment: Object.fromEntries(
+            Object.entries(selectedEnvironment).filter(([key]) => key !== "configRevisionAt"),
+          ),
+        }
+      : input.environment;
   return {
     adapter: {
       adapterType: input.adapterType,
@@ -2917,11 +2946,11 @@ function buildSessionConfigCategoryValues(input: {
       agentConfigRevision: input.agentConfigRevision,
     },
     adapterConfig: input.effectiveAdapterConfig,
-    agentRuntimeConfig: input.agentRuntimeConfig,
+    agentRuntimeConfig: withoutSchedulerOnlyHeartbeatKeys(input.agentRuntimeConfig),
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig,
-    environment: input.environment,
+    environment: environmentForFingerprint,
     envBindings: {
       environment: { env: input.environmentEnv },
       project: { env: input.projectEnv },

@@ -387,6 +387,24 @@ type SessionCompactionDecision = {
   previousRunId: string | null;
 };
 
+// Revisions that only touched runtimeConfig or adapterConfig add nothing to the
+// session fingerprint: both are already hashed by content (scheduler-only keys
+// excluded). Fingerprint the latest revision that changed anything else
+// (name, role, capabilities, environment, ...).
+const CONTENT_HASHED_AGENT_CONFIG_KEYS = new Set(["runtimeConfig", "adapterConfig"]);
+
+export function selectSessionFingerprintAgentConfigRevision<
+  T extends { changedKeys: unknown },
+>(revisionsNewestFirst: readonly T[]): T | null {
+  for (const revision of revisionsNewestFirst) {
+    const keys = Array.isArray(revision.changedKeys) ? revision.changedKeys : [];
+    if (keys.length === 0 || keys.some((key) => !CONTENT_HASHED_AGENT_CONFIG_KEYS.has(String(key)))) {
+      return revision;
+    }
+  }
+  return null;
+}
+
 export function summarizeHeartbeatRunContextSnapshot(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> | null {
@@ -1142,8 +1160,8 @@ export function createHeartbeatRunState(db: Db) {
         desc(agentConfigRevisions.createdAt),
         desc(agentConfigRevisions.id),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .limit(50)
+      .then((rows) => selectSessionFingerprintAgentConfigRevision(rows));
   }
 
   async function getTaskSession(

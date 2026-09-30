@@ -240,7 +240,8 @@ export async function terminalizeLegacyExecution(input: {
             ),
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'conversation_continuation'`,
+              // Port of the #14234 guard: any automatic no-replay disposition for this run is a decision.
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' in ('blocked', 'conversation_continuation')`,
             ),
           ),
         )).limit(1);

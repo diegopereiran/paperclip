@@ -1294,8 +1294,8 @@ export function computeInboxBadgeData({
   ).length;
   const visibleMineIssues = mineIssues.filter((issue) => issue.isUnreadForMe).length;
   const agentErrorCount = dashboard?.agents.error ?? 0;
-  const monthBudgetCents = dashboard?.costs.monthBudgetCents ?? 0;
-  const monthUtilizationPercent = dashboard?.costs.monthUtilizationPercent ?? 0;
+  const monthBudgetCents = dashboard?.costs?.monthBudgetCents ?? 0;
+  const monthUtilizationPercent = dashboard?.costs?.monthUtilizationPercent ?? 0;
   const showAggregateAgentError =
     agentErrorCount > 0 &&
     failedRuns === 0 &&

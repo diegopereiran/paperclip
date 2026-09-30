@@ -82,7 +82,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, assertNotCompanyViewer, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess, isCompanyViewer } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -1141,6 +1141,12 @@ export function agentRoutes(
     return false;
   }
 
+  async function assertRunContentReadAllowed(req: Request, res: Response, companyId: string) {
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return false;
+    assertNotCompanyViewer(req, companyId, "run transcripts");
+    return true;
+  }
+
   async function filterAgentsForActor<T extends Record<string, unknown>>(
     req: Request,
     rows: T[],
@@ -1964,8 +1970,10 @@ export function agentRoutes(
     //
     // For AGENT actors we keep a stricter gate: an agent must have either
     // agents:configure or agents:suggest-changes before it can inspect peer
-    // agent configuration for a proposed diff.
+    // agent configuration for a proposed diff. Viewers are the exception on
+    // the board side: they follow issue work, not agent internals.
     assertCompanyAccess(req, companyId);
+    assertNotCompanyViewer(req, companyId, "agent configuration");
     if (req.actor.type === "agent") {
       const decision = await access.decide({
         actor: req.actor,
@@ -1999,7 +2007,7 @@ export function agentRoutes(
     } catch {
       return false;
     }
-    if (req.actor.type === "board") return true;
+    if (req.actor.type === "board") return !isCompanyViewer(req, companyId);
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:read",
@@ -6669,7 +6677,7 @@ export function agentRoutes(
     const runId = req.params.runId as string;
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(await runRedactions.redactForRun(
@@ -7143,7 +7151,7 @@ export function agentRoutes(
     const runId = req.params.runId as string;
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
@@ -7162,7 +7170,7 @@ export function agentRoutes(
     const runId = req.params.runId as string;
     const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
@@ -7179,7 +7187,7 @@ export function agentRoutes(
     const runId = req.params.runId as string;
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const context = asRecord(run.contextSnapshot);
     const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
@@ -7191,7 +7199,7 @@ export function agentRoutes(
     const operationId = req.params.operationId as string;
     const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
     if (!operation) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, operation.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, operation.companyId))) return;
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);

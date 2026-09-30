@@ -4,7 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, assertNotCompanyViewer, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
@@ -222,6 +222,7 @@ export function activityRoutes(db: Db) {
   router.get("/companies/:companyId/activity", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertNotCompanyViewer(req, companyId, "the activity log");
     if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
 
     const filters = {
@@ -247,6 +248,7 @@ export function activityRoutes(db: Db) {
       await assertAgentAuditPermission(req, companyId);
     } else {
       assertCompanyAccess(req, companyId);
+      assertNotCompanyViewer(req, companyId, "the activity log");
       if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
     }
 

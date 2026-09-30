@@ -119,6 +119,7 @@ export {
   describeSessionResetReason,
   normalizeSessionParams,
   resolveNextSessionState,
+  selectSessionFingerprintAgentConfigRevision,
 } from "./heartbeat/run-state.js";
 
 import {

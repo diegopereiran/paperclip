@@ -14,6 +14,8 @@ import {
 
 export interface DeleteChatButtonProps {
   agentName: string;
+  /** Names of documents on the conversation; the delete removes them too. */
+  documentNames?: string[];
   onDelete: () => void | Promise<void>;
   pending?: boolean;
 }
@@ -21,6 +23,7 @@ export interface DeleteChatButtonProps {
 /** Confirmed, permanent delete of the current agent conversation. */
 export function DeleteChatButton({
   agentName,
+  documentNames = [],
   onDelete,
   pending,
 }: DeleteChatButtonProps) {
@@ -44,6 +47,13 @@ export function DeleteChatButton({
             This permanently deletes your conversation with {agentName}. This
             cannot be undone.
           </AlertDialogDescription>
+          {documentNames.length > 0 ? (
+            <p role="alert" className="text-sm font-medium text-destructive">
+              It also deletes {documentNames.length === 1 ? "this document" : `these ${documentNames.length} documents`}:{" "}
+              {documentNames.join(", ")}. Move them to another task first if
+              you need them.
+            </p>
+          ) : null}
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>

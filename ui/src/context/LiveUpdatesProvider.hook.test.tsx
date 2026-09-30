@@ -170,9 +170,12 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
     vi.unstubAllGlobals();
   });
 
-  async function receiveStatus(payload: Record<string, unknown>) {
+  async function receiveStatus(
+    payload: Record<string, unknown>,
+    providerProps: { liveActivityToasts?: boolean } = { liveActivityToasts: true },
+  ) {
     await reactAct(async () => {
-      root!.render(<QueryClientProvider client={queryClient}><LiveUpdatesProvider><span>Visible task</span></LiveUpdatesProvider></QueryClientProvider>);
+      root!.render(<QueryClientProvider client={queryClient}><LiveUpdatesProvider {...providerProps}><span>Visible task</span></LiveUpdatesProvider></QueryClientProvider>);
     });
     await vi.waitFor(() => expect(sockets).toHaveLength(1));
     expect(sockets[0]?.onmessage).toBeTypeOf("function");
@@ -197,6 +200,11 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
     });
     await vi.waitFor(() => expect(sockets).toHaveLength(2));
     expect(invalidate).toHaveBeenCalledExactlyOnceWith({ type: "active" }, { cancelRefetch: false });
+  });
+
+  it("does not toast live run activity by default", async () => {
+    await receiveStatus({ runId: "unrelated-run", agentId: "parent-agent", status: "failed", startedAt: "2026-09-09T17:59:00.000Z", finishedAt: "2026-09-09T18:00:00.000Z", deliveryId: "status-delivery" }, {});
+    expect(pushToast).not.toHaveBeenCalled();
   });
 
   it.each(["parent-agent", "child-agent"])("shows an unrelated retryable failure without issueId for %s", async (agentId) => {

@@ -1858,12 +1858,24 @@ function canUseLiveSession(sessionStatus: string, hasSession: boolean, deploymen
   return sessionStatus === "success" && (hasSession || deploymentMode === "local_trusted");
 }
 
-export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
+export function LiveUpdatesProvider({
+  children,
+  liveActivityToasts = false,
+}: {
+  children: ReactNode;
+  liveActivityToasts?: boolean;
+}) {
   const { visible } = usePageVisibility();
   const wasHidden = useRef(!visible);
   const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
-  const { pushToast } = useToastActions();
+  const { pushToast: pushAnyToast } = useToastActions();
+  // Live agent activity already reaches the Inbox. Toasting it as well stacks
+  // batches over the bottom-left of the UI, so it is off unless requested.
+  const pushToast = useMemo(
+    () => (liveActivityToasts ? pushAnyToast : () => null),
+    [liveActivityToasts, pushAnyToast],
+  );
   const location = useLocation();
   const gateRef = useRef<ToastGate>({
     cooldownHits: new Map(),

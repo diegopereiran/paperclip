@@ -12,6 +12,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
+import { createStageWakeLeaseRetry } from "./stage-wake-lease-retry.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
@@ -25700,6 +25701,12 @@ export function heartbeatService(
     }
   }
 
+  const stageWakeLeaseRetry = createStageWakeLeaseRetry<WakeupOptions>({
+    enqueue: (retryAgentId, retryOpts) => enqueueWakeup(retryAgentId, retryOpts),
+    onGiveUp: (key, attempts) => logger.warn({ key, attempts }, "stage wake still blocked by environment lease; giving up"),
+    onError: (key, err) => logger.warn({ err, key }, "stage wake lease retry failed"),
+  });
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -26642,6 +26649,12 @@ export function heartbeatService(
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
             } else {
+              // Local patch (paperclip#13532): a stage wake blocked only by an
+              // unreleased lease is retried after the lease is released.
+              if (executionBlocker.cause === "execution_owner_active" && !executionBlocker.recoveryActionId &&
+                  (parseObject(payload).executionStage || parseObject(enrichedContextSnapshot).executionStage)) {
+                stageWakeLeaseRetry.schedule(agentId, issue.id, opts);
+              }
               await recordExecutionWait(tx as unknown as Db, {
                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,
                 request: {

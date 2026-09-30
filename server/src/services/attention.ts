@@ -166,7 +166,20 @@ type AttentionListOptions = AttentionFeedQuery & {
   excludeSources?: readonly AttentionSourceKind[];
   /** Count the canonical complete set without card bodies or presentation reads. */
   summaryOnly?: boolean;
+  /** Board view: drop rows the board cannot decide in place (see NON_DECIDABLE_BOARD_KINDS). */
+  decidableOnly?: boolean;
 };
+
+// Rows with nothing to decide on the Decisions board: they only offer Open or
+// Dismiss. The Inbox already shows each of them (Blocked tab, failed runs,
+// alerts), so the board route leaves them out; other callers still get them.
+const NON_DECIDABLE_BOARD_KINDS: ReadonlySet<AttentionSourceKind> = new Set<AttentionSourceKind>([
+  "recovery_action",
+  "blocker_attention",
+  "failed_run",
+  "agent_error_alert",
+  "budget_alert",
+]);
 
 type AttentionServiceOptions = {
   openDecisionLimit?: number;
@@ -1098,6 +1111,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const collected: AttentionItem[] = [];
 
       const add = (item: AttentionItem) => {
+        if (options.decidableOnly && NON_DECIDABLE_BOARD_KINDS.has(item.sourceKind)) return;
         const dismissal = activeDismissalState(dismissals, item.dismissalKey, item.activityAt, now);
         if (!includeDismissed && dismissal?.isActive) return;
         collected.push({ ...item, dismissal });

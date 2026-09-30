@@ -20,7 +20,7 @@ import {
   accessService,
   logActivity,
 } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertNotCompanyViewer, getAccessibleResource, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -73,6 +73,7 @@ export function costRoutes(
   }
 
   async function assertCompanyCostReadAllowed(req: Parameters<typeof assertCompanyAccess>[0], res: any, companyId: string) {
+    assertNotCompanyViewer(req, companyId, "costs");
     const decision = await access.decide({
       actor: req.actor,
       action: "company_scope:read",
@@ -92,6 +93,7 @@ export function costRoutes(
     assigneeUserId: string | null;
     status: string;
   }) {
+    assertNotCompanyViewer(req, issue.companyId, "costs");
     const decision = await access.decide({
       actor: req.actor,
       action: "issue:read",
@@ -274,6 +276,7 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertBoard(req);
+    assertNotCompanyViewer(req, companyId, "costs");
     // validate companyId resolves to a real company so the "__none__" sentinel
     // and any forged ids are rejected before we touch provider credentials
     const company = await companies.getById(companyId);

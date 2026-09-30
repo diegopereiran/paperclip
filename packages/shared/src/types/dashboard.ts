@@ -44,11 +44,12 @@ export interface DashboardSummary {
     blocked: number;
     done: number;
   };
+  /** Null for viewers, who do not see company spend. */
   costs: {
     monthSpendCents: number;
     monthBudgetCents: number;
     monthUtilizationPercent: number;
-  };
+  } | null;
   pendingApprovals: number;
   budgets: {
     activeIncidents: number;

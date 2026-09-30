@@ -85,6 +85,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
+  getRunLogAccess: vi.fn(),
+  listEvents: vi.fn(),
+  readLog: vi.fn(),
   cancelRun: vi.fn(),
   cancelInvocationsForAgents: vi.fn(),
 }));
@@ -2053,6 +2056,85 @@ describe.sequential("agent permission routes", () => {
         action: "agent_config:read",
         resource: { type: "company", companyId },
       }));
+    });
+  });
+
+  describe("viewer read lockdown", () => {
+    // A viewer follows issue work but must not read agent internals, run
+    // transcripts, or run logs. The decision engine is mocked to allow
+    // everything here, so a 403 can only come from the viewer check.
+    const viewerActor = {
+      type: "board",
+      userId: "viewer-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    };
+    const operatorActor = {
+      ...viewerActor,
+      userId: "operator-user",
+      memberships: [{ companyId, status: "active", membershipRole: "operator" }],
+    };
+    const run = { id: "run-1", companyId, agentId, status: "succeeded", contextSnapshot: {} };
+
+    beforeEach(() => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      mockHeartbeatService.getRun.mockResolvedValue(run);
+      mockHeartbeatService.getRunLogAccess.mockResolvedValue(run);
+      mockHeartbeatService.listEvents.mockResolvedValue([]);
+      mockHeartbeatService.readLog.mockResolvedValue({ content: "", nextOffset: 0 });
+    });
+
+    it.each([
+      [`/api/agents/${agentId}/configuration`],
+      [`/api/agents/${agentId}/config-revisions`],
+      [`/api/companies/${companyId}/agent-configurations`],
+      [`/api/agents/${agentId}/skills`],
+      [`/api/agents/${agentId}/instructions-bundle`],
+      [`/api/agents/${agentId}/instructions-bundle/file?path=AGENTS.md`],
+    ])("denies a viewer GET %s", async (path) => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include agent configuration");
+    });
+
+    it("gives a viewer the restricted agent list without adapter config", async () => {
+      mockAgentService.list.mockResolvedValue([
+        { ...baseAgent, adapterConfig: { model: "secret-model" }, runtimeConfig: { heartbeat: { enabled: true } } },
+      ]);
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].runtimeConfig).toEqual({});
+    });
+
+    it.each([
+      ["events", "/api/heartbeat-runs/run-1/events", () => mockHeartbeatService.listEvents],
+      ["log", "/api/heartbeat-runs/run-1/log", () => mockHeartbeatService.readLog],
+    ])("denies a viewer the run %s", async (_name, path, readFn) => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include run transcripts");
+      expect(readFn()).not.toHaveBeenCalled();
+    });
+
+    it("still lets an operator read agent configuration and run events", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterConfig: {} });
+      const app = await createApp(operatorActor);
+
+      const config = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/configuration`));
+      expect(config.status).toBe(200);
+
+      const events = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/events"));
+      expect(events.status).toBe(200);
+      expect(mockHeartbeatService.listEvents).toHaveBeenCalled();
     });
   });
 

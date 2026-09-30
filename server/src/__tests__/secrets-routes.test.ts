@@ -1138,3 +1138,36 @@ describe("secret routes", () => {
     });
   });
 });
+
+describe("secret routes viewer read lockdown", () => {
+  beforeEach(() => {
+    for (const mock of Object.values(mockSecretService)) mock.mockReset();
+    mockSecretService.list.mockResolvedValue([]);
+  });
+
+  it("denies a viewer the company secrets list", async () => {
+    const res = await request(createApp({
+      type: "board",
+      userId: "viewer-user",
+      source: "session",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "viewer" }],
+    })).get("/api/companies/company-1/secrets");
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Viewer access does not include secrets");
+    expect(mockSecretService.list).not.toHaveBeenCalled();
+  });
+
+  it("still lets an operator list company secrets", async () => {
+    const res = await request(createApp({
+      type: "board",
+      userId: "operator-user",
+      source: "session",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "operator" }],
+    })).get("/api/companies/company-1/secrets");
+
+    expect(res.status).toBe(200);
+  });
+});

@@ -54,6 +54,28 @@ describe("DeleteChatButton", () => {
     expect(document.querySelector("[role=alertdialog]")).toBeNull();
   });
 
+  it("warns that the chat's documents are deleted too", async () => {
+    await render({ documentNames: ["CEO state", "plan"] });
+    await act(async () => {
+      document
+        .querySelector<HTMLButtonElement>('[aria-label="Delete chat with Planner"]')!
+        .click();
+    });
+    const warning = document.querySelector("[role=alertdialog] [role=alert]");
+    expect(warning?.textContent).toContain("these 2 documents");
+    expect(warning?.textContent).toContain("CEO state, plan");
+  });
+
+  it("shows no document warning for a chat without documents", async () => {
+    await render();
+    await act(async () => {
+      document
+        .querySelector<HTMLButtonElement>('[aria-label="Delete chat with Planner"]')!
+        .click();
+    });
+    expect(document.querySelector("[role=alertdialog] [role=alert]")).toBeNull();
+  });
+
   it("cancelling leaves the chat untouched", async () => {
     await render();
     await act(async () => {

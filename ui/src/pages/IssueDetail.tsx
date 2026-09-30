@@ -5440,6 +5440,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const persistedConversationIssueId = conversation
     ? (conversation.issue?.id ?? null)
     : (issue?.id ?? null);
+  const conversationDocumentsQuery = useQuery({
+    queryKey: persistedConversationIssueId
+      ? queryKeys.issues.documents(persistedConversationIssueId)
+      : ["agent-chat", "no-conversation-documents"],
+    queryFn: () => issuesApi.listDocuments(persistedConversationIssueId!),
+    enabled: Boolean(conversation && persistedConversationIssueId),
+  });
   const deleteConversation = useMutation({
     mutationFn: (id: string) => issuesApi.remove(id),
     onSuccess: (_data, id) => {
@@ -5473,6 +5480,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             {persistedConversationIssueId ? (
               <DeleteChatButton
                 agentName={conversationAgent.name}
+                documentNames={(conversationDocumentsQuery.data ?? []).map((doc) => doc.title || doc.key)}
                 pending={deleteConversation.isPending}
                 onDelete={async () => { await deleteConversation.mutateAsync(persistedConversationIssueId); }}
               />

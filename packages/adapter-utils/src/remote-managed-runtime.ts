@@ -149,8 +149,11 @@ export async function prepareRemoteManagedRuntime(input: {
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
+          // tar excludes .git at any depth, so nested checkouts (.paperclip-repositories/*/.git)
+          // never come back from the remote; keep them out of the baseline or the merge deletes them.
           ? [
               ...GIT_ARCHIVE_EXCLUDES,
+              "*/.git",
               ".paperclip-runtime",
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
             ]

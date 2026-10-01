@@ -64,6 +64,17 @@ describe("extractGitHubPullRequestRefs", () => {
     ]);
   });
 
+  it.each([
+    "../x#1",
+    "x/..#1",
+    "./x#1",
+    "x/.#1",
+    "https://github.com/../x/pull/1",
+    "https://github.com/x/../pull/1",
+  ])("rejects a dot-only owner or repository name in %s", (text) => {
+    expect(extractGitHubPullRequestRefs(text)).toEqual([]);
+  });
+
   it("caps the number of references per monitor", () => {
     const text = Array.from({ length: 50 }, (_, index) => `o/r#${index + 1}`).join(" ");
     expect(extractGitHubPullRequestRefs(text)).toHaveLength(20);
@@ -71,6 +82,16 @@ describe("extractGitHubPullRequestRefs", () => {
 });
 
 describe("parseGitHubPullRequestRefs", () => {
+  it("drops stored coordinates with a dot-only name", () => {
+    expect(
+      parseGitHubPullRequestRefs([
+        { owner: "..", repo: "orgs", number: 5 },
+        { owner: "o", repo: ".", number: 5 },
+        { owner: "o", repo: "r", number: 5 },
+      ]),
+    ).toEqual([{ owner: "o", repo: "r", number: 5 }]);
+  });
+
   it("accepts only well-formed coordinate objects and lower-cases them", () => {
     expect(
       parseGitHubPullRequestRefs([

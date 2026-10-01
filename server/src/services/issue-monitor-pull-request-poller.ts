@@ -122,7 +122,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
     if (isRateLimited(response)) {
       return { kind: "paused", seconds: Math.min(retryAfterSeconds(response), MAX_PAUSE_SECONDS), reason: "rate_limited" };
     }
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       return { kind: "paused", seconds: AUTH_PAUSE_SECONDS, reason: "auth" };
     }
     if (response.status !== 200) return { kind: "failed" };

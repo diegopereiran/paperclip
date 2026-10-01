@@ -1,3 +1,5 @@
+import { isValidGitHubName } from "./github-pull-request-refs.js";
+
 export type PullRequestCheckConclusion = "none" | "pending" | "success" | "failure";
 export type PullRequestFingerprintState = "open" | "closed" | "merged";
 
@@ -68,7 +70,8 @@ export function parsePullRequestState(value: unknown): Record<string, PullReques
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const parsed: Record<string, PullRequestFingerprint> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+#\d+$/.test(key)) continue;
+    const match = /^([a-z0-9_.-]+)\/([a-z0-9_.-]+)#\d+$/.exec(key);
+    if (!match || !isValidGitHubName(match[1]!) || !isValidGitHubName(match[2]!)) continue;
     const fingerprint = parsePullRequestFingerprint(entry);
     if (fingerprint) parsed[key] = fingerprint;
   }

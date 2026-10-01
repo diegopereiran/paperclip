@@ -455,19 +455,19 @@ export function Dashboard() {
 
           <div className={cn("grid grid-cols-2 gap-4", SHOW_TASK_PRIORITY_UI ? "lg:grid-cols-4" : "lg:grid-cols-3")}>
             <ChartCard title="Run Activity" subtitle="Last 14 days">
-              <RunActivityChart activity={data.runActivity} />
+              <RunActivityChart activity={data.runActivity} timeZone={data.timeZone} />
             </ChartCard>
             {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
             {SHOW_TASK_PRIORITY_UI && (
               <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
-                <PriorityChart issues={issues ?? []} />
+                <PriorityChart issues={issues ?? []} timeZone={data.timeZone} />
               </ChartCard>
             )}
             <ChartCard title="Tasks by Status" subtitle="Last 14 days">
-              <IssueStatusChart issues={issues ?? []} />
+              <IssueStatusChart issues={issues ?? []} timeZone={data.timeZone} />
             </ChartCard>
             <ChartCard title="Success Rate" subtitle="Last 14 days">
-              <SuccessRateChart activity={data.runActivity} />
+              <SuccessRateChart activity={data.runActivity} timeZone={data.timeZone} />
             </ChartCard>
           </div>
 

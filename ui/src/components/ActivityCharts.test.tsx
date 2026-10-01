@@ -120,6 +120,7 @@ describe("ActivityCharts", () => {
             succeeded: 3,
             failed: 1,
             recovered: 4,
+            handedOff: 0,
             other: 0,
             total: 8,
             failedByErrorCode: { process_lost: 1 },
@@ -131,5 +132,61 @@ describe("ActivityCharts", () => {
     expect(container.textContent).toContain("Recovered");
     const dayCell = container.querySelector("[title*='recovered: 4']");
     expect(dayCell).not.toBeNull();
+  });
+
+  it("counts handed-off runs as successes in the success rate", () => {
+    render(
+      <SuccessRateChart
+        activity={[
+          {
+            date: "2026-04-20",
+            succeeded: 1,
+            failed: 0,
+            recovered: 0,
+            handedOff: 3,
+            other: 0,
+            total: 4,
+            failedByErrorCode: {},
+          },
+        ]}
+      />,
+    );
+
+    expect(container.querySelector("[title='2026-04-20: 100% (4/4)']")).not.toBeNull();
+  });
+
+  it("shows handed-off runs as their own segment and tooltip line", () => {
+    render(
+      <RunActivityChart
+        activity={[
+          {
+            date: "2026-04-20",
+            succeeded: 1,
+            failed: 0,
+            recovered: 0,
+            handedOff: 3,
+            other: 0,
+            total: 4,
+            failedByErrorCode: {},
+          },
+        ]}
+      />,
+    );
+
+    expect(container.textContent).toContain("Handed off");
+    expect(container.querySelector("[title*='handed off: 3']")).not.toBeNull();
+  });
+
+  it("groups raw runs by calendar day in the given time zone", () => {
+    // 00:30 on 20 April in Auckland (NZST, UTC+12) is still 19 April in UTC.
+    render(
+      <RunActivityChart
+        timeZone="Pacific/Auckland"
+        runs={[createRun({ id: "run-nz", status: "succeeded", createdAt: new Date("2026-04-19T12:30:00.000Z") })]}
+      />,
+    );
+
+    expect(container.querySelector("[title^='2026-04-20: 1 run']")).not.toBeNull();
+    expect(container.querySelector("[title^='2026-04-19: 1 run']")).toBeNull();
   });
 });

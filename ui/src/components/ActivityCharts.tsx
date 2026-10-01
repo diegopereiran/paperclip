@@ -2,12 +2,26 @@ import type { DashboardRunActivityDay, HeartbeatRun } from "@paperclipai/shared"
 
 /* ---- Utilities ---- */
 
-export function getLast14Days(): string[] {
-  return Array.from({ length: 14 }, (_, i) => {
-    const d = new Date();
-    d.setDate(d.getDate() - (13 - i));
-    return d.toISOString().slice(0, 10);
-  });
+// Calendar day (YYYY-MM-DD) of `date` in `timeZone`. Without a time zone the
+// browser's own zone is used. The company dashboard passes the server host's
+// zone so these days match the server-side run activity buckets.
+export function dateKeyInZone(date: Date | string, timeZone?: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(date));
+}
+
+export function getLast14Days(timeZone?: string): string[] {
+  // Step calendar days from today's key, not 24 h from now, so a DST change
+  // cannot skip or repeat a day.
+  const [year, month, day] = dateKeyInZone(new Date(), timeZone).split("-").map(Number);
+  const today = Date.UTC(year!, month! - 1, day!);
+  return Array.from({ length: 14 }, (_, i) =>
+    new Date(today - (13 - i) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+  );
 }
 
 function formatDayLabel(dateStr: string): string {
@@ -16,12 +30,13 @@ function formatDayLabel(dateStr: string): string {
 }
 
 function emptyRunDay(date: string): DashboardRunActivityDay {
-  return { date, succeeded: 0, failed: 0, recovered: 0, other: 0, total: 0, failedByErrorCode: {} };
+  return { date, succeeded: 0, failed: 0, recovered: 0, handedOff: 0, other: 0, total: 0, failedByErrorCode: {} };
 }
 
 const runSegmentColors = {
   succeeded: "var(--status-task-icon-done)",
   recovered: "var(--status-task-todo)",
+  handedOff: "var(--status-task-in_review)",
   failed: "var(--status-task-icon-blocked)",
   other: "var(--hex-737373)",
 } as const;
@@ -31,6 +46,7 @@ function runDayTooltip(entry: DashboardRunActivityDay): string {
   const lines = [`${entry.date}: ${entry.total} run${entry.total === 1 ? "" : "s"}`];
   if (entry.succeeded > 0) lines.push(`  succeeded: ${entry.succeeded}`);
   if (entry.recovered > 0) lines.push(`  recovered: ${entry.recovered} (retry succeeded)`);
+  if ((entry.handedOff ?? 0) > 0) lines.push(`  handed off: ${entry.handedOff} (stage hand-off)`);
   if (entry.failed > 0) {
     lines.push(`  failed: ${entry.failed}`);
     const codes = Object.entries(entry.failedByErrorCode ?? {}).sort((a, b) => b[1] - a[1]);
@@ -83,16 +99,17 @@ export function ChartCard({ title, subtitle, children }: { title: string; subtit
 
 /* ---- Chart Components ---- */
 
-type RunChartProps =
+type RunChartProps = (
   | { activity?: DashboardRunActivityDay[] | null; runs?: never }
-  | { runs?: HeartbeatRun[] | null; activity?: never };
+  | { runs?: HeartbeatRun[] | null; activity?: never }
+) & { timeZone?: string };
 
-function aggregateRuns(runs: readonly HeartbeatRun[] = []): DashboardRunActivityDay[] {
-  const days = getLast14Days();
+function aggregateRuns(runs: readonly HeartbeatRun[] = [], timeZone?: string): DashboardRunActivityDay[] {
+  const days = getLast14Days(timeZone);
   const grouped = new Map<string, DashboardRunActivityDay>();
   for (const day of days) grouped.set(day, emptyRunDay(day));
   for (const run of runs) {
-    const day = new Date(run.createdAt).toISOString().slice(0, 10);
+    const day = dateKeyInZone(run.createdAt, timeZone);
     const entry = grouped.get(day);
     if (!entry) continue;
     if (run.status === "succeeded") {
@@ -114,24 +131,26 @@ function aggregateRuns(runs: readonly HeartbeatRun[] = []): DashboardRunActivity
 
 function resolveRunActivity(props: RunChartProps): DashboardRunActivityDay[] {
   if (Array.isArray(props.activity)) return props.activity;
-  if (Array.isArray(props.runs)) return aggregateRuns(props.runs);
+  if (Array.isArray(props.runs)) return aggregateRuns(props.runs, props.timeZone);
   return [];
 }
 
 export function RunActivityChart(props: RunChartProps) {
   const activity = resolveRunActivity(props);
-  const days = activity.length > 0 ? activity.map((day) => day.date) : getLast14Days();
+  const days = activity.length > 0 ? activity.map((day) => day.date) : getLast14Days(props.timeZone);
   const grouped = new Map(activity.map((day) => [day.date, day]));
 
   const maxValue = Math.max(...activity.map(v => v.total), 1);
   const hasData = activity.some(v => v.total > 0);
   const hasRecovered = activity.some(v => v.recovered > 0);
+  const hasHandedOff = activity.some(v => (v.handedOff ?? 0) > 0);
 
   if (!hasData) return <p className="text-xs text-muted-foreground">No runs yet</p>;
 
   const legendItems = [
     { color: runSegmentColors.succeeded, label: "Succeeded" },
     ...(hasRecovered ? [{ color: runSegmentColors.recovered, label: "Recovered" }] : []),
+    ...(hasHandedOff ? [{ color: runSegmentColors.handedOff, label: "Handed off" }] : []),
     { color: runSegmentColors.failed, label: "Failed" },
     { color: runSegmentColors.other, label: "Other" },
   ];
@@ -149,6 +168,7 @@ export function RunActivityChart(props: RunChartProps) {
                 <div className="flex flex-col-reverse gap-px overflow-hidden" style={{ height: `${heightPct}%`, minHeight: 2 }}>
                   {entry.succeeded > 0 && <div style={{ flex: entry.succeeded, backgroundColor: runSegmentColors.succeeded }} />}
                   {entry.recovered > 0 && <div style={{ flex: entry.recovered, backgroundColor: runSegmentColors.recovered }} />}
+                  {(entry.handedOff ?? 0) > 0 && <div style={{ flex: entry.handedOff, backgroundColor: runSegmentColors.handedOff }} />}
                   {entry.failed > 0 && <div style={{ flex: entry.failed, backgroundColor: runSegmentColors.failed }} />}
                   {entry.other > 0 && <div style={{ flex: entry.other, backgroundColor: runSegmentColors.other }} />}
                 </div>
@@ -174,12 +194,12 @@ const priorityColors: Record<string, string> = {
 
 const priorityOrder = ["critical", "high", "medium", "low"] as const;
 
-export function PriorityChart({ issues }: { issues: { priority: string; createdAt: Date }[] }) {
-  const days = getLast14Days();
+export function PriorityChart({ issues, timeZone }: { issues: { priority: string; createdAt: Date }[]; timeZone?: string }) {
+  const days = getLast14Days(timeZone);
   const grouped = new Map<string, Record<string, number>>();
   for (const day of days) grouped.set(day, { critical: 0, high: 0, medium: 0, low: 0 });
   for (const issue of issues) {
-    const day = new Date(issue.createdAt).toISOString().slice(0, 10);
+    const day = dateKeyInZone(issue.createdAt, timeZone);
     const entry = grouped.get(day);
     if (!entry) continue;
     if (issue.priority in entry) entry[issue.priority]++;
@@ -246,13 +266,13 @@ const statusLabels: Record<string, string> = {
   backlog: "Backlog",
 };
 
-export function IssueStatusChart({ issues }: { issues: { status: string; createdAt: Date }[] }) {
-  const days = getLast14Days();
+export function IssueStatusChart({ issues, timeZone }: { issues: { status: string; createdAt: Date }[]; timeZone?: string }) {
+  const days = getLast14Days(timeZone);
   const allStatuses = new Set<string>();
   const grouped = new Map<string, Record<string, number>>();
   for (const day of days) grouped.set(day, {});
   for (const issue of issues) {
-    const day = new Date(issue.createdAt).toISOString().slice(0, 10);
+    const day = dateKeyInZone(issue.createdAt, timeZone);
     const entry = grouped.get(day);
     if (!entry) continue;
     entry[issue.status] = (entry[issue.status] ?? 0) + 1;
@@ -295,7 +315,7 @@ export function IssueStatusChart({ issues }: { issues: { status: string; created
 
 export function SuccessRateChart(props: RunChartProps) {
   const activity = resolveRunActivity(props);
-  const days = activity.length > 0 ? activity.map((day) => day.date) : getLast14Days();
+  const days = activity.length > 0 ? activity.map((day) => day.date) : getLast14Days(props.timeZone);
   const grouped = new Map(activity.map((day) => [day.date, day]));
 
   const hasData = activity.some(v => v.total > 0);
@@ -306,9 +326,10 @@ export function SuccessRateChart(props: RunChartProps) {
       <div className="flex items-end gap-(--sz-3px) h-20">
         {days.map(day => {
           const entry = grouped.get(day) ?? emptyRunDay(day);
-          // Recovered runs ultimately succeeded, so they count toward the rate
-          // rather than dragging it down as failures.
-          const effectiveSucceeded = entry.succeeded + entry.recovered;
+          // Recovered runs ultimately succeeded, and handed-off runs finished
+          // their stage, so both count toward the rate instead of dragging it
+          // down.
+          const effectiveSucceeded = entry.succeeded + entry.recovered + (entry.handedOff ?? 0);
           const rate = entry.total > 0 ? effectiveSucceeded / entry.total : 0;
           const color = entry.total === 0 ? undefined : rate >= 0.8 ? "var(--status-task-icon-done)" : rate >= 0.5 ? "var(--hex-eab308)" : "var(--status-task-icon-blocked)";
           return (

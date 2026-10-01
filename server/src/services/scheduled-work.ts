@@ -11,6 +11,8 @@ export function registerScheduledWork(
     nextAgentTimerAt: () => Promise<number | null>;
     tickIssueMonitors: (signal: AbortSignal) => Promise<unknown>;
     nextIssueMonitorAt: () => Promise<number | null>;
+    tickPullRequestMonitors?: (signal: AbortSignal) => Promise<unknown>;
+    nextPullRequestMonitorPollAt?: () => Promise<number | null>;
     tickRoutines: (signal: AbortSignal) => Promise<unknown>;
     nextRoutineRunAt: () => Promise<number | null>;
     canRun: () => boolean;
@@ -37,5 +39,13 @@ export function registerScheduledWork(
     notificationCoalesceMs: options.retryMs,
     minimumSpacingMs: options.retryMs,
   });
-  return { routines, monitors, timers };
+  const pullRequestMonitors = options.tickPullRequestMonitors && options.nextPullRequestMonitorPollAt
+    ? registerDeadlineWork(coordinator, DELIVERY_QUEUES.pullRequestMonitors, {
+      run: options.tickPullRequestMonitors,
+      next: options.nextPullRequestMonitorPollAt,
+      canRun: () => options.canRun() && readTaskDrain(new Date()) === null,
+      retryMs: options.retryMs,
+    })
+    : null;
+  return { routines, monitors, timers, pullRequestMonitors };
 }

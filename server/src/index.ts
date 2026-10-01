@@ -1920,6 +1920,10 @@ async function startServerWithDatabaseTeardown(
         canRun: () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
         nextAgentTimerAt: () => heartbeat.nextAgentTimerAt(),
         nextIssueMonitorAt: () => heartbeat.nextIssueMonitorAt(),
+        nextPullRequestMonitorPollAt: () => heartbeat.nextPullRequestMonitorPollAt(),
+        tickPullRequestMonitors: signal => signal.aborted ? Promise.resolve() : heartbeat.tickPullRequestMonitors(new Date()).then(result => {
+          if (result.woken > 0) logger.info({ ...result }, "pull request monitor poll woke monitors");
+        }),
         tickIssueMonitors: signal => heartbeat.tickIssueMonitors(new Date(),
           () => !signal.aborted && !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped),
         nextRoutineRunAt: () => routines.nextScheduledTriggerAt(),
@@ -1930,7 +1934,8 @@ async function startServerWithDatabaseTeardown(
       });
       idleDeadlineOwners.quota = bindIdleDeadlineOwner(scheduled.monitors.reconciliationSnapshot, readIdleQuotaSchedule,
         snapshot => ({ issueWaits: snapshot.issueWaits }));
-      trackHeartbeatSchedulerWork(Promise.all([scheduled.timers.ready, scheduled.monitors.ready, scheduled.routines.ready]));
+      trackHeartbeatSchedulerWork(Promise.all([scheduled.timers.ready, scheduled.monitors.ready, scheduled.routines.ready,
+        scheduled.pullRequestMonitors?.ready]));
     };
     trackHeartbeatSchedulerWork(runStartupHousekeeping().then(() => {
       if (!heartbeatSchedulerStopped) startHeartbeatScheduler();

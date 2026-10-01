@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,7 +138,7 @@ function buildKimiHeadlessEnv(env: Record<string, string>): Record<string, strin
 
 function buildKimiRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildKimiHeadlessEnv(env) })).filter(
+    Object.entries(ensurePathInEnv(buildAgentProcessEnv(buildKimiHeadlessEnv(env)))).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );

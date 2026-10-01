@@ -54,6 +54,7 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -1091,6 +1092,18 @@ export function agentService(db: Db) {
         if (!existing || existing.status !== "pending_approval") return null;
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
         let patch = { ...approvedPatch } as Partial<typeof agents.$inferInsert>;
+        if (isPlainRecord(patch.runtimeConfig) && Object.prototype.hasOwnProperty.call(patch.runtimeConfig, "inheritEnv")) {
+          // The approval payload is writable below instance-admin level; only
+          // names the pending row already carried (set through the guarded hire
+          // route) may reach the activated agent.
+          const carried = new Set(normalizeAgentEnvPatterns(
+            isPlainRecord(existing.runtimeConfig) ? existing.runtimeConfig.inheritEnv : undefined,
+          ));
+          patch.runtimeConfig = {
+            ...patch.runtimeConfig,
+            inheritEnv: normalizeAgentEnvPatterns(patch.runtimeConfig.inheritEnv).filter((name) => carried.has(name)),
+          };
+        }
         let approvalBindingDecision: ClaudeOAuthBindingInvariantDecision | null = null;
         if (
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&

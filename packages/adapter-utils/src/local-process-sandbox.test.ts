@@ -103,6 +103,34 @@ describe("local process sandbox", () => {
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
   });
 
+  it.runIf(process.platform === "linux")("never bind-mounts onto a path it creates as a symlink", async () => {
+    // Merged-/usr hosts make /bin, /sbin, /lib and /lib64 symlinks into /usr. The
+    // workspace scope creates those symlinks itself; binding the same paths too
+    // made bwrap refuse to start ("Can't mount on symlink destination /bin",
+    // paperclipai/paperclip#10684).
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-symlink-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace);
+
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: { workspaceDir: workspace, filesystemScope: "workspace" },
+    });
+
+    const symlinked = new Set<string>();
+    const bound: string[] = [];
+    for (let i = 0; i < target.args.length; i += 1) {
+      if (target.args[i] === "--symlink") symlinked.add(target.args[i + 2]!);
+      if (target.args[i] === "--ro-bind" || target.args[i] === "--bind") bound.push(target.args[i + 2]!);
+    }
+    expect(symlinked).toEqual(new Set(["/bin", "/sbin", "/lib", "/lib64"]));
+    expect(bound.filter((destination) => symlinked.has(destination))).toEqual([]);
+    expect(bound).toContain("/usr");
+  });
+
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
     cleanup.push(root);

@@ -13,6 +13,12 @@ export interface DashboardRunActivityDay {
    * failures.
    */
   recovered: number;
+  /**
+   * Runs cancelled as `issue_reassigned` because the run itself reassigned its
+   * issue: a stage hand-off. The agent finished its work, so the success rate
+   * counts these with `succeeded`. Kept out of `other`.
+   */
+  handedOff: number;
   other: number;
   total: number;
   /**
@@ -51,4 +57,6 @@ export interface DashboardSummary {
     pausedProjects: number;
   };
   runActivity: DashboardRunActivityDay[];
+  /** IANA time zone of the server host; `runActivity` days are its calendar days. */
+  timeZone: string;
 }

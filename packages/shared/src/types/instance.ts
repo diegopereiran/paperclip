@@ -37,6 +37,11 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Allow-list of server environment variables (names or `PREFIX_*`) that
+   * spawned agent processes inherit. Absent = the built-in default list.
+   */
+  agentEnvAllowlist?: string[];
 }
 
 export interface InstanceExperimentalSettings {

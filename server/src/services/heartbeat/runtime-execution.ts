@@ -38,6 +38,7 @@ import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspa
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isConversation } from "../agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
+import { normalizeAgentEnvPatterns, runWithAgentEnvPolicy } from "@paperclipai/adapter-utils/agent-env-policy";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
 import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
@@ -182,7 +183,7 @@ export interface HeartbeatRuntimeExecutionInput {
     Pick<ReturnType<typeof createHeartbeatRunControl>, "cancelRunInternal"> &
     Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup" | "dispatchPendingNativeStatusWakeups"> & {
     executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "getStoredById">;
-    instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
+    instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental" | "getGeneral">;
     envOrchestrator: Pick<ReturnType<typeof environmentRunOrchestrator>, "releaseForRun">;
   };
   // Teardown must observe these updates immediately, including when execution later throws.
@@ -803,11 +804,16 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
+      // Instance default for every company; the agent can only add.
+      const agentEnvPolicy = {
+        allowlist: (await instanceSettings.getGeneral()).agentEnvAllowlist ?? null,
+        inheritEnv: normalizeAgentEnvPatterns(parseObject(agent.runtimeConfig).inheritEnv),
+      };
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            return runWithAgentEnvPolicy(agentEnvPolicy, () => withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               observability,
@@ -886,7 +892,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: authToken ?? undefined,
-            }));
+            })));
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };

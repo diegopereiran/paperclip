@@ -19,6 +19,7 @@ import { initializePrimaryAgent } from "./primary-agent.js";
 import { resolveAgentRunnerTaskDriverForCompany, resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { assertProviderApiPlacementPolicy, isProviderApiSetupDraft, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 
 export async function prepareAgentHire(db: Db, companyId: string, input: CreateAgentData, options?: CreateAgentOptions): Promise<CreateAgentData> {
   await notifyAttentionRetentionWork(db, { companyId });
@@ -111,6 +112,18 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
 export async function prepareAgentHireApproval(txDb: Db, existing: AgentHireRecord, approvedPayload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch> {
   const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
   const patch = { ...approvedPatch } as AgentConfigurationPatch;
+  if (isPlainRecord(patch.runtimeConfig) && Object.prototype.hasOwnProperty.call(patch.runtimeConfig, "inheritEnv")) {
+    // The approval payload is writable below instance-admin level; only
+    // names the pending row already carried (set through the guarded hire
+    // route) may reach the activated agent.
+    const carried = new Set(normalizeAgentEnvPatterns(
+      isPlainRecord(existing.runtimeConfig) ? existing.runtimeConfig.inheritEnv : undefined,
+    ));
+    patch.runtimeConfig = {
+      ...patch.runtimeConfig,
+      inheritEnv: normalizeAgentEnvPatterns(patch.runtimeConfig.inheritEnv).filter((name) => carried.has(name)),
+    };
+  }
   const hasApprovedAdapterConfig = Object.prototype.hasOwnProperty.call(patch, "adapterConfig") && isPlainRecord(patch.adapterConfig);
   if (
     Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&

@@ -4221,8 +4221,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  // A local_fs path the runtime did not create (a shared project checkout) is never
+  // removed, so there is nothing left to clean.
   const cleaned =
     !workspacePath ||
+    (input.workspace.providerType === "local_fs" && !createdByRuntime) ||
     !(await directoryExists(workspacePath));
 
   return {

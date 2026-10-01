@@ -3748,6 +3748,65 @@ describe("realizeExecutionWorkspace", () => {
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
+  it("reports a shared project checkout as cleaned and leaves it in place", async () => {
+    // A shared_workspace row points at the project's own checkout. The runtime did
+    // not create it, so there is nothing to remove; reporting it as not cleaned
+    // left every closed shared workspace in cleanup_failed (paperclipai/paperclip#13014).
+    const repoRoot = await createTempRepo();
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-shared",
+        cwd: repoRoot,
+        providerType: "local_fs",
+        providerRef: null,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: null,
+      },
+      projectWorkspace: {
+        cwd: repoRoot,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(path.join(repoRoot, "README.md"))).resolves.toBeTruthy();
+  });
+
+  it("still removes a local_fs directory the runtime created", async () => {
+    const projectRoot = await createTempRepo();
+    const createdDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-created",
+        cwd: createdDir,
+        providerType: "local_fs",
+        providerRef: null,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      },
+      projectWorkspace: {
+        cwd: projectRoot,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    await expect(fs.stat(createdDir)).rejects.toThrow();
+  });
+
   it("removes a created git worktree and branch during cleanup", async () => {
     const repoRoot = await createTempRepo();
 

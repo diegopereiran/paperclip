@@ -366,6 +366,50 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("requires instance administration to put inheritEnv names in a hire approval", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: unknown) => payload,
+    );
+    const payload = {
+      name: "Env attempt",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: { inheritEnv: ["DATABASE_URL", "BETTER_AUTH_SECRET"] },
+    };
+
+    const agentRes = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "hire_agent", payload });
+    const boardRes = await request(await createApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "hire_agent", payload });
+
+    expect(agentRes.status).toBe(403);
+    expect(boardRes.status).toBe(403);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("requires instance administration to add inheritEnv names when resubmitting a hire approval", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-8",
+      companyId: "company-1",
+      type: "hire_agent",
+      status: "revision_requested",
+      payload: { runtimeConfig: { inheritEnv: ["GH_TOKEN"] } },
+      requestedByAgentId: "agent-1",
+    });
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: unknown) => payload,
+    );
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-8/resubmit")
+      .send({ payload: { runtimeConfig: { inheritEnv: ["GH_TOKEN", "DATABASE_URL"] } } });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
   it("blocks status-only recovery runs from creating approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {

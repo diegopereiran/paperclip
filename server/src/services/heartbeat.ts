@@ -11772,6 +11772,8 @@ export function heartbeatService(
     if (!actorId) {
       throw conflict("Issue monitor trigger requires an actor");
     }
+    // Validate before the claim so a bad trigger never leaves a claimed monitor behind.
+    const trigger = input?.trigger ? sanitizeIssueMonitorTrigger(input.trigger) : null;
 
     const issue = await db
       .select(issueMonitorDispatchColumns)
@@ -11833,8 +11835,8 @@ export function heartbeatService(
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
-      activitySource: input?.trigger ? "pull_request_event" : "manual",
-      trigger: input?.trigger ?? null,
+      activitySource: trigger ? "pull_request_event" : "manual",
+      trigger,
     });
   }
 

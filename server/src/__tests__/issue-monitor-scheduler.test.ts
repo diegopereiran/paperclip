@@ -4,6 +4,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   activityLog,
+  chatActions,
+  chatEndpoints,
+  toolApplications,
+  toolConnections,
   agentRuntimeState,
   agentWakeupRequests,
   agents,
@@ -27,6 +31,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { createGitHubMonitorWebhookSink } from "../services/github-monitor-webhook-sink.ts";
+import { listWatchedMonitorPullRequests, sanitizeIssueMonitorTrigger } from "../services/issue-monitor-pull-requests.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -110,6 +116,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(workspaceRuntimeServices);
+    await db.delete(chatActions);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -758,5 +768,200 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId));
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
+  });
+  describe("sanitizeIssueMonitorTrigger", () => {
+    const base = { source: "github" as const, event: "pull_request", repo: "o/r", number: 5 };
+
+    it("lower-cases a valid owner/repo and keeps a positive safe integer", () => {
+      expect(sanitizeIssueMonitorTrigger({ ...base, repo: "Owner/Repo.js" })).toMatchObject({ repo: "owner/repo.js", number: 5 });
+    });
+
+    it.each(["not-a-repo", "a/b/c", "../r", "o/..", "o/", "/r", "o/r?x=1", "o/r r", ""])("rejects repo %j", (repo) => {
+      expect(() => sanitizeIssueMonitorTrigger({ ...base, repo })).toThrow();
+    });
+
+    it.each([["5"], [0], [-1], [1.5], [Number.MAX_SAFE_INTEGER + 1], [Number.NaN], [null]])("rejects number %j", (number) => {
+      expect(() => sanitizeIssueMonitorTrigger({ ...base, number: number as number })).toThrow();
+    });
+
+    it("rejects a bad trigger before the monitor is claimed", async () => {
+      const { issueId, agentId } = await seedFixture();
+      await expect(
+        heartbeatService(db).triggerIssueMonitor(issueId, {
+          now: new Date("2026-04-11T12:00:00.000Z"),
+          actorType: "system",
+          actorId: "github_webhook",
+          trigger: { ...base, repo: "not-a-repo" },
+        }),
+      ).rejects.toThrow();
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).not.toBeNull();
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(0);
+    });
+  });
+
+  describe("GitHub webhook monitor sink", () => {
+    const pr = (action: string, extra: Record<string, unknown> = {}) => ({
+      action,
+      repository: { id: 1, full_name: "Acme/Widgets" },
+      pull_request: { number: 7, head: { sha: "headsha1" }, merged: false },
+      ...extra,
+    });
+    const events: Array<[string, string, Record<string, unknown>]> = [
+      ["pull_request", "pull_request:synchronize", pr("synchronize")],
+      [
+        "check_suite",
+        "check_suite:completed",
+        {
+          action: "completed",
+          repository: { id: 1, full_name: "Acme/Widgets" },
+          check_suite: { head_sha: "headsha1", pull_requests: [{ number: 7, head: { sha: "headsha1" }, base: { repo: { id: 1 } } }] },
+        },
+      ],
+      ["pull_request_review", "pull_request_review:submitted", pr("submitted", { review: { id: 3 } })],
+      ["issue_comment", "issue_comment:created", {
+        action: "created",
+        repository: { id: 1, full_name: "Acme/Widgets" },
+        issue: { number: 7, pull_request: { url: "https://api.github.com/repos/Acme/Widgets/pulls/7" } },
+        comment: { id: 9, body: "private text" },
+      }],
+      ["pull_request_review_comment", "pull_request_review_comment:created", pr("created", { comment: { id: 10, body: "private text" } })],
+    ];
+
+    async function seedEndpoint(companyId: string, agentId: string) {
+      const endpointId = randomUUID();
+      const applicationId = randomUUID();
+      const connectionId = randomUUID();
+      await db.insert(toolApplications).values({
+        id: applicationId,
+        companyId,
+        applicationKey: `chat:github:${endpointId}`,
+        name: "GitHub chat",
+        type: "chat",
+        status: "active",
+      });
+      await db.insert(toolConnections).values({
+        id: connectionId,
+        companyId,
+        applicationId,
+        name: "GitHub chat",
+        uid: `chat-github-${endpointId}`,
+        connectionPurpose: "channel",
+        transport: "chat_sdk",
+        authKind: "api_key",
+        config: { provider: "github" },
+        transportConfig: {},
+      });
+      await db.insert(chatEndpoints).values({
+        id: endpointId,
+        companyId,
+        connectionId,
+        provider: "github",
+        publicId: `pub-${endpointId}`,
+        assignedAgentId: agentId,
+        status: "active",
+      });
+      return endpointId;
+    }
+
+    function makeSink() {
+      const heartbeat = heartbeatService(db);
+      return createGitHubMonitorWebhookSink(db, {
+        triggerMonitor: (issueId, input) => heartbeat.triggerIssueMonitor(issueId, input),
+      });
+    }
+
+    it.each(events)("wakes the matching monitor once for %s", async (eventType, expectedEvent, payload) => {
+      const { companyId, issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
+      });
+      const other = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 8 }] },
+      });
+      const sink = makeSink();
+
+      const result = await sink.handle({ companyId, endpointId: await seedEndpoint(companyId, agentId), eventType, deliveryId: `d-${eventType}`, payload });
+      expect(result).toMatchObject({ outcome: "processed", woken: 1 });
+
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]?.payload).toMatchObject({
+        issueId,
+        source: "pull_request_event",
+        trigger: { source: "github", event: expectedEvent, deliveryId: `d-${eventType}`, repo: "acme/widgets", number: 7 },
+      });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, other.agentId))).toHaveLength(0);
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      const details = activity.find((row) => row.action === "issue.monitor_triggered")?.details as Record<string, unknown>;
+      expect(details.source).toBe("pull_request_event");
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)).then((rows) => rows[0]);
+      expect(run?.contextSnapshot).toMatchObject({ trigger: { event: expectedEvent } });
+      expect((run?.contextSnapshot as Record<string, unknown>).manualTrigger).not.toBe(true);
+    });
+
+    it("does not wake twice for a redelivery with the same delivery id", async () => {
+      const { companyId, issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
+      });
+      const sink = makeSink();
+      const endpointId = await seedEndpoint(companyId, agentId);
+      const input = { companyId, endpointId, eventType: "pull_request", deliveryId: "same-delivery", payload: pr("synchronize") };
+      expect(await sink.handle(input)).toMatchObject({ outcome: "processed", woken: 1 });
+
+      // Reschedule so only the delivery id, not the one-shot strip, can stop a second wake.
+      await db.update(issues).set({ monitorNextCheckAt: new Date("2026-12-01T00:00:00.000Z") }).where(eq(issues.id, issueId));
+      expect(await sink.handle(input)).toMatchObject({ outcome: "duplicate", woken: 0 });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+    });
+
+    it("strips the monitor so polling does not wake it again", async () => {
+      const { companyId, issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
+      });
+      expect((await listWatchedMonitorPullRequests(db)).map((row) => row.issueId)).toContain(issueId);
+      await makeSink().handle({ companyId, endpointId: await seedEndpoint(companyId, agentId), eventType: "pull_request", deliveryId: "d1", payload: pr("closed") });
+      expect((await listWatchedMonitorPullRequests(db)).map((row) => row.issueId)).not.toContain(issueId);
+    });
+
+    it("never wakes a monitor of another company", async () => {
+      const mine = await seedFixture({ monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] } });
+      const theirs = await seedFixture({ monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] } });
+      const result = await makeSink().handle({ companyId: mine.companyId, endpointId: await seedEndpoint(mine.companyId, mine.agentId), eventType: "pull_request", deliveryId: "d1", payload: pr("opened") });
+      expect(result.woken).toBe(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, theirs.agentId))).toHaveLength(0);
+    });
+
+    it.each([
+      ["pull_request", pr("labeled")],
+      ["pull_request", pr("synchronize", { repository: { id: 1, full_name: "not-a-repo" } })],
+      ["pull_request", pr("synchronize", { pull_request: { number: "7", head: { sha: "x" } } })],
+      ["pull_request", pr("synchronize", { pull_request: { number: -7, head: { sha: "x" } } })],
+      ["check_suite", { action: "requested", repository: { id: 1, full_name: "Acme/Widgets" }, check_suite: { pull_requests: [{ number: 7 }] } }],
+      ["pull_request_review", pr("dismissed")],
+      ["issue_comment", { action: "created", repository: { id: 1, full_name: "Acme/Widgets" }, issue: { number: 7 } }],
+      ["issue_comment", { action: "edited", repository: { id: 1, full_name: "Acme/Widgets" }, issue: { number: 7, pull_request: {} } }],
+      ["push", pr("synchronize")],
+    ])("ignores %s payloads that carry no valid pull request event", async (eventType, payload) => {
+      const { companyId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
+      });
+      const result = await makeSink().handle({ companyId, endpointId: await seedEndpoint(companyId, agentId), eventType, deliveryId: "d1", payload });
+      expect(result).toMatchObject({ outcome: "ignored", woken: 0 });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+    });
+
+    it("keeps no comment text in the delivery receipt", async () => {
+      const { companyId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
+      });
+      const endpointId = await seedEndpoint(companyId, agentId);
+      await makeSink().handle({ companyId, endpointId, eventType: "issue_comment", deliveryId: "d1", payload: events[3]![2] });
+      const rows = await db.execute(sql`select payload::text as payload from chat_actions where endpoint_id = ${endpointId}`);
+      expect(rows).toHaveLength(1);
+      expect(JSON.stringify(rows)).not.toContain("private text");
+    });
   });
 });

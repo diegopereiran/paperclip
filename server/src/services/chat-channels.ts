@@ -331,6 +331,12 @@ import {
   streamSafePublicationText,
   telegramMarkdownRequiresAttachment,
 } from "./chat-publication-stream.js";
+import {
+  createGitHubMonitorWebhookSink,
+  GITHUB_MONITOR_ONLY_EVENTS,
+  isGitHubMonitorEvent,
+  type GitHubMonitorWebhookSinkOptions,
+} from "./github-monitor-webhook-sink.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   questionResponseDeliveryService,
@@ -1389,6 +1395,8 @@ export interface ChatChannelServiceOptions {
         eventPayload?: Record<string, unknown>;
       },
     ) => Promise<unknown>;
+    /** Wakes an issue monitor for a verified GitHub pull request event. */
+    triggerIssueMonitor?: GitHubMonitorWebhookSinkOptions["triggerMonitor"];
   };
   /** Production bridge for resuming a native run that owns the question. */
   resolveNativeQuestion?: QuestionResponseDeliveryServiceOptions["resolveNativeQuestion"];
@@ -24373,6 +24381,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   type GitHubIngressStageResult =
     | { kind: "invalid_signature" }
     | { kind: "ignored" }
+    | { kind: "monitor_event" }
     | { actionId: string; kind: "staged" };
 
   function githubSignatureIsValid(
@@ -24435,6 +24444,51 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return status === "revoked" && eventType === "installation";
   }
 
+  /**
+   * Runs only after the signature and installation checks passed. Never enters
+   * the chat adapter. Chat events must not fail on a sink error; monitor-only
+   * events surface it so the delivery can be retried.
+   */
+  async function handleGitHubMonitorWebhook(
+    endpoint: EndpointRow,
+    context: RuntimeContext,
+    input: {
+      eventType: string;
+      providerDeliveryId: string;
+      parsedPayload: unknown;
+    },
+  ): Promise<"done" | "retry"> {
+    const triggerMonitor = options.heartbeat.triggerIssueMonitor;
+    if (!triggerMonitor) return "done";
+    // The signature was checked against a captured credential set: do not act
+    // if that set was replaced meanwhile.
+    const latest = await endpointRecord(endpoint.id);
+    if (
+      !latest ||
+      runtimeGeneration(latest.endpoint.setup) !== context.generation ||
+      credentialFingerprint(latest.credentialSecretRefs) !==
+        context.credentialFingerprint
+    ) {
+      return "retry";
+    }
+    try {
+      await createGitHubMonitorWebhookSink(db, { triggerMonitor }).handle({
+        companyId: endpoint.companyId,
+        endpointId: endpoint.id,
+        eventType: input.eventType,
+        deliveryId: input.providerDeliveryId,
+        payload: input.parsedPayload,
+      });
+    } catch (error) {
+      if (GITHUB_MONITOR_ONLY_EVENTS.has(input.eventType)) throw error;
+      logger.warn(
+        { endpointId: endpoint.id, error: redactError(error) },
+        "GitHub pull request event could not wake an issue monitor",
+      );
+    }
+    return "done";
+  }
+
   async function stageGitHubWebhookIngress(
     endpoint: EndpointRow,
     request: Request,
@@ -24445,7 +24499,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const providerDeliveryId =
       request.headers.get("x-github-delivery")?.trim() ||
       `body:${createHash("sha256").update(body).digest("hex")}`;
-    if (!SUPPORTED_GITHUB_WEBHOOK_EVENTS.has(eventType))
+    // Monitor-only events are admitted for authentication here but are acted on
+    // only after the signature and installation checks below.
+    if (
+      !SUPPORTED_GITHUB_WEBHOOK_EVENTS.has(eventType) &&
+      !GITHUB_MONITOR_ONLY_EVENTS.has(eventType)
+    )
       return { kind: "ignored" };
 
     let parsedPayload: unknown = null;
@@ -24514,6 +24573,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         eventType !== "installation"
       ) {
         return { kind: "ignored" };
+      }
+
+      if (isGitHubMonitorEvent(eventType)) {
+        const handled = await handleGitHubMonitorWebhook(
+          record.endpoint,
+          context,
+          { eventType, providerDeliveryId, parsedPayload },
+        );
+        if (handled === "retry") continue;
+        if (GITHUB_MONITOR_ONLY_EVENTS.has(eventType))
+          return { kind: "monitor_event" };
       }
 
       const bodySha256 = createHash("sha256").update(body).digest("hex");
@@ -26610,6 +26680,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return new Response("Invalid signature", { status: 401 });
       if (staged.kind === "ignored")
         return new Response("ignored", { status: 200 });
+      if (staged.kind === "monitor_event")
+        return new Response("accepted", { status: 200 });
       recordChatWebhookReceipt(endpoint.id, staged.actionId, "github_ingress");
 
       if (options.deferWebhookProcessing === true) {

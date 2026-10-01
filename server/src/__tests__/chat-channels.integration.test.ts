@@ -1197,11 +1197,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ChatChannelServiceOptions["heartbeat"]["cancelRun"]
       >;
       wakeup?: ChatChannelServiceOptions["heartbeat"]["wakeup"];
+      triggerIssueMonitor?: ChatChannelServiceOptions["heartbeat"]["triggerIssueMonitor"];
     } = {},
   ) {
     const {
       cancelRun: cancelRunOverride,
       wakeup: wakeupOverride,
+      triggerIssueMonitor,
       ...serviceOverrides
     } = overrides;
     const wakeup = vi.fn(wakeupOverride ?? (async () => ({ accepted: true })));
@@ -1210,7 +1212,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
     const service = chatChannelService(db, {
       fetch: providerFetch,
-      heartbeat: { cancelRun, wakeup: receiptBackedWakeup(wakeup) },
+      heartbeat: {
+        cancelRun,
+        wakeup: receiptBackedWakeup(wakeup),
+        triggerIssueMonitor,
+      },
       publicBaseUrl: "https://paperclip.example",
       runtime: runtime as unknown as ChatSdkRuntime,
       ...serviceOverrides,
@@ -1773,7 +1779,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "receiptReactionTransportBarrier"
         | "storage"
       >
-    > & { wakeup?: ChatChannelServiceOptions["heartbeat"]["wakeup"] } = {},
+    > & {
+      wakeup?: ChatChannelServiceOptions["heartbeat"]["wakeup"];
+      triggerIssueMonitor?: ChatChannelServiceOptions["heartbeat"]["triggerIssueMonitor"];
+    } = {},
     useVerifiedAppId = false,
   ) {
     let setupComplete = false;
@@ -4236,6 +4245,259 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       healthMessage: "Waiting for a test conversation",
     });
     expect(runtime.endpoints.has(endpoint.id)).toBe(true);
+  });
+
+  describe("GitHub pull request events for issue monitors", () => {
+    const repository = {
+      id: 97531,
+      full_name: "paperclipai/paperclip",
+      name: "paperclip",
+      owner: { id: 1357, login: "paperclipai" },
+    };
+    const pullRequest = { number: 77, head: { sha: "abc123" }, merged: false };
+    const monitorEvents: Array<[string, string, Record<string, unknown>]> = [
+      [
+        "pull_request",
+        "pull_request:synchronize",
+        { action: "synchronize", pull_request: pullRequest },
+      ],
+      [
+        "check_suite",
+        "check_suite:completed",
+        {
+          action: "completed",
+          check_suite: {
+            head_sha: "abc123",
+            pull_requests: [
+              { number: 77, head: { sha: "abc123" }, base: { repo: { id: 97531 } } },
+            ],
+          },
+        },
+      ],
+      [
+        "pull_request_review",
+        "pull_request_review:submitted",
+        { action: "submitted", pull_request: pullRequest, review: { id: 5 } },
+      ],
+      [
+        "issue_comment",
+        "issue_comment:created",
+        {
+          action: "created",
+          issue: { number: 77, pull_request: { url: "https://api.github.com/x" } },
+          comment: {
+            id: 9001,
+            body: "unaddressed note",
+            created_at: "2026-09-06T12:00:00Z",
+            updated_at: "2026-09-06T12:00:00Z",
+            user: { id: 42, login: "octocat" },
+          },
+          sender: { id: 42, login: "octocat" },
+        },
+      ],
+      [
+        "pull_request_review_comment",
+        "pull_request_review_comment:created",
+        {
+          action: "created",
+          pull_request: pullRequest,
+          comment: {
+            id: 9002,
+            body: "unaddressed review note",
+            created_at: "2026-09-06T12:00:00Z",
+            updated_at: "2026-09-06T12:00:00Z",
+            user: { id: 42, login: "octocat" },
+          },
+          sender: { id: 42, login: "octocat" },
+        },
+      ],
+    ];
+
+    async function seedMonitoredPullRequestIssue(companyId: string, agentId: string) {
+      const issueId = randomUUID();
+      const nextCheckAt = new Date("2026-04-11T12:30:00.000Z");
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Watch pull request",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `W${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}-1`,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: nextCheckAt.toISOString(),
+            notes: "Watch the pull request",
+            scheduledBy: "assignee",
+            pullRequests: [{ owner: "paperclipai", repo: "paperclip", number: 77 }],
+          },
+        },
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: nextCheckAt.toISOString(),
+            lastTriggeredAt: null,
+            attemptCount: 0,
+            notes: "Watch the pull request",
+            scheduledBy: "assignee",
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+        monitorNextCheckAt: nextCheckAt,
+        monitorAttemptCount: 0,
+        monitorNotes: "Watch the pull request",
+        monitorScheduledBy: "assignee",
+      });
+      return issueId;
+    }
+
+    async function monitorFixture() {
+      const fixture = await seedCompany();
+      const triggerIssueMonitor = vi.fn(async () => ({}));
+      const configured = await configuredGitHubEndpoint(fixture, {
+        triggerIssueMonitor,
+      });
+      const issueId = await seedMonitoredPullRequestIssue(
+        fixture.companyId,
+        fixture.assignedAgentId,
+      );
+      const send = (
+        event: string,
+        delivery: string,
+        payload: Record<string, unknown>,
+        mutate?: (request: Request) => void,
+      ) => {
+        const request = signedGitHubWebhookRequest({
+          delivery,
+          event,
+          webhookSecret: configured.webhookSecret,
+          payload: { installation: { id: 2468 }, repository, ...payload },
+        });
+        mutate?.(request);
+        return configured.service.handleWebhook(
+          configured.endpoint.publicId,
+          "github",
+          request,
+        );
+      };
+      return { ...configured, fixture, issueId, send, triggerIssueMonitor };
+    }
+
+    it.each(monitorEvents)(
+      "never reaches the monitor sink with a bad signature for %s",
+      async (event, _expected, payload) => {
+        const { send, triggerIssueMonitor } = await monitorFixture();
+        const response = await send(
+          event,
+          `bad-signature-${event}`,
+          payload,
+          (request) =>
+            request.headers.set("x-hub-signature-256", "sha256=invalid"),
+        );
+        expect(response.status).toBe(401);
+        expect(triggerIssueMonitor).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(monitorEvents)(
+      "wakes the matching monitor once for %s and not again on a redelivery",
+      async (event, expectedEvent, payload) => {
+        const { fixture, issueId, send, triggerIssueMonitor } =
+          await monitorFixture();
+        const first = await send(event, `delivery-${event}`, payload);
+        expect(first.status).toBeLessThan(300);
+        expect(triggerIssueMonitor).toHaveBeenCalledTimes(1);
+        expect(triggerIssueMonitor).toHaveBeenCalledWith(issueId, {
+          actorType: "system",
+          actorId: "github_pull_request_webhook",
+          trigger: {
+            source: "github",
+            event: expectedEvent,
+            deliveryId: `delivery-${event}`,
+            repo: "paperclipai/paperclip",
+            number: 77,
+            headSha: event === "issue_comment" ? null : "abc123",
+          },
+        });
+        const again = await send(event, `delivery-${event}`, payload);
+        expect(again.status).toBeLessThan(300);
+        expect(triggerIssueMonitor).toHaveBeenCalledTimes(1);
+        const receipts = await db
+          .select({ payload: chatActions.payload })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.companyId, fixture.companyId),
+              eq(chatActions.kind, "github_monitor_event"),
+            ),
+          );
+        expect(receipts).toHaveLength(1);
+        expect(JSON.stringify(receipts)).not.toContain("unaddressed");
+      },
+    );
+
+    it("keeps the monitor-only events out of the chat adapter", async () => {
+      const { endpoint, runtime, send, triggerIssueMonitor } =
+        await monitorFixture();
+      const endpointRuntime = runtime.endpoints.get(endpoint.id);
+      const countIngress = async () =>
+        (
+          await db.execute(
+            sql`select id from chat_actions where endpoint_id = ${endpoint.id} and kind = 'github_webhook_ingress'`,
+          )
+        ).length;
+      const before = await countIngress();
+      for (const [event, , payload] of monitorEvents.slice(0, 3)) {
+        const response = await send(event, `adapter-${event}`, payload);
+        expect(response.status).toBe(200);
+      }
+      expect(triggerIssueMonitor).toHaveBeenCalledTimes(3);
+      expect(endpointRuntime?.webhookRequest ?? null).toBeNull();
+      await expect(countIngress()).resolves.toBe(before);
+    });
+
+    it("drops an unsupported event before the signature check", async () => {
+      const { send, triggerIssueMonitor } = await monitorFixture();
+      const response = await send(
+        "push",
+        "unsupported-push",
+        { ref: "refs/heads/main" },
+        (request) =>
+          request.headers.set("x-hub-signature-256", "sha256=invalid"),
+      );
+      expect(response.status).toBe(200);
+      expect(triggerIssueMonitor).not.toHaveBeenCalled();
+    });
+
+    it("ignores a verified event from another installation", async () => {
+      const { send, triggerIssueMonitor } = await monitorFixture();
+      const response = await send("pull_request", "other-installation", {
+        installation: { id: 999999 },
+        action: "synchronize",
+        pull_request: pullRequest,
+      });
+      expect(response.status).toBe(200);
+      expect(triggerIssueMonitor).not.toHaveBeenCalled();
+    });
   });
 
   it("admits only an addressed raw GitHub comment as the first setup repository", async () => {

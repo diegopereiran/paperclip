@@ -1,8 +1,10 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companies, issues, issueWorkProducts } from "@paperclipai/db";
+import { unprocessable } from "../errors.js";
 import {
   extractGitHubPullRequestRefs,
+  isValidGitHubName,
   mergeGitHubPullRequestRefs,
   parseGitHubPullRequestRefs,
   type GitHubPullRequestRef,
@@ -32,13 +34,25 @@ function boundedString(value: unknown) {
   return typeof value === "string" && value.length > 0 ? value.slice(0, MAX_TRIGGER_FIELD_LENGTH) : null;
 }
 
-/** Copies only the declared trigger fields so extra caller data never reaches a wake payload. */
+/**
+ * Copies only the declared trigger fields so extra caller data never reaches a
+ * wake payload. Throws when `repo` is not `owner/repo` or `number` is not a
+ * positive safe integer: the trigger may come from a webhook body.
+ */
 export function sanitizeIssueMonitorTrigger(trigger: IssueMonitorTrigger): IssueMonitorTrigger {
+  const repo = (boundedString(trigger.repo) ?? "").toLowerCase();
+  const [owner, name, ...rest] = repo.split("/");
+  if (!owner || !name || rest.length > 0 || !isValidGitHubName(owner) || !isValidGitHubName(name)) {
+    throw unprocessable("Issue monitor trigger repo must be in owner/repo form");
+  }
+  if (typeof trigger.number !== "number" || !Number.isSafeInteger(trigger.number) || trigger.number <= 0) {
+    throw unprocessable("Issue monitor trigger number must be a positive safe integer");
+  }
   return {
     source: "github",
     event: boundedString(trigger.event) ?? "unknown",
     ...(boundedString(trigger.deliveryId) ? { deliveryId: boundedString(trigger.deliveryId) } : {}),
-    repo: (boundedString(trigger.repo) ?? "").toLowerCase(),
+    repo,
     number: trigger.number,
     ...(boundedString(trigger.headSha) ? { headSha: boundedString(trigger.headSha) } : {}),
   };

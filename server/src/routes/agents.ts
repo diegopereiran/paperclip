@@ -107,6 +107,7 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 import {
   persistReprojectedWorkspaceDiffs,
   projectCodexWorkspaceDiffsFromTrace,
@@ -2261,6 +2262,10 @@ export function agentRoutes(
     const nextRaw =
       asRecord(asRecord(nextRuntimeConfig)?.debug)?.providerTrace === "raw";
     if (previousRaw !== nextRaw) assertInstanceAdmin(req);
+    const previousInherit = new Set(normalizeAgentEnvPatterns(asRecord(previousRuntimeConfig)?.inheritEnv));
+    const addsInherit = normalizeAgentEnvPatterns(asRecord(nextRuntimeConfig)?.inheritEnv)
+      .some((pattern) => !previousInherit.has(pattern));
+    if (addsInherit) assertInstanceAdmin(req);
   }
 
   async function assertAgentDefaultEnvironmentSelection(

@@ -896,6 +896,102 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
   });
 
+  it("blocks an agent from adding inheritEnv names to itself", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { inheritEnv: ["DATABASE_URL", "BETTER_AUTH_SECRET"] } }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("requires instance administration to add inheritEnv names", async () => {
+    const companyAdmin = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const instanceAdmin = await createApp({
+      type: "board",
+      userId: "instance-admin-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+    const body = { runtimeConfig: { inheritEnv: ["GH_TOKEN"] } };
+
+    const denied = await requestApp(companyAdmin, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send(body));
+    const allowed = await requestApp(instanceAdmin, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send(body));
+
+    expect(denied.status).toBe(403);
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+  });
+
+  it.each([
+    ["direct creation", `/api/companies/${companyId}/agents`],
+    ["hire creation", `/api/companies/${companyId}/agent-hires`],
+  ])("requires instance administration for inheritEnv during %s", async (_label, path) => {
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(path)
+      .send({
+        name: "Env attempt",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { inheritEnv: ["DATABASE_URL"] },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-admin rollback into added inheritEnv names", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: "33333333-3333-4333-8333-333333333333",
+      afterConfig: {
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { inheritEnv: ["DATABASE_URL"] },
+      },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const response = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(
+        `/api/agents/${agentId}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`,
+      ),
+    );
+
+    expect(response.status).toBe(403);
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {
     const app = await createApp({
       type: "agent",

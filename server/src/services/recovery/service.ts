@@ -105,6 +105,12 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
+import {
+  ISSUE_ORIGIN_DONE_WAKE_REASON,
+  buildIssueOriginDoneWakeContext,
+  buildIssueOriginDoneWakeIdempotencyKey,
+  buildIssueOriginDoneWakePayload,
+} from "../issue-origin-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
@@ -165,6 +171,8 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_CANDIDATE_LIMIT = 200;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -5427,6 +5435,181 @@ export function recoveryService(
     return result;
   }
 
+  async function reconcileIssueOriginDoneWakeBackstop(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+  }) {
+    const result = {
+      checked: 0,
+      healed: 0,
+      notWakeableSkipped: 0,
+      existingWakeSkipped: 0,
+      livePathSkipped: 0,
+      interactionSkipped: 0,
+      pauseHoldSkipped: 0,
+      candidateLimitSkipped: 0,
+      deferredOrFailed: 0,
+      enqueueFailed: 0,
+      issueIds: [] as string[],
+    };
+    const now = opts?.now ?? new Date();
+    const since = new Date(now.getTime() - ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_LOOKBACK_MS);
+
+    // Cheap pre-filter: a done issue created from a run whose issue is still
+    // open and agent-assigned. The service method applies the exact skip rules.
+    const filters = [
+      eq(issues.status, "done"),
+      isNull(issues.conversationAgentId),
+      sql`${issues.originRunId} is not null`,
+      sql`${issues.originKind} <> 'routine_execution'`,
+      gte(issues.completedAt, since),
+      visibleIssueCondition(),
+      sql`exists (
+        select 1
+        from heartbeat_runs origin_run
+        join issues origin_issue
+          on origin_issue.company_id = origin_run.company_id
+          and origin_issue.id::text = coalesce(
+            origin_run.context_snapshot ->> 'issueId',
+            origin_run.context_snapshot ->> 'taskId'
+          )
+        where origin_run.id::text = ${issues.originRunId}
+          and origin_run.company_id = ${issues.companyId}
+          and origin_issue.assignee_agent_id is not null
+          and origin_issue.assignee_user_id is null
+          and origin_issue.status not in ('backlog', 'done', 'cancelled')
+      )`,
+    ];
+    if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
+
+    const candidateRows = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        totalCount: sql<number>`count(*) over()::int`,
+      })
+      .from(issues)
+      .where(and(...filters))
+      .orderBy(desc(issues.completedAt), asc(issues.id))
+      .limit(ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+    result.checked = candidateRows.length;
+    result.candidateLimitSkipped = Math.max(
+      0,
+      (candidateRows[0]?.totalCount ?? 0) - candidateRows.length,
+    );
+    if (result.candidateLimitSkipped > 0) {
+      logger.warn(
+        {
+          processed: candidateRows.length,
+          skipped: result.candidateLimitSkipped,
+          limit: ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+        },
+        "issue origin done wake backstop deferred candidates past page limit",
+      );
+    }
+
+    for (const candidate of candidateRows) {
+      const origin = await issuesSvc.getWakeableOriginIssueAfterDone(candidate.id);
+      if (!origin) {
+        result.notWakeableSkipped += 1;
+        continue;
+      }
+      const companyId = candidate.companyId;
+      const idempotencyKey = buildIssueOriginDoneWakeIdempotencyKey({
+        originIssueId: origin.id,
+        doneIssueId: origin.doneIssueId,
+      });
+
+      const existingWake = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            notInArray(agentWakeupRequests.status, ["skipped"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existingWake) {
+        result.existingWakeSkipped += 1;
+        continue;
+      }
+
+      if (
+        (await hasActiveExecutionPath(companyId, origin.id, origin.assigneeAgentId)) ||
+        (await hasQueuedIssueWake(companyId, origin.id, origin.assigneeAgentId))
+      ) {
+        result.livePathSkipped += 1;
+        continue;
+      }
+      if (await hasPendingWakeInteraction(companyId, origin.id)) {
+        result.interactionSkipped += 1;
+        continue;
+      }
+      if (
+        await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          companyId,
+          origin.id,
+          treeControlSvc,
+        )
+      ) {
+        result.pauseHoldSkipped += 1;
+        continue;
+      }
+
+      try {
+        const wake = await deps.enqueueWakeup(origin.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_ORIGIN_DONE_WAKE_REASON,
+          payload: {
+            ...buildIssueOriginDoneWakePayload(origin),
+            backstop: "issue_origin_done_reconciliation",
+          },
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: "issue_origin_done_backstop",
+          contextSnapshot: buildIssueOriginDoneWakeContext(origin),
+        });
+        if (!wake) {
+          result.deferredOrFailed += 1;
+          continue;
+        }
+        result.healed += 1;
+        result.issueIds.push(origin.id);
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "issue_origin_done_backstop",
+          agentId: origin.assigneeAgentId,
+          runId: opts?.runId ?? null,
+          action: "issue.origin_done_wake_emitted",
+          entityType: "issue",
+          entityId: origin.id,
+          details: {
+            source: "issue_origin_done.backstop",
+            wakeupRunId: wake.id,
+            idempotencyKey,
+            doneIssueId: origin.doneIssueId,
+          },
+        });
+      } catch (err) {
+        result.deferredOrFailed += 1;
+        result.enqueueFailed += 1;
+        logger.warn(
+          { err, issueId: origin.id, doneIssueId: origin.doneIssueId, idempotencyKey },
+          "failed to enqueue origin wake from issue origin done backstop",
+        );
+      }
+    }
+
+    return result;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -5855,6 +6038,7 @@ export function recoveryService(
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileIssueOriginDoneWakeBackstop,
     readRecoveryTimerIntervalMs,
   };
 }

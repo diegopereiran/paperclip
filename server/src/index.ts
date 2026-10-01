@@ -1545,6 +1545,14 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        const originDoneWakesReconciled = await heartbeat.reconcileIssueOriginDoneWakes();
+        if (originDoneWakesReconciled.healed > 0) {
+          logger.warn(
+            { ...originDoneWakesReconciled },
+            "startup origin-done wake reconciliation woke issues whose created issue is done",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1781,6 +1789,12 @@ async function startServerWithDatabaseTeardown(
               const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
               if (reconciled.healed > 0) {
                 logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+              }
+            })
+            .then(async () => {
+              const reconciled = await heartbeat.reconcileIssueOriginDoneWakes();
+              if (reconciled.healed > 0) {
+                logger.warn({ ...reconciled }, "periodic origin-done wake reconciliation woke issues whose created issue is done");
               }
             })
             .then(async () => {

@@ -260,6 +260,12 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
+import {
+  ISSUE_ORIGIN_DONE_WAKE_REASON,
+  buildIssueOriginDoneWakeContext,
+  buildIssueOriginDoneWakeIdempotencyKey,
+  buildIssueOriginDoneWakePayload,
+} from "../services/issue-origin-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
   executionWorkspaceService as executionWorkspaceServiceDirect,
@@ -14915,6 +14921,24 @@ export function issueRoutes(
             });
           }
         }
+        if (becameTerminal && issue.status === "done") {
+          const origin = await svc.getWakeableOriginIssueAfterDone(issue.id);
+          if (origin) {
+            addWakeup(origin.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: ISSUE_ORIGIN_DONE_WAKE_REASON,
+              payload: buildIssueOriginDoneWakePayload(origin),
+              idempotencyKey: buildIssueOriginDoneWakeIdempotencyKey({
+                originIssueId: origin.id,
+                doneIssueId: origin.doneIssueId,
+              }),
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: buildIssueOriginDoneWakeContext(origin),
+            });
+          }
+        }
 
         for (const { agentId, wakeup } of wakeups.values()) {
           heartbeat
@@ -18245,6 +18269,24 @@ export function issueRoutes(
                 childIssueSummaries: parent.childIssueSummaries,
                 childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
               },
+            });
+          }
+        }
+        if (becameTerminal && currentIssue.status === "done") {
+          const origin = await svc.getWakeableOriginIssueAfterDone(currentIssue.id);
+          if (origin) {
+            addWakeup(origin.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: ISSUE_ORIGIN_DONE_WAKE_REASON,
+              payload: buildIssueOriginDoneWakePayload(origin),
+              idempotencyKey: buildIssueOriginDoneWakeIdempotencyKey({
+                originIssueId: origin.id,
+                doneIssueId: origin.doneIssueId,
+              }),
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: buildIssueOriginDoneWakeContext(origin),
             });
           }
         }

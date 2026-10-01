@@ -30,6 +30,7 @@ const mockIssueService = vi.hoisted(() => ({
   getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getWakeableOriginIssueAfterDone: vi.fn(async () => null),
   findMentionedAgents: vi.fn(async () => []),
 }));
 
@@ -181,6 +182,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getWakeableOriginIssueAfterDone.mockResolvedValue(null);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -404,6 +406,57 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  it("wakes the origin issue's assignee once when a gate issue is done", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({ id: "gate-1", status: "in_progress" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ id: "gate-1", status: "done" }));
+    mockIssueService.getWakeableOriginIssueAfterDone.mockResolvedValue({
+      id: "origin-1",
+      assigneeAgentId: "agent-origin",
+      doneIssueId: "gate-1",
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/gate-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledTimes(1);
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-origin",
+        expect.objectContaining({
+          reason: "issue_origin_done",
+          idempotencyKey: "issue_origin_done:origin-1:gate-1",
+          payload: { issueId: "origin-1", doneIssueId: "gate-1" },
+          contextSnapshot: expect.objectContaining({
+            issueId: "origin-1",
+            taskId: "origin-1",
+            wakeReason: "issue_origin_done",
+            doneIssueId: "gate-1",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("does not wake an origin issue when the service reports none", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({ id: "gate-1", status: "in_progress" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ id: "gate-1", status: "done" }));
+
+    const res = await request(await createApp()).patch("/api/issues/gate-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockIssueService.getWakeableOriginIssueAfterDone).toHaveBeenCalledWith("gate-1");
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not ask for an origin wake when the issue was already done", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({ id: "gate-1", status: "done" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ id: "gate-1", status: "done" }));
+
+    const res = await request(await createApp()).patch("/api/issues/gate-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockIssueService.getWakeableOriginIssueAfterDone).not.toHaveBeenCalled();
   });
 
   function issueRecord(overrides: Record<string, unknown> = {}) {

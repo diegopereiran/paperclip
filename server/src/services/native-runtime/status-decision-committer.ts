@@ -43,6 +43,10 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
 import {
+  ISSUE_ORIGIN_DONE_WAKE_REASON,
+  buildIssueOriginDoneWakeIdempotencyKey,
+} from "../issue-origin-wakeups.js";
+import {
   persistActivity,
   publishActivity,
   type ActivityPublication,
@@ -1987,6 +1991,33 @@ export async function commitNativeStatusDecision(input: {
             completedChildIssueId: input.issueId,
             childIssueSummaries: parent.childIssueSummaries,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+          },
+        });
+      }
+      const origin = await issueSvc.getWakeableOriginIssueAfterDone(
+        input.issueId,
+      );
+      if (origin) {
+        const wakeId = await enqueueWake({
+          tx: tx as unknown as Db,
+          companyId: input.companyId,
+          issueId: origin.id,
+          agentId: origin.assigneeAgentId,
+          reason: ISSUE_ORIGIN_DONE_WAKE_REASON,
+          idempotencyKey: buildIssueOriginDoneWakeIdempotencyKey({
+            originIssueId: origin.id,
+            doneIssueId: origin.doneIssueId,
+          }),
+          payload: { doneIssueId: origin.doneIssueId },
+          contextSnapshot: { doneIssueId: origin.doneIssueId },
+        });
+        materialized.push({
+          effectKind: "origin_wake",
+          targetType: "agent_wakeup_request",
+          targetId: wakeId,
+          payload: {
+            originIssueId: origin.id,
+            doneIssueId: origin.doneIssueId,
           },
         });
       }

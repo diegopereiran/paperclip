@@ -40,6 +40,10 @@ import {
   parseIssueExecutionState,
   buildIssueMonitorTriggeredPatch,
 } from "../issue-execution-policy.js";
+import {
+  sanitizeIssueMonitorTrigger,
+  type IssueMonitorTrigger,
+} from "../issue-monitor-pull-requests.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
 import { EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON } from "./run-state.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -552,6 +556,7 @@ export function createHeartbeatScheduling(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -559,7 +564,10 @@ export function createHeartbeatScheduling(
     }
 
     const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
-    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + 1;
+    // An event-driven trigger is real work, not a poll, so it keeps the attempt count.
+    const trigger = input.trigger ? sanitizeIssueMonitorTrigger(input.trigger) : null;
+    const consumeAttempt = trigger === null;
+    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + (consumeAttempt ? 1 : 0);
     const policy = normalizeIssueExecutionPolicy(
       claimed.executionPolicy ?? null,
     );
@@ -698,6 +706,7 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(trigger ? { trigger } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -713,7 +722,8 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
-            manualTrigger: input.activitySource === "manual",
+            ...(trigger ? { trigger } : {}),
+            manualTrigger: input.activitySource === "manual" && trigger === null,
           },
         });
         if (!wake) {
@@ -730,6 +740,7 @@ export function createHeartbeatScheduling(
             issue: claimed,
             policy,
             triggeredAt: input.now,
+            consumeAttempt,
           })),
           updatedAt: new Date(),
         })
@@ -753,6 +764,7 @@ export function createHeartbeatScheduling(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          ...(trigger ? { trigger } : {}),
           source: input.activitySource,
         },
       });
@@ -834,6 +846,7 @@ export function createHeartbeatScheduling(
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     const now = input?.now ?? new Date();
@@ -905,6 +918,7 @@ export function createHeartbeatScheduling(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      trigger: input?.trigger ?? null,
     });
   }
 

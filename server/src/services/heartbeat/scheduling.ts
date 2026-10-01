@@ -44,6 +44,10 @@ import {
   sanitizeIssueMonitorTrigger,
   type IssueMonitorTrigger,
 } from "../issue-monitor-pull-requests.js";
+import {
+  createPullRequestMonitorPoller,
+  type PullRequestMonitorPollerOptions,
+} from "../issue-monitor-pull-request-poller.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
 import { EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON } from "./run-state.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -71,7 +75,12 @@ export interface HeartbeatSchedulingDependencies
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: () => Promise<{ suppressed: boolean }>;
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: Pick<PullRequestMonitorPollerOptions, "fetch" | "getToken" | "intervalMs">;
 }
+
+/** Why an issue monitor was dispatched; a pull request event is neither a person's check-now nor the due timer. */
+type IssueMonitorActivitySource = "manual" | "scheduled" | "pull_request_event";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -136,6 +145,7 @@ export function createHeartbeatScheduling(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    pullRequestPoll,
   } = dependencies;
 
   const issueMonitorDispatchColumns = {
@@ -217,7 +227,7 @@ export function createHeartbeatScheduling(
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     monitor: IssueExecutionMonitorPolicy | null;
-    source: "manual" | "scheduled";
+    source: IssueMonitorActivitySource;
   }) {
     return {
       identifier: input.claimed.identifier,
@@ -289,7 +299,7 @@ export function createHeartbeatScheduling(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -472,7 +482,7 @@ export function createHeartbeatScheduling(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const cleared = await db
       .update(issues)
@@ -555,7 +565,7 @@ export function createHeartbeatScheduling(
       agentId: string | null;
       runId: string | null;
       clearOnClientError: boolean;
-      activitySource: "manual" | "scheduled";
+      activitySource: IssueMonitorActivitySource;
       trigger?: IssueMonitorTrigger | null;
     },
   ) {
@@ -917,9 +927,23 @@ export function createHeartbeatScheduling(
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
-      activitySource: "manual",
+      activitySource: input?.trigger ? "pull_request_event" : "manual",
       trigger: input?.trigger ?? null,
     });
+  }
+
+  const pullRequestMonitorPoller = createPullRequestMonitorPoller(db, {
+    ...pullRequestPoll,
+    triggerMonitor: (issueId, input) => triggerIssueMonitor(issueId, input),
+  });
+
+  async function tickPullRequestMonitors(now: Date) {
+    try {
+      return await pullRequestMonitorPoller.poll(now);
+    } catch (err) {
+      logger.error({ err }, "pull request monitor polling failed");
+      return { polled: 0, baselined: 0, woken: 0 };
+    }
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
@@ -1245,10 +1269,11 @@ export function createHeartbeatScheduling(
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const pullRequestMonitors = await tickPullRequestMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
+        checked: checked + issueMonitors.checked + pullRequestMonitors.polled,
+        enqueued: enqueued + issueMonitors.triggered + pullRequestMonitors.woken,
         skipped: skipped + issueMonitors.skipped,
       };
     }

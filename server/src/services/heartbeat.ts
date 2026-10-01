@@ -12,6 +12,7 @@ export {
 import {
   createHeartbeatScheduling,
   formatIssueIdentifierLink,
+  type HeartbeatSchedulingDependencies,
 } from "./heartbeat/scheduling.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
@@ -834,6 +835,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
 >;
 
 export interface HeartbeatServiceOptions {
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: HeartbeatSchedulingDependencies["pullRequestPoll"];
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -1656,6 +1659,7 @@ export function heartbeatService(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    pullRequestPoll: options.pullRequestPoll,
   });
 
   const {

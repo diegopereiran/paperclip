@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -444,7 +445,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries(buildAgentProcessEnv(env)).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -475,7 +476,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       loggedEnv = buildInvocationEnvForLogs(env, {
-        runtimeEnv: ensurePathInEnv({ ...process.env, ...env }),
+        runtimeEnv: ensurePathInEnv(buildAgentProcessEnv(env)),
         includeRuntimeKeys: ["HOME"],
         resolvedCommand,
       });

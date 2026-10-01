@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import type { Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -100,7 +101,7 @@ function buildGeminiHeadlessEnv(env: Record<string, string>): Record<string, str
 
 function buildGeminiRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildGeminiHeadlessEnv(env) })).filter(
+    Object.entries(ensurePathInEnv(buildAgentProcessEnv(buildGeminiHeadlessEnv(env)))).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );

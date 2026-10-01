@@ -406,6 +406,29 @@ describeEmbeddedPostgres("wake the issue whose run created a done issue", () => 
       expect(await originWakes(companyId)).toHaveLength(1);
     });
 
+    it.each(["failed", "cancelled"])(
+      "does not wake again when the earlier wake ended %s",
+      async (status) => {
+        const { companyId, agentId, originIssueId, gateIssueId } = await seedGate();
+        await db.insert(agentWakeupRequests).values({
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_origin_done",
+          payload: { issueId: originIssueId, doneIssueId: gateIssueId },
+          status,
+          idempotencyKey: `issue_origin_done:${originIssueId}:${gateIssueId}`,
+        });
+
+        const result = await heartbeatService(db).reconcileIssueOriginDoneWakes();
+
+        expect(result.healed).toBe(0);
+        expect(result.existingWakeSkipped).toBe(1);
+        expect(await originWakes(companyId)).toHaveLength(1);
+      },
+    );
+
     it.each([
       ["a routine execution", { gateOriginKind: "routine_execution" }],
       ["a child of the origin issue", { gateParent: "origin" as const }],

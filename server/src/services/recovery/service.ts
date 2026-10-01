@@ -173,13 +173,6 @@ const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const ISSUE_ORIGIN_DONE_WAKE_BACKSTOP_CANDIDATE_LIMIT = 200;
-const ISSUE_ORIGIN_DONE_WAKE_DELIVERED_STATUSES = [
-  "queued",
-  "deferred_issue_execution",
-  "claimed",
-  "coalesced",
-  "completed",
-] as const;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -5535,9 +5528,7 @@ export function recoveryService(
           and(
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-            inArray(agentWakeupRequests.status, [
-              ...ISSUE_ORIGIN_DONE_WAKE_DELIVERED_STATUSES,
-            ]),
+            notInArray(agentWakeupRequests.status, ["skipped"]),
           ),
         )
         .limit(1)

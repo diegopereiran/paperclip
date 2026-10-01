@@ -38,6 +38,14 @@ describe("changedFingerprintFields", () => {
     expect(changedFingerprintFields(base, { ...base, ...patch })).toEqual([field]);
   });
 
+  it("counts a comment or review only when its id grows", () => {
+    expect(changedFingerprintFields(base, { ...base, latestCommentId: null })).toEqual([]);
+    expect(changedFingerprintFields(base, { ...base, latestCommentId: 9 })).toEqual([]);
+    expect(changedFingerprintFields(base, { ...base, latestReviewId: null })).toEqual([]);
+    expect(changedFingerprintFields(base, { ...base, latestReviewId: 19 })).toEqual([]);
+    expect(changedFingerprintFields({ ...base, latestCommentId: null }, { ...base, latestCommentId: 1 })).toEqual(["comment"]);
+  });
+
   it("reports no change for an identical fingerprint", () => {
     expect(changedFingerprintFields(base, { ...base })).toEqual([]);
   });

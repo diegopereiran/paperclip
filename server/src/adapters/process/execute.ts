@@ -1,4 +1,5 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import {
   asString,
   asNumber,
@@ -41,7 +42,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // the child env is built inside runChildProcess from
   // sanitizeInheritedPaperclipEnv(process.env) + env, so a PAPERCLIP_API_KEY
   // on the server process never reaches the child.
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = ensurePathInEnv(buildAgentProcessEnv(env));
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,

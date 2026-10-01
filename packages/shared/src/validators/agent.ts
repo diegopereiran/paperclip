@@ -69,6 +69,8 @@ export const agentRuntimeConfigSchema = z.object({
   // Server environment variables (names or PREFIX_*) this agent's process may
   // inherit on top of the instance allow-list. It can only add.
   inheritEnv: z.array(agentEnvPatternSchema).max(256).optional(),
+  // false opts this agent's monitors out of native PR monitor watching.
+  prMonitorWatching: z.boolean().optional(),
 }).catchall(z.unknown()).superRefine((value, ctx) => {
   if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
     ctx.addIssue({

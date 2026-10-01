@@ -28,6 +28,8 @@ export interface Company {
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
+  /** `false` opts this company out of native PR monitor watching; absent or `null` inherits the instance setting. */
+  prMonitorWatching?: boolean | null;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

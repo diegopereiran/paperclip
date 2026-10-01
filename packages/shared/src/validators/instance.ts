@@ -46,6 +46,9 @@ export const instanceGeneralSettingsSchema = z.object({
   // built-in default list in adapter-utils, for every company, present and
   // future. An agent can add to it (runtimeConfig.inheritEnv), never opt out.
   agentEnvAllowlist: z.array(agentEnvPatternSchema).max(256).optional(),
+  // Native PR monitor watching. Absent = on for every company, present and
+  // future. false turns it off for the whole instance.
+  prMonitorWatching: z.boolean().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

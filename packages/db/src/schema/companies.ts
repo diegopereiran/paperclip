@@ -22,6 +22,8 @@ export const companies = pgTable(
       .$type<InteractionResolverGovernance>()
       .notNull()
       .default({}),
+    // null = inherit the instance setting general.prMonitorWatching.
+    prMonitorWatching: boolean("pr_monitor_watching"),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

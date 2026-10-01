@@ -43,6 +43,12 @@ export interface InstanceGeneralSettings {
    * spawned agent processes inherit. Absent = the built-in default list.
    */
   agentEnvAllowlist?: string[];
+  /**
+   * Native PR monitor watching (polling and GitHub webhooks wake issue
+   * monitors that name a pull request). Absent = on for every company.
+   * A company or an agent may opt out; `false` here turns it off everywhere.
+   */
+  prMonitorWatching?: boolean;
 }
 
 export interface InstanceExperimentalSettings {

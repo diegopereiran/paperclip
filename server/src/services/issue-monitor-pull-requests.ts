@@ -1,7 +1,8 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies, issues, issueWorkProducts } from "@paperclipai/db";
+import { agents, companies, issues, issueWorkProducts } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import {
   extractGitHubPullRequestRefs,
   isValidGitHubName,
@@ -80,36 +81,37 @@ interface MonitorCandidate {
  * matches `triggerIssueMonitor`: a scheduled monitor, an agent assignee with
  * no user assignee, and an `in_progress` or `in_review` status. Without a
  * `companyId` the candidates of every active company are returned.
+ *
+ * This is the one place the native watching switch is applied, so polling and
+ * webhooks stop together: the instance setting `general.prMonitorWatching`
+ * (absent = on), then the company's `prMonitorWatching` and the assignee's
+ * `runtimeConfig.prMonitorWatching`, where only an explicit `false` opts out.
  */
 async function loadMonitorCandidates(db: Db, scope: { companyId?: string }): Promise<MonitorCandidate[]> {
+  if ((await instanceSettingsService(db).getGeneral()).prMonitorWatching === false) return [];
   const gate = [
     sql`${issues.monitorNextCheckAt} is not null`,
     isNull(issues.assigneeUserId),
     sql`${issues.assigneeAgentId} is not null`,
     inArray(issues.status, ["in_progress", "in_review"]),
+    sql`${companies.prMonitorWatching} is distinct from false`,
+    sql`coalesce(${agents.runtimeConfig} ->> 'prMonitorWatching', 'true') <> 'false'`,
   ];
-  const rows = scope.companyId
-    ? await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          executionPolicy: issues.executionPolicy,
-          monitorNotes: issues.monitorNotes,
-        })
-        .from(issues)
-        .where(and(eq(issues.companyId, scope.companyId), ...gate))
-    : await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          executionPolicy: issues.executionPolicy,
-          monitorNotes: issues.monitorNotes,
-        })
-        .from(issues)
-        .innerJoin(companies, eq(companies.id, issues.companyId))
-        .where(and(eq(companies.status, "active"), ...gate));
+  const columns = {
+    id: issues.id,
+    companyId: issues.companyId,
+    identifier: issues.identifier,
+    executionPolicy: issues.executionPolicy,
+    monitorNotes: issues.monitorNotes,
+  };
+  const rows = await db
+    .select(columns)
+    .from(issues)
+    .innerJoin(companies, eq(companies.id, issues.companyId))
+    .innerJoin(agents, eq(agents.id, issues.assigneeAgentId))
+    .where(
+      and(...(scope.companyId ? [eq(issues.companyId, scope.companyId)] : [eq(companies.status, "active")]), ...gate),
+    );
   if (rows.length === 0) return [];
 
   const workProducts = await db

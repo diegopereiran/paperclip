@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
@@ -12,6 +15,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companySecrets,
   companySkills,
   createDb,
   documentRevisions,
@@ -22,6 +26,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueDocuments,
+  instanceSettings,
   issues,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
@@ -31,6 +36,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
+import { secretService } from "../services/secrets.ts";
 import { createGitHubMonitorWebhookSink } from "../services/github-monitor-webhook-sink.ts";
 import { listWatchedMonitorPullRequests, sanitizeIssueMonitorTrigger } from "../services/issue-monitor-pull-requests.ts";
 
@@ -255,6 +262,49 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
 
     return { companyId, agentId, issueId, nextCheckAt };
+  }
+
+  async function seedEndpoint(companyId: string, agentId: string) {
+    const endpointId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    await db.insert(toolApplications).values({
+      id: applicationId,
+      companyId,
+      applicationKey: `chat:github:${endpointId}`,
+      name: "GitHub chat",
+      type: "chat",
+      status: "active",
+    });
+    await db.insert(toolConnections).values({
+      id: connectionId,
+      companyId,
+      applicationId,
+      name: "GitHub chat",
+      uid: `chat-github-${endpointId}`,
+      connectionPurpose: "channel",
+      transport: "chat_sdk",
+      authKind: "api_key",
+      config: { provider: "github" },
+      transportConfig: {},
+    });
+    await db.insert(chatEndpoints).values({
+      id: endpointId,
+      companyId,
+      connectionId,
+      provider: "github",
+      publicId: `pub-${endpointId}`,
+      assignedAgentId: agentId,
+      status: "active",
+    });
+    return endpointId;
+  }
+
+  function makeSink() {
+    const heartbeat = heartbeatService(db);
+    return createGitHubMonitorWebhookSink(db, {
+      triggerMonitor: (issueId, input) => heartbeat.triggerIssueMonitor(issueId, input),
+    });
   }
 
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
@@ -830,49 +880,6 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       ["pull_request_review_comment", "pull_request_review_comment:created", pr("created", { comment: { id: 10, body: "private text" } })],
     ];
 
-    async function seedEndpoint(companyId: string, agentId: string) {
-      const endpointId = randomUUID();
-      const applicationId = randomUUID();
-      const connectionId = randomUUID();
-      await db.insert(toolApplications).values({
-        id: applicationId,
-        companyId,
-        applicationKey: `chat:github:${endpointId}`,
-        name: "GitHub chat",
-        type: "chat",
-        status: "active",
-      });
-      await db.insert(toolConnections).values({
-        id: connectionId,
-        companyId,
-        applicationId,
-        name: "GitHub chat",
-        uid: `chat-github-${endpointId}`,
-        connectionPurpose: "channel",
-        transport: "chat_sdk",
-        authKind: "api_key",
-        config: { provider: "github" },
-        transportConfig: {},
-      });
-      await db.insert(chatEndpoints).values({
-        id: endpointId,
-        companyId,
-        connectionId,
-        provider: "github",
-        publicId: `pub-${endpointId}`,
-        assignedAgentId: agentId,
-        status: "active",
-      });
-      return endpointId;
-    }
-
-    function makeSink() {
-      const heartbeat = heartbeatService(db);
-      return createGitHubMonitorWebhookSink(db, {
-        triggerMonitor: (issueId, input) => heartbeat.triggerIssueMonitor(issueId, input),
-      });
-    }
-
     it.each(events)("wakes the matching monitor once for %s", async (eventType, expectedEvent, payload) => {
       const { companyId, issueId, agentId } = await seedFixture({
         monitor: { pullRequests: [{ owner: "acme", repo: "widgets", number: 7 }] },
@@ -962,6 +969,148 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       const rows = await db.execute(sql`select payload::text as payload from chat_actions where endpoint_id = ${endpointId}`);
       expect(rows).toHaveLength(1);
       expect(JSON.stringify(rows)).not.toContain("private text");
+    });
+  });
+  describe("native pull request watching is on by default and can be switched off", () => {
+    const state = { headSha: "sha-1" };
+    const requests: string[] = [];
+    const fakeFetch = async (url: string) => {
+      requests.push(url);
+      const { pathname } = new URL(url);
+      if (pathname.endsWith("/pulls/5")) {
+        return new Response(
+          JSON.stringify({ state: "open", merged: false, mergeable_state: "clean", head: { sha: state.headSha } }),
+          { status: 200 },
+        );
+      }
+      if (pathname.includes("/check-suites")) {
+        return new Response(JSON.stringify({ check_suites: [{ status: "completed", conclusion: "success" }] }), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    };
+    const pullRequests = [{ owner: "o", repo: "r", number: 5 }];
+    const webhookPayload = {
+      action: "synchronize",
+      repository: { id: 1, full_name: "O/R" },
+      pull_request: { number: 5, head: { sha: "headsha1" }, merged: false },
+    };
+    const secretsDir = path.join(os.tmpdir(), `paperclip-pr-watch-default-${randomUUID()}`);
+    const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+
+    beforeAll(() => {
+      mkdirSync(secretsDir, { recursive: true });
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsDir, "master.key");
+    });
+
+    afterAll(() => {
+      if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+      rmSync(secretsDir, { recursive: true, force: true });
+    });
+
+    afterEach(async () => {
+      await db.delete(instanceSettings);
+      await db.delete(companySecrets);
+    });
+
+    async function wakeCount(agentId: string) {
+      return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).length;
+    }
+
+    async function pollUntilChange(heartbeat: ReturnType<typeof heartbeatService>) {
+      state.headSha = "sha-1";
+      requests.length = 0;
+      await heartbeat.tickTimers(new Date("2026-04-11T12:00:00.000Z"));
+      state.headSha = "sha-2";
+      await heartbeat.tickTimers(new Date("2026-04-11T12:04:00.000Z"));
+    }
+
+    it("wakes a company created after boot that has only a GitHub token secret, through polling", async () => {
+      const { companyId, agentId } = await seedFixture({ monitor: { pullRequests } });
+      await secretService(db).create(companyId, { name: "GITHUB_TOKEN", provider: "local_encrypted", value: "ghp_fixture_value" });
+      const heartbeat = heartbeatService(db, { pullRequestPoll: { fetch: fakeFetch } });
+
+      await pollUntilChange(heartbeat);
+
+      expect(await wakeCount(agentId)).toBe(1);
+    });
+
+    it("wakes a company created after boot that has only a GitHub chat endpoint, through the webhook", async () => {
+      const { companyId, agentId } = await seedFixture({ monitor: { pullRequests } });
+
+      const result = await makeSink().handle({
+        companyId,
+        endpointId: await seedEndpoint(companyId, agentId),
+        eventType: "pull_request",
+        deliveryId: "created-after-boot",
+        payload: webhookPayload,
+      });
+
+      expect(result).toMatchObject({ outcome: "processed", woken: 1 });
+      expect(await wakeCount(agentId)).toBe(1);
+    });
+
+    async function switchOff(level: "instance" | "company" | "agent", target: { companyId: string; agentId: string }) {
+      if (level === "instance") await instanceSettingsService(db).updateGeneral({ prMonitorWatching: false });
+      if (level === "company") await db.update(companies).set({ prMonitorWatching: false }).where(eq(companies.id, target.companyId));
+      if (level === "agent") {
+        await db
+          .update(agents)
+          .set({ runtimeConfig: sql`${agents.runtimeConfig} || '{"prMonitorWatching": false}'::jsonb` })
+          .where(eq(agents.id, target.agentId));
+      }
+    }
+
+    it.each(["instance", "company", "agent"] as const)(
+      "stops polling and webhook wakes when switched off for the %s",
+      async (level) => {
+        const target = await seedFixture({ monitor: { pullRequests } });
+        await secretService(db).create(target.companyId, { name: "GITHUB_TOKEN", provider: "local_encrypted", value: "ghp_fixture_value" });
+        await switchOff(level, target);
+        const heartbeat = heartbeatService(db, { pullRequestPoll: { fetch: fakeFetch } });
+
+        await pollUntilChange(heartbeat);
+        const result = await makeSink().handle({
+          companyId: target.companyId,
+          endpointId: await seedEndpoint(target.companyId, target.agentId),
+          eventType: "pull_request",
+          deliveryId: `off-${level}`,
+          payload: webhookPayload,
+        });
+
+        expect(requests).toEqual([]);
+        expect(result).toMatchObject({ woken: 0 });
+        expect(await wakeCount(target.agentId)).toBe(0);
+      },
+    );
+
+    it("keeps watching other companies and agents when one company or agent opts out", async () => {
+      const optedOut = await seedFixture({ monitor: { pullRequests } });
+      const other = await seedFixture({ monitor: { pullRequests } });
+      await switchOff("company", optedOut);
+      await secretService(db).create(other.companyId, { name: "GITHUB_TOKEN", provider: "local_encrypted", value: "ghp_fixture_value" });
+      const heartbeat = heartbeatService(db, { pullRequestPoll: { fetch: fakeFetch } });
+
+      await pollUntilChange(heartbeat);
+
+      expect(await wakeCount(optedOut.agentId)).toBe(0);
+      expect(await wakeCount(other.agentId)).toBe(1);
+    });
+
+    it("resumes watching when the instance switch is turned back on", async () => {
+      const target = await seedFixture({ monitor: { pullRequests } });
+      await instanceSettingsService(db).updateGeneral({ prMonitorWatching: false });
+      await instanceSettingsService(db).updateGeneral({ prMonitorWatching: true });
+
+      const result = await makeSink().handle({
+        companyId: target.companyId,
+        endpointId: await seedEndpoint(target.companyId, target.agentId),
+        eventType: "pull_request",
+        deliveryId: "back-on",
+        payload: webhookPayload,
+      });
+
+      expect(result).toMatchObject({ woken: 1 });
     });
   });
 });

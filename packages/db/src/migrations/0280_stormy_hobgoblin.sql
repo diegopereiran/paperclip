@@ -1,0 +1,1 @@
+ALTER TABLE "companies" ADD COLUMN "pr_monitor_watching" boolean;

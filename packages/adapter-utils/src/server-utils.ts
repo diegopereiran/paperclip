@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { selectInheritedAgentEnv } from "./agent-env-policy.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -3404,6 +3405,14 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Set by Paperclip for its own children; not secrets, so they outlive the
+// PAPERCLIP_* strip.
+const PAPERCLIP_RUNTIME_PASS_THROUGH = new Set([
+  "PAPERCLIP_RUNTIME_API_URL",
+  "PAPERCLIP_LISTEN_HOST",
+  "PAPERCLIP_LISTEN_PORT",
+]);
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -3411,10 +3420,19 @@ export function sanitizeInheritedPaperclipEnv(
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
-    if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
-    if (key === "PAPERCLIP_LISTEN_HOST") continue;
-    if (key === "PAPERCLIP_LISTEN_PORT") continue;
+    if (PAPERCLIP_RUNTIME_PASS_THROUGH.has(key)) continue;
     delete env[key];
+  }
+  return env;
+}
+
+/** The server environment an agent process inherits: the allow-list only. */
+export function inheritedAgentProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = selectInheritedAgentEnv(source);
+  for (const key of PAPERCLIP_RUNTIME_PASS_THROUGH) {
+    if (typeof source[key] === "string") env[key] = source[key];
   }
   return env;
 }
@@ -4599,8 +4617,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // A remote launch only runs the local ssh client here; the agent's own
+    // env travels in opts.env. Every other launch is the agent process itself
+    // and inherits only the allow-listed part of the server environment.
     const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
+      ...(opts.remoteExecution
+        ? sanitizeInheritedPaperclipEnv(process.env)
+        : inheritedAgentProcessEnv()),
       ...opts.env,
     };
 

@@ -18,11 +18,22 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
+
+function hireInheritEnv(payload: unknown): string[] {
+  const runtimeConfig = (payload as { runtimeConfig?: unknown } | null | undefined)?.runtimeConfig;
+  return normalizeAgentEnvPatterns((runtimeConfig as { inheritEnv?: unknown } | null | undefined)?.inheritEnv);
+}
+
+function assertInheritEnvAdditionAllowed(req: Request, next: unknown, previous?: unknown) {
+  const carried = new Set(hireInheritEnv(previous));
+  if (hireInheritEnv(next).some((name) => !carried.has(name))) assertInstanceAdmin(req);
+}
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -230,6 +241,7 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    if (approvalInput.type === "hire_agent") assertInheritEnvAdditionAllowed(req, approvalInput.payload);
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -470,6 +482,10 @@ export function approvalRoutes(
     if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
       res.status(403).json({ error: "Only requesting agent can resubmit this approval" });
       return;
+    }
+
+    if (existing.type === "hire_agent" && req.body.payload) {
+      assertInheritEnvAdditionAllowed(req, req.body.payload, existing.payload);
     }
 
     const normalizedPayload = req.body.payload

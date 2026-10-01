@@ -155,4 +155,32 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       metadata: { source: "hire-form" },
     });
   });
+  it("does not activate inheritEnv names that the pending hire row never carried", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const pending = await agentSvc.create(companyId, {
+      name: "Env Coder",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { inheritEnv: ["GH_TOKEN"] },
+      budgetMonthlyCents: 0,
+      metadata: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+
+    const activated = await agentSvc.activatePendingApproval(pending.id, {
+      name: "Env Coder",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { inheritEnv: ["GH_TOKEN", "DATABASE_URL", "BETTER_AUTH_SECRET"] },
+    });
+
+    expect(activated?.activated).toBe(true);
+    expect((activated?.agent.runtimeConfig as Record<string, unknown>).inheritEnv).toEqual(["GH_TOKEN"]);
+  });
+
 });

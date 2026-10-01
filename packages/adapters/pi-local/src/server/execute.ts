@@ -1,6 +1,7 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,7 +54,6 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
-  sanitizeInheritedPaperclipEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./parse.js";
@@ -357,7 +357,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const skillBinDirs = piSkillEntries
       .filter((entry) => injectedSkillKeys.has(entry.key) && entry.source.length > 0)
       .map((entry) => path.join(entry.source, "bin"));
-    const mergedEnv = ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env });
+    const mergedEnv = ensurePathInEnv(buildAgentProcessEnv(env));
     const pathKey =
       typeof mergedEnv.Path === "string" && mergedEnv.Path.length > 0 && !mergedEnv.PATH
         ? "Path"
@@ -509,7 +509,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         Object.assign(env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(env, {
           runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
+            Object.entries(ensurePathInEnv(buildAgentProcessEnv(env))).filter(
               (entry): entry is [string, string] => typeof entry[1] === "string",
             ),
           ),

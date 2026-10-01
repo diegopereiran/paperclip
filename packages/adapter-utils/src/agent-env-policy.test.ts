@@ -69,6 +69,13 @@ describe("selectInheritedAgentEnv", () => {
     }
   });
 
+  it("keeps DISABLE_AUTOUPDATER so a claude_local run does not update the CLI mid-run", () => {
+    // The service sets it to pin the Claude Code version; dropping it lets every
+    // agent run self-update the shared CLI binary.
+    const selected = selectInheritedAgentEnv({ DISABLE_AUTOUPDATER: "1", DISABLE_OTHER: "1" });
+    expect(selected).toEqual({ DISABLE_AUTOUPDATER: "1" });
+  });
+
   it("keeps the hermes provider keys its environment test reads", () => {
     const selected = selectInheritedAgentEnv({ ZAI_API_KEY: "z", MINIMAX_API_KEY: "m", OTHER_API_KEY: "o" });
     expect(selected).toEqual({ ZAI_API_KEY: "z", MINIMAX_API_KEY: "m" });

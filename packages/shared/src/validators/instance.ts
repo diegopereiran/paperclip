@@ -8,6 +8,7 @@ import {
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
 import { shapeWithoutDefaults } from "./partial.js";
+import { agentProcessPolicySchema } from "./agent-process-policy.js";
 
 function presetSchema<T extends readonly number[]>(presets: T, label: string) {
   return z.number().refine(
@@ -46,6 +47,10 @@ export const instanceGeneralSettingsSchema = z.object({
   // built-in default list in adapter-utils, for every company, present and
   // future. An agent can add to it (runtimeConfig.inheritEnv), never opt out.
   agentEnvAllowlist: z.array(agentEnvPatternSchema).max(256).optional(),
+  // Default process confinement for every company, present and future. A
+  // company or an agent may override it; nobody opts in. PATCH replaces the
+  // whole object. Absent = mode "off".
+  agentProcessPolicy: agentProcessPolicySchema.optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

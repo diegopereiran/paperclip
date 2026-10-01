@@ -1748,6 +1748,26 @@ export {
   DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
 } from "./types/feedback.js";
 
+export type {
+  AgentProcessPolicy,
+  AgentProcessPolicyMode,
+  AgentProcessFilesystemScope,
+  AgentProcessGitDir,
+  AgentProcessNetworkScope,
+} from "./types/agent-process-policy.js";
+
+export {
+  agentProcessPolicySchema,
+  type AgentProcessPolicyInput,
+} from "./validators/agent-process-policy.js";
+
+export {
+  STATIC_FORBIDDEN_BIND_ROOTS,
+  cleanAbsoluteBindPath,
+  findUnsafeBindPath,
+  type AgentProcessBindRoots,
+} from "./agent-process-bind-paths.js";
+
 export {
   DAILY_RETENTION_PRESETS,
   WEEKLY_RETENTION_PRESETS,

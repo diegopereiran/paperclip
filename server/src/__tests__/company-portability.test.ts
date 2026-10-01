@@ -6116,6 +6116,71 @@ describe("company portability", () => {
     );
     expect(agentSvc.create).toHaveBeenCalledTimes(createCallsBeforeInvalidProfile);
   });
+
+  it("never imports a process policy from a bundle, and an update keeps the target agent's own", async () => {
+    const portability = companyPortabilityService({} as any);
+    const sourceAgents = (await agentSvc.list()) as Array<Record<string, unknown>>;
+    const withPolicy = (policy: unknown) => sourceAgents.map((agent) => ({
+      ...agent,
+      runtimeConfig: { ...((agent.runtimeConfig ?? {}) as Record<string, unknown>), processPolicy: policy },
+    }));
+    agentSvc.list.mockResolvedValue(withPolicy({ mode: "off", network: { scope: "shared" } }));
+    agentSvc.list.mockClear();
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: false, issues: false },
+    });
+
+    const targetPolicy = { mode: "enforce", network: { scope: "deny" } };
+    agentSvc.list.mockResolvedValue(withPolicy(targetPolicy));
+    agentSvc.update.mockImplementation(async (id: string, patch: Record<string, unknown>) => ({
+      id,
+      name: "ClaudeCoder",
+      adapterType: patch.adapterType,
+      adapterConfig: patch.adapterConfig,
+      runtimeConfig: patch.runtimeConfig,
+    }));
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: false, agents: true, projects: false, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      agents: ["claudecoder"],
+      collisionStrategy: "replace",
+    }, "user-1");
+    const updateCall = agentSvc.update.mock.calls.find(([id]) => id === "agent-1");
+    expect((updateCall?.[1].runtimeConfig as Record<string, unknown>).processPolicy).toEqual(targetPolicy);
+
+    agentSvc.update.mockClear();
+    agentSvc.list.mockResolvedValue(sourceAgents);
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: false, agents: true, projects: false, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      agents: ["claudecoder"],
+      collisionStrategy: "replace",
+    }, "user-1");
+    const bareUpdate = agentSvc.update.mock.calls.find(([id]) => id === "agent-1");
+    expect(bareUpdate?.[1].runtimeConfig).not.toHaveProperty("processPolicy");
+
+    companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.name).toLowerCase()}`,
+      name: input.name,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    }));
+    agentSvc.list.mockResolvedValue([]);
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+      agents: "all",
+      collisionStrategy: "rename",
+    }, "user-1");
+    expect(agentSvc.create.mock.calls.length).toBeGreaterThan(0);
+    for (const [, input] of agentSvc.create.mock.calls) {
+      expect(input.runtimeConfig).not.toHaveProperty("processPolicy");
+    }
+  });
 });
 
 describe("dedupeImportedCompanyName", () => {

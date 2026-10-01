@@ -992,6 +992,119 @@ describe.sequential("agent permission routes", () => {
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
+  describe("agent process policy writes", () => {
+    const enforcing = {
+      mode: "enforce",
+      filesystem: { scope: "workspace", rw: ["/srv/shared/cache"] },
+      network: { scope: "deny" },
+    };
+    const nonAdmin = () =>
+      createApp({
+        type: "board",
+        userId: "agent-admin-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+    it("requires instance administration to widen the policy on update", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { processPolicy: enforcing } });
+      const app = await nonAdmin();
+      const widenings = [
+        { ...enforcing, mode: "off" },
+        { ...enforcing, network: { scope: "shared" } },
+        { ...enforcing, filesystem: { ...enforcing.filesystem, rw: ["/srv/shared/cache", "/srv/other"] } },
+        { ...enforcing, filesystem: { ...enforcing.filesystem, ro: ["/srv/data"] } },
+        { ...enforcing, network: { scope: "deny", allowlist: ["api.example.org"] } },
+      ];
+      for (const processPolicy of widenings) {
+        const res = await requestApp(app, (baseUrl) => request(baseUrl)
+          .patch(`/api/agents/${agentId}`)
+          .send({ runtimeConfig: { processPolicy } }));
+        expect(res.status, JSON.stringify(processPolicy)).toBe(403);
+      }
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("treats dropping the policy from a replaced runtimeConfig as widening", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { processPolicy: enforcing } });
+      const res = await requestApp(await nonAdmin(), (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { heartbeat: { enabled: false } } }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("lets a non-admin narrow the policy and an instance admin widen it", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { processPolicy: enforcing } });
+      const narrower = {
+        mode: "enforce",
+        filesystem: { scope: "workspace", rw: [] },
+        network: { scope: "deny" },
+      };
+      const narrowed = await requestApp(await nonAdmin(), (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { processPolicy: { ...narrower, filesystem: { scope: "workspace" } } } }));
+      expect(narrowed.status, JSON.stringify(narrowed.body)).toBe(200);
+
+      const instanceAdmin = await createApp({
+        type: "board",
+        userId: "instance-admin-user",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const widened = await requestApp(instanceAdmin, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { processPolicy: { ...enforcing, network: { scope: "shared" } } } }));
+      expect(widened.status, JSON.stringify(widened.body)).toBe(200);
+    });
+
+    it("rejects an unsafe bind path at request validation", async () => {
+      const res = await requestApp(await nonAdmin(), (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { processPolicy: { mode: "enforce", filesystem: { rw: ["/"] } } } }));
+      expect(res.status).toBe(400);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["direct creation", `/api/companies/${companyId}/agents`],
+      ["hire creation", `/api/companies/${companyId}/agent-hires`],
+    ])("requires instance administration to widen the policy during %s", async (_label, path) => {
+      const res = await requestApp(await nonAdmin(), (baseUrl) => request(baseUrl)
+        .post(path)
+        .send({
+          name: "Policy attempt",
+          role: "engineer",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: { processPolicy: { mode: "off" } },
+        }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects non-admin rollback into a wider policy", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { processPolicy: enforcing } });
+      mockAgentService.getConfigRevision.mockResolvedValue({
+        id: "44444444-4444-4444-8444-444444444444",
+        afterConfig: {
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: { processPolicy: { mode: "off" } },
+        },
+      });
+      const response = await requestApp(await nonAdmin(), (baseUrl) =>
+        request(baseUrl).post(
+          `/api/agents/${agentId}/config-revisions/44444444-4444-4444-8444-444444444444/rollback`,
+        ),
+      );
+      expect(response.status).toBe(403);
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+  });
+
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {
     const app = await createApp({
       type: "agent",

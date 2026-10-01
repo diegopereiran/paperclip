@@ -20,6 +20,7 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
+import { assertRuntimeConfigProcessPolicyWriteAllowed } from "./agent-process-policy-authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
@@ -33,6 +34,11 @@ function hireInheritEnv(payload: unknown): string[] {
 function assertInheritEnvAdditionAllowed(req: Request, next: unknown, previous?: unknown) {
   const carried = new Set(hireInheritEnv(previous));
   if (hireInheritEnv(next).some((name) => !carried.has(name))) assertInstanceAdmin(req);
+  assertRuntimeConfigProcessPolicyWriteAllowed(
+    req,
+    (next as { runtimeConfig?: unknown } | null | undefined)?.runtimeConfig,
+    (previous as { runtimeConfig?: unknown } | null | undefined)?.runtimeConfig,
+  );
 }
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {

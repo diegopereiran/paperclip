@@ -183,4 +183,86 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
     expect((activated?.agent.runtimeConfig as Record<string, unknown>).inheritEnv).toEqual(["GH_TOKEN"]);
   });
 
+  it("does not activate a process policy that widens the one the pending row carried", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const carried = { mode: "enforce", network: { scope: "deny" } };
+    const pending = await agentSvc.create(companyId, {
+      name: "Policy Coder",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { processPolicy: carried },
+      budgetMonthlyCents: 0,
+      metadata: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+
+    const widened = await agentSvc.activatePendingApproval(pending.id, {
+      name: "Policy Coder",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { processPolicy: { mode: "off", network: { scope: "shared" } } },
+    });
+    expect(widened?.activated).toBe(true);
+    expect((widened?.agent.runtimeConfig as Record<string, unknown>).processPolicy).toEqual(carried);
+  });
+
+  it("keeps the carried process policy when the approval payload leaves it out", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const carried = { mode: "enforce", network: { scope: "deny" } };
+    const pending = await agentSvc.create(companyId, {
+      name: "Quiet Coder",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { processPolicy: carried },
+      budgetMonthlyCents: 0,
+      metadata: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+
+    const activated = await agentSvc.activatePendingApproval(pending.id, {
+      name: "Quiet Coder",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { maxConcurrentRuns: 1 },
+    });
+    expect((activated?.agent.runtimeConfig as Record<string, unknown>).processPolicy).toEqual(carried);
+  });
+
+  it("activates a process policy that narrows the carried one", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const pending = await agentSvc.create(companyId, {
+      name: "Narrow Coder",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { processPolicy: { mode: "enforce", network: { scope: "allowlist", allowlist: ["a.example.org"] } } },
+      budgetMonthlyCents: 0,
+      metadata: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+
+    const narrowed = { mode: "enforce", network: { scope: "deny" } };
+    const activated = await agentSvc.activatePendingApproval(pending.id, {
+      name: "Narrow Coder",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { processPolicy: narrowed },
+    });
+    expect((activated?.agent.runtimeConfig as Record<string, unknown>).processPolicy).toEqual(narrowed);
+  });
+
 });

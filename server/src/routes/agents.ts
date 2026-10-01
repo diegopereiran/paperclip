@@ -107,6 +107,7 @@ import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
+import { assertRuntimeConfigProcessPolicyWriteAllowed } from "./agent-process-policy-authz.js";
 import {
   persistReprojectedWorkspaceDiffs,
   projectCodexWorkspaceDiffsFromTrace,
@@ -2232,7 +2233,7 @@ export function agentRoutes(
     return normalizeLegacyRunnerProvider(next);
   }
 
-  function assertProviderTraceSettingTransition(
+  function assertAdminOnlyRuntimeConfigTransition(
     req: Request,
     nextRuntimeConfig: unknown,
     previousRuntimeConfig?: unknown,
@@ -2246,6 +2247,7 @@ export function agentRoutes(
     const addsInherit = normalizeAgentEnvPatterns(asRecord(nextRuntimeConfig)?.inheritEnv)
       .some((pattern) => !previousInherit.has(pattern));
     if (addsInherit) assertInstanceAdmin(req);
+    assertRuntimeConfigProcessPolicyWriteAllowed(req, nextRuntimeConfig, previousRuntimeConfig);
   }
 
   async function assertAgentDefaultEnvironmentSelection(
@@ -4283,7 +4285,7 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
-    assertProviderTraceSettingTransition(
+    assertAdminOnlyRuntimeConfigTransition(
       req,
       rollbackConfig.runtimeConfig,
       existing.runtimeConfig,
@@ -4423,7 +4425,7 @@ export function agentRoutes(
     } = req.body;
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
-    assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
+    assertAdminOnlyRuntimeConfigTransition(req, hireInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
       companyId,
       hireInput.adapterType,
@@ -4725,7 +4727,7 @@ export function agentRoutes(
     } = req.body;
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
-    assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
+    assertAdminOnlyRuntimeConfigTransition(req, createInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
       companyId,
       createInput.adapterType,
@@ -5203,7 +5205,7 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      assertProviderTraceSettingTransition(
+      assertAdminOnlyRuntimeConfigTransition(
         req,
         runtimeConfig,
         existing.runtimeConfig,

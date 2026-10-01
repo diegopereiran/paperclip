@@ -37,6 +37,8 @@ export {
   type DecisionSpecInput,
 } from "./decision.js";
 
+export { agentProcessPolicySchema, type AgentProcessPolicyInput } from "./agent-process-policy.js";
+
 export {
   instanceSettingsSchema,
   instanceGeneralSettingsSchema,

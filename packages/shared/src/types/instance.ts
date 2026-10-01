@@ -1,3 +1,4 @@
+import type { AgentProcessPolicy } from "./agent-process-policy.js";
 import type { FeedbackDataSharingPreference } from "./feedback.js";
 
 export const DAILY_RETENTION_PRESETS = [3, 7, 14] as const;
@@ -43,6 +44,11 @@ export interface InstanceGeneralSettings {
    * spawned agent processes inherit. Absent = the built-in default list.
    */
   agentEnvAllowlist?: string[];
+  /**
+   * Instance-wide default confinement for spawned agent processes, inherited
+   * by every company and agent unless they override it. Absent = mode "off".
+   */
+  agentProcessPolicy?: AgentProcessPolicy;
 }
 
 export interface InstanceExperimentalSettings {

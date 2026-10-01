@@ -210,6 +210,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       ...(parsed.data.agentEnvAllowlist ? { agentEnvAllowlist: parsed.data.agentEnvAllowlist } : {}),
+      ...(parsed.data.agentProcessPolicy ? { agentProcessPolicy: parsed.data.agentProcessPolicy } : {}),
     };
   }
   return {

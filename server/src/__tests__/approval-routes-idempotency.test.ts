@@ -410,6 +410,51 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
   });
 
+  it("requires instance administration to widen the process policy in a hire approval", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: unknown) => payload,
+    );
+    const payload = {
+      name: "Policy attempt",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: { processPolicy: { mode: "off", network: { scope: "shared" } } },
+    };
+
+    const agentRes = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "hire_agent", payload });
+    const boardRes = await request(await createApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "hire_agent", payload });
+
+    expect(agentRes.status).toBe(403);
+    expect(boardRes.status).toBe(403);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("requires instance administration to widen the process policy when resubmitting a hire approval", async () => {
+    const narrow = { mode: "enforce", network: { scope: "deny" } };
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-9",
+      companyId: "company-1",
+      type: "hire_agent",
+      status: "revision_requested",
+      payload: { runtimeConfig: { processPolicy: narrow } },
+      requestedByAgentId: "agent-1",
+    });
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: unknown) => payload,
+    );
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-9/resubmit")
+      .send({ payload: { runtimeConfig: { processPolicy: { mode: "enforce", network: { scope: "shared" } } } } });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
   it("blocks status-only recovery runs from creating approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {

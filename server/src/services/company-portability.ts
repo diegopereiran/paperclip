@@ -1319,6 +1319,9 @@ function sanitizeImportedAgentRuntimeConfig(runtimeConfig: unknown) {
   // Imports sit below the instance-admin boundary; widening the child
   // process environment stays an administrator action.
   delete next.inheritEnv;
+  // Same boundary for the process policy; an import update keeps the target
+  // agent's own value (see the update branch of the import).
+  delete next.processPolicy;
   const heartbeat = isPlainRecord(next.heartbeat) ? { ...next.heartbeat } : {};
   heartbeat.enabled = false;
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {
@@ -5498,7 +5501,11 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       const preImportExistingAgentIds = new Set<string>();
       const agentStatusById = new Map<string, string | null | undefined>();
       const existingAgents = await agents.list(targetCompany.id);
+      const existingProcessPolicyById = new Map<string, unknown>();
       for (const existing of existingAgents) {
+        if (isPlainRecord(existing.runtimeConfig) && existing.runtimeConfig.processPolicy !== undefined) {
+          existingProcessPolicyById.set(existing.id, existing.runtimeConfig.processPolicy);
+        }
         const slug = normalizeAgentUrlKey(existing.name) ?? existing.id;
         existingSlugToAgentId.set(slug, existing.id);
         preImportExistingSlugToAgentId.set(slug, existing.id);
@@ -5617,8 +5624,14 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             : {};
 
           if (planAgent.action === "update" && planAgent.existingAgentId) {
+            // The update replaces runtimeConfig, so carry the target agent's own
+            // process policy over: dropping a narrowing override would widen it.
+            const existingProcessPolicy = existingProcessPolicyById.get(planAgent.existingAgentId);
             let updated = await agents.update(planAgent.existingAgentId, {
               ...patch,
+              ...(existingProcessPolicy === undefined
+                ? {}
+                : { runtimeConfig: { ...patch.runtimeConfig, processPolicy: existingProcessPolicy } }),
               ...automationPausePatch,
             });
             if (!updated) {

@@ -673,6 +673,61 @@ describe("instance settings routes", () => {
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
   });
 
+  describe("agentProcessPolicy instance setting", () => {
+    const adminActor = {
+      type: "board",
+      userId: "owner-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+
+    it("stores a valid policy and lets only an instance admin write it", async () => {
+      const policy = {
+        mode: "enforce",
+        filesystem: { scope: "workspace", rw: ["/srv/shared/cache"] },
+        network: { scope: "deny" },
+      };
+      const ok = await request(await createApp(adminActor))
+        .patch("/api/instance/settings/general")
+        .send({ agentProcessPolicy: policy });
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ agentProcessPolicy: policy });
+
+      mockInstanceSettingsService.updateGeneral.mockClear();
+      const denied = await request(await createApp({ ...adminActor, isInstanceAdmin: false }))
+        .patch("/api/instance/settings/general")
+        .send({ agentProcessPolicy: { mode: "off" } });
+      expect(denied.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["the filesystem root", { filesystem: { rw: ["/"] } }],
+      ["a relative path", { filesystem: { ro: ["relative/dir"] } }],
+      ["a parent of the Postgres socket", { filesystem: { rw: ["/run"] } }],
+      ["the Postgres socket", { filesystem: { rw: ["/var/run/postgresql"] } }],
+      ["a relative wrapper", { commandWrapper: ["bwrap"] }],
+      ["an unknown key", { network: { scope: "deny", proxy: "x" } }],
+    ])("rejects %s", async (_label, policy) => {
+      const res = await request(await createApp(adminActor))
+        .patch("/api/instance/settings/general")
+        .send({ agentProcessPolicy: { mode: "enforce", ...policy } });
+      expect(res.status).toBe(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects a bind that contains the server user's home", async () => {
+      const home = process.env.HOME ?? "/home";
+      const res = await request(await createApp(adminActor))
+        .patch("/api/instance/settings/general")
+        .send({ agentProcessPolicy: { mode: "enforce", filesystem: { rw: [home] } } });
+      expect(res.status).toBe(422);
+      expect(res.body.details?.code).toBe("invalid_agent_process_policy");
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+  });
+
   describe("executionMode floor on cloud-managed instances", () => {
     const adminActor = {
       type: "board",

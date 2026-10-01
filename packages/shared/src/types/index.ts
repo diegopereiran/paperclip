@@ -100,6 +100,13 @@ export type {
   FeedbackTraceBundle,
 } from "./feedback.js";
 export type {
+  AgentProcessPolicy,
+  AgentProcessPolicyMode,
+  AgentProcessFilesystemScope,
+  AgentProcessGitDir,
+  AgentProcessNetworkScope,
+} from "./agent-process-policy.js";
+export type {
   InstanceExecutionMode,
   InstanceExperimentalSettings,
   InstanceExperimentalSettingsWithManaged,

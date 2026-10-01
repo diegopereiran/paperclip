@@ -7,6 +7,7 @@ import {
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { assertAgentProcessPolicyValid } from "../services/agent-process-policy-guard.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { validate } from "../middleware/validate.js";
@@ -210,6 +211,9 @@ export function instanceSettingsRoutes(db: Db) {
           });
         }
       }
+      // Schema checks the shape; this adds the host-specific bind roots (home,
+      // Paperclip home, instance root).
+      assertAgentProcessPolicyValid(req.body.agentProcessPolicy);
       const hidden = getHiddenSettings();
       await assertNoHiddenSettingChanges(
         req.body,

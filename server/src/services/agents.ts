@@ -55,6 +55,7 @@ import {
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
+import { carriedProcessPolicyForActivation } from "./agent-process-policy-guard.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -1103,6 +1104,19 @@ export function agentService(db: Db) {
             ...patch.runtimeConfig,
             inheritEnv: normalizeAgentEnvPatterns(patch.runtimeConfig.inheritEnv).filter((name) => carried.has(name)),
           };
+        }
+        if (isPlainRecord(patch.runtimeConfig)) {
+          // Same boundary as inheritEnv: the approval payload may not widen the
+          // process policy the pending row already carries, and leaving it out
+          // of the payload does not drop it.
+          const { processPolicy: approvedProcessPolicy, ...restRuntimeConfig } = patch.runtimeConfig;
+          const carriedProcessPolicy = carriedProcessPolicyForActivation(
+            approvedProcessPolicy,
+            isPlainRecord(existing.runtimeConfig) ? existing.runtimeConfig.processPolicy : undefined,
+          );
+          patch.runtimeConfig = carriedProcessPolicy === undefined
+            ? restRuntimeConfig
+            : { ...restRuntimeConfig, processPolicy: carriedProcessPolicy };
         }
         let approvalBindingDecision: ClaudeOAuthBindingInvariantDecision | null = null;
         if (

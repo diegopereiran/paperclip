@@ -12,6 +12,7 @@ import { trustAuthorizationPolicySchema, trustPresetSchema } from "./trust-polic
 import { agentDesiredSkillSelectionSchema } from "./adapter-skills.js";
 import { objectWithoutDefaults } from "./partial.js";
 import { agentEnvPatternSchema } from "./instance.js";
+import { agentProcessPolicySchema } from "./agent-process-policy.js";
 
 export const agentPermissionsSchema = z.object({
   // No schema default: the server derives the default (enabled unless the
@@ -69,6 +70,8 @@ export const agentRuntimeConfigSchema = z.object({
   // Server environment variables (names or PREFIX_*) this agent's process may
   // inherit on top of the instance allow-list. It can only add.
   inheritEnv: z.array(agentEnvPatternSchema).max(256).optional(),
+  // Agent layer of the process policy. Widening it needs an instance admin.
+  processPolicy: agentProcessPolicySchema.optional(),
 }).catchall(z.unknown()).superRefine((value, ctx) => {
   if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
     ctx.addIssue({

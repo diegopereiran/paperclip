@@ -86,8 +86,8 @@ The poller runs in the server's timer tick.
 - The first time the poller sees a pull request it stores the fingerprint as a
   baseline and does **not** wake. A later change in any field wakes the monitor once.
 - A GitHub rate limit pauses polling for that company until the reset time (at most
-  one hour). A 401 or 403 pauses it for 5 minutes. A pause in one company does not
-  affect another.
+  one hour). A 401 pauses the company for 5 minutes. A 403 that is not a rate limit
+  skips only that pull request. A pause in one company does not affect another.
 
 A company with both a token and a chat endpoint gets webhook wakes and polling wakes.
 They name the same change, and the consumed monitor makes the second one a no-op.
@@ -109,7 +109,7 @@ is absent inherits.
 | --- | --- | --- |
 | Instance | `PATCH /api/instance/settings/general` with `{ "prMonitorWatching": false }` | Board |
 | Company | `PATCH /api/companies/:companyId` with `{ "prMonitorWatching": false }`; `null` inherits | Board |
-| Agent | set `runtimeConfig.prMonitorWatching` to `false` on the agent | Board |
+| Agent | set `runtimeConfig.prMonitorWatching` to `false` on the agent | An actor with the `agents:configure` grant, or the agent itself |
 
 Absent or `true` at the instance means on. A company can turn watching off when the
 instance allows it. The instance value `false` turns it off for every company, and

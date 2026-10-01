@@ -1084,7 +1084,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       },
     );
 
-    it("keeps watching other companies and agents when one company or agent opts out", async () => {
+    it("keeps watching other companies when one company opts out", async () => {
       const optedOut = await seedFixture({ monitor: { pullRequests } });
       const other = await seedFixture({ monitor: { pullRequests } });
       await switchOff("company", optedOut);
@@ -1095,6 +1095,31 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
       expect(await wakeCount(optedOut.agentId)).toBe(0);
       expect(await wakeCount(other.agentId)).toBe(1);
+    });
+
+    it("keeps watching off when the instance is off, even if the company and agent say on", async () => {
+      const target = await seedFixture({ monitor: { pullRequests } });
+      await db.update(companies).set({ prMonitorWatching: true }).where(eq(companies.id, target.companyId));
+      await db
+        .update(agents)
+        .set({ runtimeConfig: sql`${agents.runtimeConfig} || '{"prMonitorWatching": true}'::jsonb` })
+        .where(eq(agents.id, target.agentId));
+      await instanceSettingsService(db).updateGeneral({ prMonitorWatching: false });
+      await secretService(db).create(target.companyId, { name: "GITHUB_TOKEN", provider: "local_encrypted", value: "ghp_fixture_value" });
+      const heartbeat = heartbeatService(db, { pullRequestPoll: { fetch: fakeFetch } });
+
+      await pollUntilChange(heartbeat);
+      const result = await makeSink().handle({
+        companyId: target.companyId,
+        endpointId: await seedEndpoint(target.companyId, target.agentId),
+        eventType: "pull_request",
+        deliveryId: "instance-off-company-on",
+        payload: webhookPayload,
+      });
+
+      expect(requests).toEqual([]);
+      expect(result).toMatchObject({ woken: 0 });
+      expect(await wakeCount(target.agentId)).toBe(0);
     });
 
     it("resumes watching when the instance switch is turned back on", async () => {

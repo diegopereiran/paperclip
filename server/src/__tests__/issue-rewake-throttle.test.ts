@@ -75,6 +75,7 @@ describe("isThrottleCandidateIssueRewake", () => {
       "issue_comment_mentioned",
       "issue_blockers_resolved",
       "issue_children_completed",
+      "issue_origin_done",
       "issue_monitor_due",
       "process_lost_retry",
       "run_liveness_continuation",

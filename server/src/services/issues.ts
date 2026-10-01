@@ -189,6 +189,7 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import type { WakeableOriginIssue } from "./issue-origin-wakeups.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -9023,6 +9024,100 @@ export function issueService(db: Db) {
           blockerIssueIds: readiness.blockerIssueIds,
           blockedTransitionAt: candidate.blockedTransitionAt,
         }));
+    },
+
+    getWakeableOriginIssueAfterDone: async (
+      doneIssueId: string,
+    ): Promise<WakeableOriginIssue | null> => {
+      const done = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          parentId: issues.parentId,
+          originKind: issues.originKind,
+          originRunId: issues.originRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, doneIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (
+        !done ||
+        done.status !== "done" ||
+        !done.originRunId ||
+        done.originKind === "routine_execution" ||
+        !isUuidLike(done.originRunId)
+      ) {
+        return null;
+      }
+
+      const run = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, done.originRunId),
+            eq(heartbeatRuns.companyId, done.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      const originIssueId =
+        readStringFromRecord(run?.contextSnapshot, "issueId") ??
+        readStringFromRecord(run?.contextSnapshot, "taskId");
+      if (
+        !originIssueId ||
+        originIssueId === done.id ||
+        originIssueId === done.parentId
+      ) {
+        return null;
+      }
+
+      const origin = await db
+        .select({
+          id: issues.id,
+          conversationAgentId: issues.conversationAgentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, originIssueId),
+            eq(issues.companyId, done.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (
+        !origin ||
+        origin.conversationAgentId ||
+        !origin.assigneeAgentId ||
+        origin.assigneeUserId ||
+        ["backlog", "done", "cancelled"].includes(origin.status)
+      ) {
+        return null;
+      }
+
+      const blocksOrigin = await db
+        .select({ id: issueRelations.id })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, done.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.issueId, done.id),
+            eq(issueRelations.relatedIssueId, origin.id),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (blocksOrigin) return null;
+
+      return {
+        id: origin.id,
+        assigneeAgentId: origin.assigneeAgentId,
+        doneIssueId: done.id,
+      };
     },
 
     getWakeableParentAfterChildCompletion: async (

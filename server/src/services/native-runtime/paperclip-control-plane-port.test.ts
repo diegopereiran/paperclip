@@ -1346,6 +1346,128 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
   });
 
+  async function completeNativeGateIssue(input: { suffix: string; originIsParent: boolean }) {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const originIssueId = `30000000-0000-4000-8000-000000000${input.suffix}0`;
+    const gateIssueId = `30000000-0000-4000-8000-000000000${input.suffix}1`;
+    const originRunId = `32000000-0000-4000-8000-000000000${input.suffix}0`;
+    const localContractId = `31000000-0000-4000-8000-000000000${input.suffix}1`;
+    const runId = `32000000-0000-4000-8000-000000000${input.suffix}1`;
+    const runnerInstanceId = `33000000-0000-4000-8000-000000000${input.suffix}1`;
+    const contractSha = `origin-wake-contract-${input.suffix}`;
+    await db.insert(issues).values({
+      id: originIssueId,
+      companyId: identity.companyId,
+      title: "Origin issue that spawned the gate",
+      status: "in_progress",
+      assigneeAgentId: identity.agentId,
+      workMode: "standard",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: originRunId,
+      companyId: identity.companyId,
+      agentId: identity.agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId: originIssueId },
+    });
+    await db.insert(issues).values({
+      id: gateIssueId,
+      companyId: identity.companyId,
+      parentId: input.originIsParent ? originIssueId : null,
+      originRunId,
+      title: "Gate issue created from the origin run",
+      status: "in_progress",
+      assigneeAgentId: identity.agentId,
+      workMode: "standard",
+    });
+    await db.insert(completionContracts).values({
+      id: localContractId,
+      companyId: identity.companyId,
+      issueId: gateIssueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v3",
+      risk: "low",
+      completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {
+        revision: "origin-wake-v1",
+        objective: "Finish the gate",
+        criteria: [{ id: "objective", requirement: "Finish and test" }],
+      },
+      canonicalSha256: contractSha,
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: identity.companyId,
+      agentId: identity.agentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: gateIssueId,
+      nativeSessionId: identity.sessionId,
+      runnerInstanceId,
+      completionContractId: localContractId,
+      completionContractSha256: contractSha,
+      contextSnapshot: { issueId: gateIssueId },
+    });
+    const port = new PaperclipControlPlanePort(db, {
+      companyId: identity.companyId,
+      issueId: gateIssueId,
+      runId,
+      agentId: identity.agentId,
+      sessionId: identity.sessionId,
+      completionContractId: localContractId,
+      completionContractSha256: contractSha,
+      sourceInstanceId: runnerInstanceId,
+      controlPlaneSourceInstanceId: `origin-wake-control-${input.suffix}`,
+    });
+    await port.openRun({
+      identity: { ...identity, issueId: gateIssueId, runId },
+      backendKind: "mock",
+      sourceInstanceId: runnerInstanceId,
+    });
+    const result: PrpStructuredRunResult = {
+      ...structuredClone(CONTROL_PLANE_CONFORMANCE_RESULT),
+      summary: "Finished the gate.",
+      completionClaim: {
+        contractRevision: "origin-wake-v1",
+        objectiveSatisfied: true,
+        criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [] }],
+        remainingWork: [],
+      },
+      verification: [{ commandOrCheck: "node --test", status: "passed" }],
+      attentionRequests: [],
+    };
+    await port.completeRun({
+      result,
+      terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: `origin-wake-result-${input.suffix}`,
+    });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, identity.companyId));
+    return { originIssueId, gateIssueId, wakes };
+  }
+
+  it("wakes the origin issue once when a native gate issue completes", async () => {
+    const { originIssueId, gateIssueId, wakes } = await completeNativeGateIssue({ suffix: "50", originIsParent: false });
+    const originWakes = wakes.filter((row) => row.payload?.issueId === originIssueId);
+    expect(originWakes).toHaveLength(1);
+    expect(originWakes[0]).toMatchObject({
+      reason: "issue_origin_done",
+      idempotencyKey: `issue_origin_done:${originIssueId}:${gateIssueId}`,
+      payload: { issueId: originIssueId, doneIssueId: gateIssueId },
+    });
+  });
+
+  it("does not add an origin wake when the origin issue is the parent", async () => {
+    const { originIssueId, wakes } = await completeNativeGateIssue({ suffix: "51", originIsParent: true });
+    const originWakes = wakes.filter((row) => row.payload?.issueId === originIssueId);
+    expect(originWakes.map((row) => row.reason)).toEqual(["issue_children_completed"]);
+  });
+
   it("returns a rejected native completion review to the original agent with the reviewer reason", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = "30000000-0000-4000-8000-000000000027";

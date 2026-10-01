@@ -1214,6 +1214,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_reopened_via_comment",
   "issue_blockers_resolved",
   "issue_children_completed",
+  "issue_origin_done",
   "issue_status_changed",
   "issue_tree_restored",
   "issue_recovery_action_restored",
@@ -19560,6 +19561,13 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  async function reconcileIssueOriginDoneWakes(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+  }) {
+    return recovery.reconcileIssueOriginDoneWakeBackstop(opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -29349,6 +29357,7 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+    reconcileIssueOriginDoneWakes,
 
     scanSilentActiveRuns,
 

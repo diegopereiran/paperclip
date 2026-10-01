@@ -39,6 +39,7 @@ export const HARNESS_AGENT_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   "MOONSHOT_API_KEY", // kimi_local
   "XAI_API_KEY", // grok_local
   "OPENROUTER_API_KEY", // pi_local, opencode_local
+  "ZAI_API_KEY", "MINIMAX_API_KEY", // hermes_local: provider keys its environment test also reads
   "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE", // claude_local on Bedrock: non-secret selectors only
 ]);
 

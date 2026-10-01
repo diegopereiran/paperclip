@@ -147,13 +147,25 @@ describe("agentProcessPolicyWidening", () => {
     ).toEqual([]);
   });
 
-  it("flags setting or changing the command wrapper but not clearing it", () => {
+  it("flags removing an allowlist the layer carried", () => {
+    expect(
+      agentProcessPolicyWidening({ network: { scope: "allowlist", allowlist: ["a.example.com"] } }, { network: { scope: "allowlist" } }),
+    ).toEqual(["network.allowlist"]);
+    expect(agentProcessPolicyWidening({ network: { allowlist: ["a.example.com"] } }, {})).toEqual(["network.allowlist"]);
+    expect(
+      agentProcessPolicyWidening({ network: { scope: "allowlist", allowlist: ["a.example.com"] } }, { network: { scope: "deny" } }),
+    ).toEqual([]);
+    expect(agentProcessPolicyWidening({ network: { allowlist: ["a.example.com"] } }, { network: { allowlist: [] } }))
+      .toEqual(["network.allowlist"]);
+  });
+
+  it("flags setting, changing or clearing the command wrapper", () => {
     expect(agentProcessPolicyWidening(undefined, { commandWrapper: ["/usr/bin/env"] })).toEqual(["commandWrapper"]);
     expect(agentProcessPolicyWidening({ commandWrapper: ["/usr/bin/env"] }, { commandWrapper: ["/usr/bin/nice"] }))
       .toEqual(["commandWrapper"]);
     expect(agentProcessPolicyWidening({ commandWrapper: ["/usr/bin/env"] }, { commandWrapper: ["/usr/bin/env"] }))
       .toEqual([]);
-    expect(agentProcessPolicyWidening({ commandWrapper: ["/usr/bin/env"] }, {})).toEqual([]);
+    expect(agentProcessPolicyWidening({ commandWrapper: ["/usr/bin/env"] }, {})).toEqual(["commandWrapper"]);
   });
 
   it("flags a git dir of auto set over off and removing off or the workspace scope", () => {

@@ -179,9 +179,17 @@ export function agentProcessPolicyWidening(
   ) {
     kinds.push("network.scope");
   }
-  if (addedEntries(previous.network?.allowlist, next.network?.allowlist)) kinds.push("network.allowlist");
+  if (
+    addedEntries(previous.network?.allowlist, next.network?.allowlist)
+    || (previous.network?.allowlist?.length && !next.network?.allowlist?.length && nextScope !== "deny")
+  ) {
+    kinds.push("network.allowlist");
+  }
 
-  if (next.commandWrapper !== undefined && !sameList(previous.commandWrapper, next.commandWrapper)) {
+  if (
+    (next.commandWrapper !== undefined && !sameList(previous.commandWrapper, next.commandWrapper))
+    || (previous.commandWrapper !== undefined && next.commandWrapper === undefined)
+  ) {
     kinds.push("commandWrapper");
   }
   return kinds;

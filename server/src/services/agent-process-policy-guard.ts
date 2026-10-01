@@ -29,12 +29,21 @@ function realpathOrNull(value: string): string | null {
 
 /** Roots a bind path may not equal or contain: the server user's home and the Paperclip home. */
 export function agentProcessPolicyBindRoots(): AgentProcessBindRoots {
+  const withRealpaths = (dirs: Iterable<string>): string[] => {
+    const out = new Set<string>();
+    for (const dir of dirs) {
+      out.add(dir);
+      const real = realpathOrNull(dir);
+      if (real) out.add(real);
+    }
+    return [...out];
+  };
   const homeDirs = new Set<string>();
   for (const home of [os.homedir(), process.env.HOME]) {
     if (home && path.isAbsolute(home)) homeDirs.add(path.resolve(home));
   }
   const paperclipDirs = [resolvePaperclipHomeDir(), resolvePaperclipInstanceRoot()];
-  return { homeDirs: [...homeDirs], paperclipDirs };
+  return { homeDirs: withRealpaths(homeDirs), paperclipDirs: withRealpaths(paperclipDirs) };
 }
 
 /** The process policy stored on an agent runtimeConfig (or hire payload runtimeConfig), if any. */

@@ -12,6 +12,11 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import {
+  extractGitHubPullRequestRefs,
+  mergeGitHubPullRequestRefs,
+  parseGitHubPullRequestRefs,
+} from "./github-pull-request-refs.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -230,12 +235,13 @@ function buildScheduledMonitorState(
 function buildTriggeredMonitorState(input: {
   previous: IssueExecutionMonitorState | null;
   triggeredAt: Date;
+  consumeAttempt?: boolean;
 }): IssueExecutionMonitorState {
   return {
     status: "triggered",
     nextCheckAt: null,
     lastTriggeredAt: input.triggeredAt.toISOString(),
-    attemptCount: (input.previous?.attemptCount ?? 0) + 1,
+    attemptCount: (input.previous?.attemptCount ?? 0) + (input.consumeAttempt === false ? 0 : 1),
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
@@ -347,7 +353,20 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
-export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
+function storedMonitorPullRequests(input: unknown) {
+  const monitor = (input as { monitor?: { pullRequests?: unknown } | null } | null)?.monitor;
+  return parseGitHubPullRequestRefs(monitor?.pullRequests);
+}
+
+/**
+ * `source: "client"` marks a request body: any `monitor.pullRequests` it carries
+ * is ignored because the server derives the field. The default treats the input
+ * as an already stored policy and keeps its validated `pullRequests`.
+ */
+export function normalizeIssueExecutionPolicy(
+  input: unknown,
+  options?: { source?: "client" | "stored" },
+): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
   if (!parsed.success) {
@@ -384,6 +403,12 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
 
+  const pullRequests = parsed.data.monitor
+    ? mergeGitHubPullRequestRefs(
+        options?.source === "client" ? [] : storedMonitorPullRequests(input),
+        extractGitHubPullRequestRefs(parsed.data.monitor.externalRef, parsed.data.monitor.notes),
+      )
+    : [];
   const monitor = parsed.data.monitor
     ? {
       nextCheckAt: parsed.data.monitor.nextCheckAt,
@@ -395,6 +420,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
+      ...(pullRequests.length > 0 ? { pullRequests } : {}),
     }
     : null;
 
@@ -412,6 +438,27 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
   };
+}
+
+/**
+ * A client that echoes back the redacted `externalRef` it read cannot restate
+ * the original reference, so the pull requests derived when it was first
+ * written carry over to the replacement monitor.
+ */
+export function carryOverEchoedMonitorPullRequests(input: {
+  requested: unknown;
+  normalized: IssueExecutionPolicy | null;
+  stored: unknown;
+}): IssueExecutionPolicy | null {
+  const monitor = input.normalized?.monitor;
+  if (!input.normalized || !monitor) return input.normalized;
+  const requestedRef = (input.requested as { monitor?: { externalRef?: unknown } | null } | null)?.monitor?.externalRef;
+  if (typeof requestedRef !== "string" || requestedRef.trim() !== REDACTED_ISSUE_MONITOR_EXTERNAL_REF) {
+    return input.normalized;
+  }
+  const pullRequests = mergeGitHubPullRequestRefs(storedMonitorPullRequests(input.stored), monitor.pullRequests ?? []);
+  if (pullRequests.length === 0) return input.normalized;
+  return { ...input.normalized, monitor: { ...monitor, pullRequests } };
 }
 
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
@@ -1164,6 +1211,8 @@ export function buildIssueMonitorTriggeredPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   triggeredAt: Date;
+  /** Event-driven wakes (for example a pull request event) pass false: they are real work, not a poll. */
+  consumeAttempt?: boolean;
 }) {
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
@@ -1174,6 +1223,7 @@ export function buildIssueMonitorTriggeredPatch(input: {
   const nextMonitorState = buildTriggeredMonitorState({
     previous: currentMonitorState,
     triggeredAt: input.triggeredAt,
+    consumeAttempt: input.consumeAttempt,
   });
 
   return {

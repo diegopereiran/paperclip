@@ -1318,6 +1318,9 @@ function parseFiniteNumberLike(value: unknown): number | null {
 function sanitizeImportedAgentRuntimeConfig(runtimeConfig: unknown) {
   const next = clonePortableRecord(runtimeConfig) ?? {};
   delete next.modelProfiles;
+  // Imports sit below the instance-admin boundary; widening the child
+  // process environment stays an administrator action.
+  delete next.inheritEnv;
   const heartbeat = isPlainRecord(next.heartbeat) ? { ...next.heartbeat } : {};
   heartbeat.enabled = false;
   if (parseFiniteNumberLike(heartbeat.maxConcurrentRuns) == null) {

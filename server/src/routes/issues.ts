@@ -366,6 +366,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
+  carryOverEchoedMonitorPullRequests,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
@@ -4134,7 +4135,7 @@ export function issueRoutes(
     projectId: string | null,
     requestedPolicy: unknown,
   ) {
-    const policy = normalizeIssueExecutionPolicy(requestedPolicy);
+    const policy = normalizeIssueExecutionPolicy(requestedPolicy, { source: "client" });
     if (req.actor.type !== "agent") return policy;
     const trust = await resolveAgentTrustForIssue(
       { agentId: req.actor.agentId, runId: req.actor.runId },
@@ -13750,7 +13751,7 @@ export function issueRoutes(
       const normalizedChildren = [];
       for (const child of requestedChildren) {
         const executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(child.executionPolicy),
+          normalizeIssueExecutionPolicy(child.executionPolicy, { source: "client" }),
           actor.actorType,
         );
         await assertCanManageIssueMonitor(
@@ -14877,7 +14878,11 @@ export function issueRoutes(
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          carryOverEchoedMonitorPullRequests({
+            requested: req.body.executionPolicy,
+            normalized: normalizeIssueExecutionPolicy(req.body.executionPolicy, { source: "client" }),
+            stored: existing.executionPolicy ?? null,
+          }),
           actor.actorType,
         );
       }

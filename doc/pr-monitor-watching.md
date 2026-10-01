@@ -102,8 +102,8 @@ pull request, and the watching switch does not change it.
 
 ## Turn it off
 
-Resolution order, first match wins: instance, then company, then agent. A level that
-is absent inherits.
+Watching is on unless a level says `false`. An absent or `null` value inherits, and
+`true` never overrides a `false` at another level.
 
 | Level | How | Who |
 | --- | --- | --- |
@@ -111,9 +111,10 @@ is absent inherits.
 | Company | `PATCH /api/companies/:companyId` with `{ "prMonitorWatching": false }`; `null` inherits | Board |
 | Agent | set `runtimeConfig.prMonitorWatching` to `false` on the agent | An actor with the `agents:configure` grant, or the agent itself |
 
-Absent or `true` at the instance means on. A company can turn watching off when the
-instance allows it. The instance value `false` turns it off for every company, and
-no company or agent can turn it back on.
+Absent or `true` at the instance means on. The instance value `false` turns watching
+off for every company. A company `false` turns it off for that company, and an agent
+`false` turns it off for that agent. No level can turn watching back on when another
+level says `false`.
 
 Turning it off stops both the webhook wake and the polling wake for the covered
 monitors. Timed monitor wakes (`monitorNextCheckAt`) still work. A webhook that

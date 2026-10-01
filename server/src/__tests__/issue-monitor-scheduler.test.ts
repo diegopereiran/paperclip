@@ -1122,6 +1122,27 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(await wakeCount(target.agentId)).toBe(0);
     });
 
+    it("keeps watching off for an agent set to off, even if its company says on", async () => {
+      const target = await seedFixture({ monitor: { pullRequests } });
+      await db.update(companies).set({ prMonitorWatching: true }).where(eq(companies.id, target.companyId));
+      await switchOff("agent", target);
+      await secretService(db).create(target.companyId, { name: "GITHUB_TOKEN", provider: "local_encrypted", value: "ghp_fixture_value" });
+      const heartbeat = heartbeatService(db, { pullRequestPoll: { fetch: fakeFetch } });
+
+      await pollUntilChange(heartbeat);
+      const result = await makeSink().handle({
+        companyId: target.companyId,
+        endpointId: await seedEndpoint(target.companyId, target.agentId),
+        eventType: "pull_request",
+        deliveryId: "company-on-agent-off",
+        payload: webhookPayload,
+      });
+
+      expect(requests).toEqual([]);
+      expect(result).toMatchObject({ woken: 0 });
+      expect(await wakeCount(target.agentId)).toBe(0);
+    });
+
     it("resumes watching when the instance switch is turned back on", async () => {
       const target = await seedFixture({ monitor: { pullRequests } });
       await instanceSettingsService(db).updateGeneral({ prMonitorWatching: false });

@@ -69,6 +69,11 @@ describe("selectInheritedAgentEnv", () => {
     }
   });
 
+  it("keeps the hermes provider keys its environment test reads", () => {
+    const selected = selectInheritedAgentEnv({ ZAI_API_KEY: "z", MINIMAX_API_KEY: "m", OTHER_API_KEY: "o" });
+    expect(selected).toEqual({ ZAI_API_KEY: "z", MINIMAX_API_KEY: "m" });
+  });
+
   it("matches names case-insensitively and PREFIX_* patterns", () => {
     const selected = selectInheritedAgentEnv(
       { http_proxy: "http://proxy", ACME_ONE: "1", ACMEX: "2" },

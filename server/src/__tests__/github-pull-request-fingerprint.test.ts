@@ -63,6 +63,10 @@ describe("fingerprint parsing", () => {
     expect(parsePullRequestFingerprint("nope")).toBeNull();
   });
 
+  it("drops a key with a dot-only owner or repository", () => {
+    expect(parsePullRequestState({ "../orgs#5": base, "o/..#5": base, "o/r#5": base })).toEqual({ "o/r#5": base });
+  });
+
   it("keeps only well-formed keys", () => {
     const key = pullRequestStateKey({ owner: "Open", repo: "Repo", number: 3 });
     expect(key).toBe("open/repo#3");

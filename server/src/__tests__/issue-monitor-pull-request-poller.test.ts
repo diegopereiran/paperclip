@@ -493,4 +493,47 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
     await poller.poll(at(8));
     expect(triggerMonitor).toHaveBeenCalledTimes(2);
   });
+  it("makes no request for a monitor note that names a dot-only owner", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company, "../orgs#5");
+    const { poller, github } = setup();
+
+    await poller.poll(T0);
+
+    expect(github.fetch).not.toHaveBeenCalled();
+  });
+
+  it("treats a 403 without a rate limit as a failure of that pull request only", async () => {
+    const company = await seedCompany();
+    const blocked = await seedMonitor(company, "https://github.com/saml/repo/pull/1");
+    const healthy = await seedMonitor(company, "https://github.com/open/repo/pull/12");
+    const { poller, github, triggerMonitor } = setup();
+    github.set("saml/repo#1");
+    const original = github.fetch.getMockImplementation()!;
+    github.fetch.mockImplementation(async (url, init) => {
+      if (url.includes("/repos/saml/")) return new Response("{}", { status: 403 });
+      return original(url, init);
+    });
+    await poller.poll(T0);
+    expect(await storedState(healthy)).toBeDefined();
+    expect(await storedState(blocked)).toBeUndefined();
+
+    github.set("open/repo#12", { ...freshPullRequest(), headSha: "sha-2" });
+    await poller.poll(at(4));
+
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+    expect(triggerMonitor).toHaveBeenCalledWith(healthy, expect.anything());
+  });
+
+  it("pauses the company on a 401", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company, "https://github.com/open/repo/pull/12");
+    await seedMonitor(company, "https://github.com/open/repo/pull/13");
+    const { poller, github } = setup();
+    github.fail({ status: 401 });
+
+    await poller.poll(T0);
+
+    expect(github.fetch).toHaveBeenCalledTimes(1);
+  });
 });

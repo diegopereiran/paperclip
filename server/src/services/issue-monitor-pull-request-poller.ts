@@ -23,6 +23,7 @@ import {
 export const PULL_REQUEST_POLL_INTERVAL_MS = 3 * 60 * 1000;
 const MAX_PAUSE_SECONDS = 60 * 60;
 const AUTH_PAUSE_SECONDS = 5 * 60;
+const REQUEST_TIMEOUT_MS = 20_000;
 const GITHUB_API_ORIGIN = gitHubApiBase("github.com");
 
 type PollerLog = Pick<typeof logger, "info" | "warn" | "debug" | "error">;
@@ -93,6 +94,8 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
   const cache = new Map<string, PullRequestCacheEntry>();
   const pausedUntil = new Map<string, number>();
   const noTokenLogged = new Set<string>();
+  const wakeRetryAt = new Map<string, number>();
+  let running = false;
 
   async function request<T>(
     token: string,
@@ -111,7 +114,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
 
     let response: Response;
     try {
-      response = await fetchImpl(url, { headers });
+      response = await fetchImpl(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     } catch {
       return { kind: "failed" };
     }
@@ -226,8 +229,19 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
   }
 
   async function poll(now: Date = new Date()): Promise<PullRequestPollResult> {
+    if (running) return { polled: 0, baselined: 0, woken: 0 };
+    running = true;
+    try {
+      return await pollOnce(now);
+    } finally {
+      running = false;
+    }
+  }
+
+  async function pollOnce(now: Date): Promise<PullRequestPollResult> {
     const result: PullRequestPollResult = { polled: 0, baselined: 0, woken: 0 };
     const nowMs = now.getTime();
+    for (const [retryKey, retryAt] of wakeRetryAt) if (retryAt <= nowMs) wakeRetryAt.delete(retryKey);
     const watched = (await listWatchedMonitorPullRequests(db)).filter((entry) => entry.hasMonitorPolicy);
 
     const byCompany = new Map<string, Map<string, { ref: GitHubPullRequestRef; monitors: WatchedMonitorPullRequests[] }>>();
@@ -273,9 +287,9 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
           if (!token) break;
 
           entry ??= { polledAt: 0, sinceIso: now.toISOString(), responses: new Map(), fingerprint: null };
+          entry.polledAt = nowMs;
           cache.set(cacheKey, entry);
           const fetched = await fetchFingerprint(token, ref, entry);
-          entry.polledAt = nowMs;
           result.polled += 1;
           if (fetched.kind === "paused") {
             const seconds = fetched.seconds;
@@ -310,6 +324,8 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
             }
             continue;
           }
+          const retryKey = `${monitor.issueId}|${key}`;
+          if (wakeRetryAt.has(retryKey)) continue;
           try {
             await options.triggerMonitor(monitor.issueId, {
               now,
@@ -325,6 +341,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
             });
             result.woken += 1;
           } catch (err) {
+            wakeRetryAt.set(retryKey, nowMs + intervalMs);
             log.debug({ err, issueId: monitor.issueId }, "pull request monitor wake was not dispatched");
           }
         }

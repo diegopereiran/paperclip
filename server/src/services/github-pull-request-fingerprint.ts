@@ -75,6 +75,12 @@ export function parsePullRequestState(value: unknown): Record<string, PullReques
   return parsed;
 }
 
+/** Comment and review ids only grow; a missing or smaller id means the poll window moved, not a new entry. */
+function idGrew(previous: number | null, current: number | null) {
+  if (current === null) return false;
+  return previous === null || current > previous;
+}
+
 export function changedFingerprintFields(
   previous: PullRequestFingerprint,
   current: PullRequestFingerprint,
@@ -82,8 +88,8 @@ export function changedFingerprintFields(
   const changed: PullRequestFingerprintField[] = [];
   if (previous.headSha !== current.headSha) changed.push("head_sha");
   if (previous.checkConclusion !== current.checkConclusion) changed.push("check_conclusion");
-  if (previous.latestCommentId !== current.latestCommentId) changed.push("comment");
-  if (previous.latestReviewId !== current.latestReviewId) changed.push("review");
+  if (idGrew(previous.latestCommentId, current.latestCommentId)) changed.push("comment");
+  if (idGrew(previous.latestReviewId, current.latestReviewId)) changed.push("review");
   if (previous.state !== current.state) changed.push("state");
   if (
     previous.mergeableState !== null &&

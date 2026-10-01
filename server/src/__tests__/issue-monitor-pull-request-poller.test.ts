@@ -457,7 +457,7 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
 
     const first = poller.poll(T0);
     await vi.waitFor(() => expect(github.fetch).toHaveBeenCalledTimes(1));
-    const overlapping = await poller.poll(at(1));
+    const overlapping = await poller.poll(at(4));
     expect(overlapping).toEqual({ polled: 0, baselined: 0, woken: 0 });
     expect(github.fetch).toHaveBeenCalledTimes(1);
 

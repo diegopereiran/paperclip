@@ -527,6 +527,128 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
   });
 
+  describe("pull request triggers", () => {
+    const trigger = {
+      source: "github" as const,
+      event: "check_suite.completed",
+      deliveryId: "delivery-1",
+      repo: "o/r",
+      number: 5,
+      headSha: "abc123",
+    };
+
+    it("carries the trigger into the wake payload, context snapshot and activity", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "o", repo: "r", number: 5 }] },
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+      expect(result.outcome).toBe("triggered");
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.reason).toBe("issue_monitor_due");
+      expect(wakeup?.payload).toMatchObject({ issueId, trigger });
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.length).toBeGreaterThan(0);
+      expect(runs[0]?.contextSnapshot).toMatchObject({ issueId, trigger });
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({ trigger });
+    });
+
+    it("copies only the declared trigger fields", async () => {
+      const { issueId, agentId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger: { ...trigger, token: "secret-value" } as typeof trigger,
+      });
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(JSON.stringify(wakeup?.payload)).not.toContain("secret-value");
+    });
+
+    it("does not consume a maxAttempts attempt", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitorAttemptCount: 1,
+        monitor: { maxAttempts: 1 },
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+
+      expect(result.outcome).toBe("triggered");
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorAttemptCount).toBe(1);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "triggered",
+        attemptCount: 1,
+      });
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.payload).toMatchObject({ monitorAttemptCount: 1 });
+    });
+
+    it("still consumes an attempt for a poll-style trigger without a trigger input", async () => {
+      const { issueId } = await seedFixture({ monitorAttemptCount: 1, monitor: { maxAttempts: 5 } });
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+      });
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorAttemptCount).toBe(2);
+    });
+
+    it("wakes once per scheduled monitor because the one-shot strip rejects a second trigger", async () => {
+      const { issueId, agentId } = await seedFixture();
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+      expect(first.outcome).toBe("triggered");
+
+      await expect(
+        heartbeat.triggerIssueMonitor(issueId, {
+          now: new Date("2026-04-11T12:00:05.000Z"),
+          actorType: "system",
+          actorId: "github_webhook",
+          trigger: { ...trigger, deliveryId: "delivery-2" },
+        }),
+      ).rejects.toThrow("Issue has no scheduled monitor");
+
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+    });
+  });
+
   it("omits external monitor refs from wake payloads and activity details", async () => {
     const { issueId, agentId } = await seedFixture({
       monitor: {

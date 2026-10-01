@@ -708,6 +708,106 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  describe("monitor pull requests on PATCH", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const agentId = "33333333-3333-4333-8333-333333333333";
+    const storedNextCheckAt = "2026-12-01T12:00:00.000Z";
+
+    function monitoredIssue() {
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1007",
+        title: "PR monitor",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: storedNextCheckAt,
+            notes: "Wait for the PR.",
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: "GitHub",
+            externalRef: "[redacted]",
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            pullRequests: [{ owner: "o", repo: "r", number: 5 }],
+          },
+        },
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: new Date(storedNextCheckAt),
+        monitorLastTriggeredAt: null,
+        monitorNotes: "Wait for the PR.",
+        monitorScheduledBy: "assignee",
+      };
+    }
+
+    async function patchMonitor(monitor: Record<string, unknown>) {
+      const issue = monitoredIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      const res = await request(await createApp({
+        type: "agent",
+        agentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { monitor: { nextCheckAt: "2026-12-02T12:00:00.000Z", scheduledBy: "assignee", ...monitor } } });
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy: { monitor: { externalRef: string | null; pullRequests?: unknown } };
+      };
+      return patch.executionPolicy.monitor;
+    }
+
+    it("keeps the stored pullRequests when the client echoes the redacted externalRef", async () => {
+      const monitor = await patchMonitor({ externalRef: "[redacted]", notes: "Still waiting." });
+      expect(monitor.externalRef).toBe("[redacted]");
+      expect(monitor.pullRequests).toEqual([{ owner: "o", repo: "r", number: 5 }]);
+    });
+
+    it("keeps the stored pullRequests when the client echoes the monitor it read back", async () => {
+      const monitor = await patchMonitor({
+        externalRef: "[redacted]",
+        notes: "Wait for the PR.",
+        serviceName: "GitHub",
+        pullRequests: [{ owner: "evil", repo: "repo", number: 1 }],
+      });
+      expect(monitor.pullRequests).toEqual([{ owner: "o", repo: "r", number: 5 }]);
+    });
+
+    it("replaces the stored pullRequests when the client sends a new reference", async () => {
+      const monitor = await patchMonitor({ externalRef: "https://github.com/O/R/pull/9?token=secret" });
+      expect(monitor.pullRequests).toEqual([{ owner: "o", repo: "r", number: 9 }]);
+      expect(JSON.stringify(monitor)).not.toContain("secret");
+    });
+
+    it("does not carry stored pullRequests onto a monitor with no external reference", async () => {
+      const monitor = await patchMonitor({ notes: "Check later." });
+      expect(monitor).not.toHaveProperty("pullRequests");
+    });
+
+    it("ignores client-supplied pullRequests on a new monitor", async () => {
+      const monitor = await patchMonitor({
+        externalRef: "x/y#2",
+        pullRequests: [{ owner: "evil", repo: "repo", number: 1 }],
+      });
+      expect(monitor.pullRequests).toEqual([{ owner: "x", repo: "y", number: 2 }]);
+    });
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

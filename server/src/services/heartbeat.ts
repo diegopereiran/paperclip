@@ -402,6 +402,10 @@ import {
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
 import {
+  sanitizeIssueMonitorTrigger,
+  type IssueMonitorTrigger,
+} from "./issue-monitor-pull-requests.js";
+import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -11476,6 +11480,7 @@ export function heartbeatService(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -11483,7 +11488,10 @@ export function heartbeatService(
     }
 
     const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
-    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + 1;
+    // An event-driven trigger is real work, not a poll, so it keeps the attempt count.
+    const trigger = input.trigger ? sanitizeIssueMonitorTrigger(input.trigger) : null;
+    const consumeAttempt = trigger === null;
+    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + (consumeAttempt ? 1 : 0);
     const policy = normalizeIssueExecutionPolicy(
       claimed.executionPolicy ?? null,
     );
@@ -11620,6 +11628,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(trigger ? { trigger } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -11635,7 +11644,8 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
-            manualTrigger: input.activitySource === "manual",
+            ...(trigger ? { trigger } : {}),
+            manualTrigger: input.activitySource === "manual" && trigger === null,
           },
         });
 
@@ -11646,6 +11656,7 @@ export function heartbeatService(
             issue: claimed,
             policy,
             triggeredAt: input.now,
+            consumeAttempt,
           }),
           updatedAt: new Date(),
         })
@@ -11667,6 +11678,7 @@ export function heartbeatService(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          ...(trigger ? { trigger } : {}),
           source: input.activitySource,
         },
       });
@@ -11740,6 +11752,7 @@ export function heartbeatService(
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     const now = input?.now ?? new Date();
@@ -11811,6 +11824,7 @@ export function heartbeatService(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      trigger: input?.trigger ?? null,
     });
   }
 

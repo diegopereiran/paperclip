@@ -662,6 +662,14 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /** Server-derived GitHub pull request coordinates (lower-cased) named by externalRef or notes. Never client-writable. */
+  pullRequests?: IssueExecutionMonitorPullRequest[];
+}
+
+export interface IssueExecutionMonitorPullRequest {
+  owner: string;
+  repo: string;
+  number: number;
 }
 
 export interface IssueExecutionPolicy {

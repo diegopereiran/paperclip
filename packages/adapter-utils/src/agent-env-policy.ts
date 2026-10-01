@@ -27,6 +27,7 @@ export const BASE_AGENT_ENV_ALLOWLIST: readonly string[] = Object.freeze([
 // does not use this list: it passes only the entries of the agent it launches.
 export const HARNESS_AGENT_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   "CLAUDE_*", // claude_local: CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK
+  "DISABLE_AUTOUPDATER", // claude_local: keeps an operator-pinned Claude Code version from self-updating mid-run
   "ANTHROPIC_*", // claude_local: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, Bedrock base URL
   "CODEX_*", // codex_local: CODEX_HOME, CODEX_API_KEY
   "OPENAI_*", // codex_local, opencode_local, pi_local: OPENAI_API_KEY, OPENAI_BASE_URL

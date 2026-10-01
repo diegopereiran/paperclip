@@ -542,7 +542,7 @@ async function runReleaseRecoveryTail(
       : false;
 
   const hasExplicitBlockerPath =
-    immediateApplies && !reviewParticipantApplies
+    immediateApplies || reviewParticipantApplies
       ? await transaction.hasExplicitBlockerPath({
           companyId: issue.companyId,
           issueId: issue.id,
@@ -580,13 +580,14 @@ async function runReleaseRecoveryTail(
       applies: reviewParticipantApplies,
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
+      hasExplicitBlockerPath: reviewParticipantApplies && hasExplicitBlockerPath,
     },
     immediate: {
       applies: immediateApplies,
       isDispositionRepairRetry:
         readNonEmptyString(run.contextSnapshot.retryReason) ===
         ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
-      hasExplicitBlockerPath,
+      hasExplicitBlockerPath: !reviewParticipantApplies && hasExplicitBlockerPath,
       isWorkspaceValidationFailedRun: isWorkspaceValidationFailedRun(run),
       isConfigurationIncompleteFailedRun:
         isConfigurationIncompleteFailedRun(run),

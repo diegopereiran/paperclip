@@ -567,6 +567,37 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({ trigger });
     });
 
+    it("logs a trigger-driven wake with its own activity source, not manual", async () => {
+      const { issueId, agentId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_pull_request_poll",
+        trigger,
+      });
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      const details = activity.find((row) => row.action === "issue.monitor_triggered")?.details as Record<string, unknown>;
+      expect(details.source).toBe("pull_request_event");
+      expect(details.source).not.toBe("manual");
+
+      const wakeup = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)).then((rows) => rows[0]);
+      expect(wakeup?.payload).toMatchObject({ source: "pull_request_event" });
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)).then((rows) => rows[0]);
+      expect((run?.contextSnapshot as Record<string, unknown>).manualTrigger).not.toBe(true);
+    });
+
+    it("keeps the manual activity source for a trigger without a pull request trigger", async () => {
+      const { issueId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "user",
+        actorId: "local-board",
+      });
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({ source: "manual" });
+    });
+
     it("copies only the declared trigger fields", async () => {
       const { issueId, agentId } = await seedFixture();
       await heartbeatService(db).triggerIssueMonitor(issueId, {
@@ -646,6 +677,58 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
       const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       expect(wakeups).toHaveLength(1);
+    });
+  });
+
+  describe("pull request polling in the scheduler tick", () => {
+    const state = { headSha: "sha-1" };
+    const requests: string[] = [];
+    const fakeFetch = async (url: string) => {
+      requests.push(url);
+      const { pathname } = new URL(url);
+      if (pathname.endsWith("/pulls/5")) {
+        return new Response(
+          JSON.stringify({ state: "open", merged: false, mergeable_state: "clean", head: { sha: state.headSha } }),
+          { status: 200 },
+        );
+      }
+      if (pathname.includes("/check-suites")) {
+        return new Response(JSON.stringify({ check_suites: [{ status: "completed", conclusion: "success" }] }), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    };
+
+    it("baselines, wakes once on a change and logs the pull_request_event source", async () => {
+      state.headSha = "sha-1";
+      requests.length = 0;
+      const { issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "o", repo: "r", number: 5 }] },
+      });
+      const heartbeat = heartbeatService(db, {
+        pullRequestPoll: { fetch: fakeFetch, getToken: async () => "token-value" },
+      });
+
+      await heartbeat.tickTimers(new Date("2026-04-11T12:00:00.000Z"));
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+
+      state.headSha = "sha-2";
+      await heartbeat.tickTimers(new Date("2026-04-11T12:04:00.000Z"));
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]?.payload).toMatchObject({
+        trigger: { source: "github", repo: "o/r", number: 5, headSha: "sha-2" },
+        source: "pull_request_event",
+      });
+
+      await heartbeat.tickTimers(new Date("2026-04-11T12:08:00.000Z"));
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({
+        source: "pull_request_event",
+      });
     });
   });
 

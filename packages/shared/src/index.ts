@@ -1139,6 +1139,7 @@ export type {
   IssueRelatedWorkSummary,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorPullRequest,
+  IssueExecutionMonitorPullRequestFingerprint,
   IssueExecutionMonitorState,
   IssueRelation,
   IssueRelationIssueSummary,

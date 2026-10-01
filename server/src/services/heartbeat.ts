@@ -170,6 +170,10 @@ import { createHostDuplexObservabilityRecorder } from "./duplex-observability-re
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
+  createPullRequestMonitorPoller,
+  type PullRequestMonitorPollerOptions,
+} from "./issue-monitor-pull-request-poller.js";
+import {
   createGitRemoteAuthProvider,
   resolveManagedGitHubIdentitySelection,
   describeGitAuthFailure,
@@ -9283,7 +9287,12 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
   typeof environmentRuntimeService
 >;
 
+/** Why an issue monitor was dispatched; a pull request event is neither a person's check-now nor the due timer. */
+type IssueMonitorActivitySource = "manual" | "scheduled" | "pull_request_event";
+
 export interface HeartbeatServiceOptions {
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: Pick<PullRequestMonitorPollerOptions, "fetch" | "getToken" | "intervalMs">;
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -11225,7 +11234,7 @@ export function heartbeatService(
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     monitor: IssueExecutionMonitorPolicy | null;
-    source: "manual" | "scheduled";
+    source: IssueMonitorActivitySource;
   }) {
     return {
       identifier: input.claimed.identifier,
@@ -11306,7 +11315,7 @@ export function heartbeatService(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -11489,7 +11498,7 @@ export function heartbeatService(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     await db
       .update(issues)
@@ -11553,7 +11562,7 @@ export function heartbeatService(
       agentId: string | null;
       runId: string | null;
       clearOnClientError: boolean;
-      activitySource: "manual" | "scheduled";
+      activitySource: IssueMonitorActivitySource;
       trigger?: IssueMonitorTrigger | null;
     },
   ) {
@@ -11897,9 +11906,23 @@ export function heartbeatService(
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
-      activitySource: "manual",
+      activitySource: input?.trigger ? "pull_request_event" : "manual",
       trigger: input?.trigger ?? null,
     });
+  }
+
+  const pullRequestMonitorPoller = createPullRequestMonitorPoller(db, {
+    ...options.pullRequestPoll,
+    triggerMonitor: (issueId, input) => triggerIssueMonitor(issueId, input),
+  });
+
+  async function tickPullRequestMonitors(now: Date) {
+    try {
+      return await pullRequestMonitorPoller.poll(now);
+    } catch (err) {
+      logger.error({ err }, "pull request monitor polling failed");
+      return { polled: 0, baselined: 0, woken: 0 };
+    }
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
@@ -29703,10 +29726,11 @@ export function heartbeatService(
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const pullRequestMonitors = await tickPullRequestMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
+        checked: checked + issueMonitors.checked + pullRequestMonitors.polled,
+        enqueued: enqueued + issueMonitors.triggered + pullRequestMonitors.woken,
         skipped: skipped + issueMonitors.skipped,
       };
     },

@@ -13,11 +13,17 @@ const PULL_REQUEST_URL = new RegExp(
 );
 const SHORT_REFERENCE = new RegExp(`(?<![\\w./#-])(${NAME})/(${NAME})#(\\d+)\\b`, "g");
 const NAME_PATTERN = new RegExp(`^${NAME}$`);
+const DOT_ONLY = /^\.+$/;
+
+/** GitHub forbids `.` and `..` as owner or repository names; either would make a request URL climb a path segment. */
+export function isValidGitHubName(name: string) {
+  return NAME_PATTERN.test(name) && !DOT_ONLY.test(name);
+}
 
 function toRef(owner: string, repo: string, rawNumber: string | number): GitHubPullRequestRef | null {
   const number = typeof rawNumber === "number" ? rawNumber : Number(rawNumber);
   if (!Number.isSafeInteger(number) || number <= 0) return null;
-  if (!NAME_PATTERN.test(owner) || !NAME_PATTERN.test(repo)) return null;
+  if (!isValidGitHubName(owner) || !isValidGitHubName(repo)) return null;
   return { owner: owner.toLowerCase(), repo: repo.toLowerCase(), number };
 }
 

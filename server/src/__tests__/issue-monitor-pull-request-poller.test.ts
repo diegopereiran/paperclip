@@ -417,4 +417,80 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
     expect(triggerMonitor).not.toHaveBeenCalled();
     expect(await storedState(issueId)).toBeUndefined();
   });
+  it("does not wake after a restart when an older comment is no longer in the since window", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github, getToken } = setup();
+    await poller.poll(T0);
+
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301] });
+    const late = await seedMonitor(company);
+    await poller.poll(at(4));
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+    expect((await storedState(late))?.["open/repo#12"]).toMatchObject({ latestCommentId: 301 });
+
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [] });
+    const restarted = createPullRequestMonitorPoller(db, {
+      fetch: github.fetch,
+      getToken,
+      triggerMonitor,
+      log: createLog(),
+    });
+    await restarted.poll(at(10));
+
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start a second request set while an earlier poll is still running", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, github } = setup();
+    const original = github.fetch.getMockImplementation()!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    github.fetch.mockImplementation(async (url, init) => {
+      await gate;
+      return original(url, init);
+    });
+
+    const first = poller.poll(T0);
+    await vi.waitFor(() => expect(github.fetch).toHaveBeenCalledTimes(1));
+    const overlapping = await poller.poll(at(1));
+    expect(overlapping).toEqual({ polled: 0, baselined: 0, woken: 0 });
+    expect(github.fetch).toHaveBeenCalledTimes(1);
+
+    release();
+    await first;
+    expect(github.fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("gives every request a timeout signal", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, github } = setup();
+
+    await poller.poll(T0);
+
+    expect(github.fetch.mock.calls.length).toBeGreaterThan(0);
+    expect(github.fetch.mock.calls.every(([, init]) => init?.signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("holds back a rejected wake until the next interval instead of retrying every tick", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github } = setup();
+    await poller.poll(T0);
+    triggerMonitor.mockRejectedValue(new Error("agent paused"));
+    github.set("open/repo#12", { ...freshPullRequest(), headSha: "sha-2" });
+
+    await poller.poll(at(4));
+    await poller.poll(at(4.5));
+    await poller.poll(at(5));
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+
+    await poller.poll(at(8));
+    expect(triggerMonitor).toHaveBeenCalledTimes(2);
+  });
 });

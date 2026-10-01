@@ -17,6 +17,7 @@ import {
   mergeGitHubPullRequestRefs,
   parseGitHubPullRequestRefs,
 } from "./github-pull-request-refs.js";
+import { parsePullRequestState } from "./github-pull-request-fingerprint.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -409,6 +410,10 @@ export function normalizeIssueExecutionPolicy(
         extractGitHubPullRequestRefs(parsed.data.monitor.externalRef, parsed.data.monitor.notes),
       )
     : [];
+  const pullRequestState =
+    parsed.data.monitor && options?.source !== "client"
+      ? parsePullRequestState((input as { monitor?: { pullRequestState?: unknown } | null }).monitor?.pullRequestState)
+      : {};
   const monitor = parsed.data.monitor
     ? {
       nextCheckAt: parsed.data.monitor.nextCheckAt,
@@ -421,6 +426,7 @@ export function normalizeIssueExecutionPolicy(
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
       ...(pullRequests.length > 0 ? { pullRequests } : {}),
+      ...(Object.keys(pullRequestState).length > 0 ? { pullRequestState } : {}),
     }
     : null;
 

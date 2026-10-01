@@ -2143,4 +2143,33 @@ describe("normalizeIssueExecutionPolicy monitor pull requests", () => {
     );
     expect(reread?.monitor?.pullRequests).toEqual([{ owner: "o", repo: "r", number: 4 }]);
   });
+
+  describe("pullRequestState", () => {
+    const fingerprint = {
+      headSha: "abc",
+      checkConclusion: "success",
+      latestCommentId: 5,
+      latestReviewId: null,
+      state: "open",
+      mergeableState: "clean",
+    };
+
+    it("keeps a stored fingerprint and drops malformed entries", () => {
+      const reread = normalizeIssueExecutionPolicy(
+        monitorPolicy({
+          externalRef: "o/r#2",
+          pullRequestState: { "o/r#2": fingerprint, "bad key": fingerprint, "o/r#3": { state: "nope" } },
+        }),
+      );
+      expect(reread?.monitor?.pullRequestState).toEqual({ "o/r#2": fingerprint });
+    });
+
+    it("ignores a client-supplied fingerprint so a rescheduled monitor takes a new baseline", () => {
+      const policy = normalizeIssueExecutionPolicy(
+        monitorPolicy({ externalRef: "o/r#2", pullRequestState: { "o/r#2": fingerprint } }),
+        { source: "client" },
+      );
+      expect(policy?.monitor).not.toHaveProperty("pullRequestState");
+    });
+  });
 });

@@ -71,7 +71,7 @@ describe("claude_local run scratch dir in the workspace sandbox", () => {
     const calls = runAdapterExecutionTargetProcess.mock.calls as unknown as Array<
       [string, null, string, string[], { localProcessSandbox?: { managedPaths?: Array<{ path: string; access: string }> } }]
     >;
-    return { scratch, managedPaths: calls[0]?.[4]?.localProcessSandbox?.managedPaths };
+    return { scratch, managedPaths: calls.at(-1)?.[4]?.localProcessSandbox?.managedPaths };
   }
 
   it("binds an existing run scratch dir read-write", async () => {
@@ -88,6 +88,7 @@ describe("claude_local run scratch dir in the workspace sandbox", () => {
     expect(unset.managedPaths).toBeDefined();
     expect(unset.managedPaths?.some((entry) => entry.path.endsWith("run-scratch"))).toBe(false);
     const missing = await run(async (rootDir) => path.join(rootDir, "never-created"));
+    expect(missing.managedPaths).toBeDefined();
     expect(missing.managedPaths?.some((entry) => entry.path === missing.scratch)).toBe(false);
   });
 });

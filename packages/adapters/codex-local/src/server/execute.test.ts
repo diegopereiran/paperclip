@@ -355,7 +355,7 @@ describe("codex execute — run scratch dir in the workspace sandbox", () => {
       onLog: async () => {},
     } as never);
     const calls = runChildProcess.mock.calls as unknown as Array<[string, string, string[], { localProcessSandbox?: { managedPaths?: Array<{ path: string; access: string }> } }]>;
-    return { scratch, managedPaths: calls[0]?.[3]?.localProcessSandbox?.managedPaths };
+    return { scratch, managedPaths: calls.at(-1)?.[3]?.localProcessSandbox?.managedPaths };
   }
 
   it("binds an existing run scratch dir read-write", async () => {
@@ -372,6 +372,7 @@ describe("codex execute — run scratch dir in the workspace sandbox", () => {
     expect(unset.managedPaths).toBeDefined();
     expect(unset.managedPaths?.some((entry) => entry.path.endsWith("run-scratch"))).toBe(false);
     const missing = await runLocal(async (rootDir) => path.join(rootDir, "never-created"));
+    expect(missing.managedPaths).toBeDefined();
     expect(missing.managedPaths?.some((entry) => entry.path === missing.scratch)).toBe(false);
   });
 });

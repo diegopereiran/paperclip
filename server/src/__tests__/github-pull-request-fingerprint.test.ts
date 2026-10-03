@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  actionableFingerprintChange,
   changedFingerprintFields,
   parsePullRequestFingerprint,
   parsePullRequestState,
@@ -53,6 +54,50 @@ describe("changedFingerprintFields", () => {
   it("ignores mergeable state while GitHub has not computed it", () => {
     expect(changedFingerprintFields(base, { ...base, mergeableState: null })).toEqual([]);
     expect(changedFingerprintFields({ ...base, mergeableState: null }, base)).toEqual([]);
+  });
+});
+
+describe("actionableFingerprintChange", () => {
+  const own = { ownLogin: "bot" };
+  it.each([
+    [{ state: "merged" as const }],
+    [{ state: "closed" as const }],
+    [{ headSha: "bbb" }],
+    [{ checkConclusion: "failure" as const }],
+    [{ latestReviewId: 21 }],
+    [{ latestCommentId: 11, latestCommentAuthor: "human" }],
+    [{ mergeableState: "dirty" }],
+    [{ mergeableState: "behind" }],
+  ])("wakes for %j", (patch) => {
+    expect(actionableFingerprintChange(base, { ...base, ...patch }, own)).toHaveLength(1);
+  });
+
+  it("wakes for check success and mergeable clean", () => {
+    expect(actionableFingerprintChange({ ...base, checkConclusion: "pending" }, base, own)).toEqual(["check_conclusion"]);
+    expect(actionableFingerprintChange({ ...base, mergeableState: "blocked" }, base, own)).toEqual(["mergeable_state"]);
+  });
+
+  it.each([
+    [{ checkConclusion: "pending" as const }],
+    [{ checkConclusion: "none" as const }],
+    [{ mergeableState: "blocked" }],
+    [{ mergeableState: "unstable" }],
+    [{ mergeableState: "has_hooks" }],
+    [{ mergeableState: "draft" }],
+    [{ latestCommentId: 11, latestCommentAuthor: "Bot" }],
+  ])("stays quiet for %j", (patch) => {
+    expect(actionableFingerprintChange(base, { ...base, ...patch }, own)).toEqual([]);
+  });
+
+  it("treats a comment as actionable when the own login or author is unknown", () => {
+    const next = { ...base, latestCommentId: 11, latestCommentAuthor: "bot" };
+    expect(actionableFingerprintChange(base, next, { ownLogin: null })).toEqual(["comment"]);
+    expect(actionableFingerprintChange(base, { ...next, latestCommentAuthor: null }, own)).toEqual(["comment"]);
+  });
+
+  it("lists only the actionable fields of a mixed change", () => {
+    const next = { ...base, headSha: "bbb", checkConclusion: "pending" as const, mergeableState: "blocked" };
+    expect(actionableFingerprintChange(base, next, own)).toEqual(["head_sha"]);
   });
 });
 

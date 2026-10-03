@@ -39,6 +39,7 @@ export const HARNESS_AGENT_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_GCA", // gemini_local
   "MOONSHOT_API_KEY", // kimi_local
   "XAI_API_KEY", // grok_local
+  "GROK_HOME", // grok_local: an inherited host home is the sign-in fallback (v2026.1001.0, #13570)
   "OPENROUTER_API_KEY", // pi_local, opencode_local
   "ZAI_API_KEY", "MINIMAX_API_KEY", // hermes_local: provider keys its environment test also reads
   "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE", // claude_local on Bedrock: non-secret selectors only

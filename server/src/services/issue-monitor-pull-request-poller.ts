@@ -6,6 +6,7 @@ import { defaultTokenProvider, retryAfterSeconds } from "./github-external-objec
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import {
+  actionableFingerprintChange,
   changedFingerprintFields,
   parsePullRequestState,
   pullRequestStateKey,
@@ -79,6 +80,16 @@ function maxId(value: unknown) {
   return max;
 }
 
+function latestComment(value: unknown): { id: number | null; author: string | null } {
+  const id = maxId(value);
+  if (id === null || !Array.isArray(value)) return { id: null, author: null };
+  const entry = value.find((candidate) => (candidate as { id?: unknown } | null)?.id === id) as
+    | { user?: { login?: unknown } | null }
+    | undefined;
+  const login = entry?.user?.login;
+  return { id, author: typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null };
+}
+
 function isRateLimited(response: Response) {
   if (response.status === 429) return true;
   if (response.status !== 403) return false;
@@ -95,6 +106,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
   const pausedUntil = new Map<string, number>();
   const noTokenLogged = new Set<string>();
   const wakeRetryAt = new Map<string, number>();
+  const ownLogins = new Map<string, string>();
   let running = false;
 
   async function request<T>(
@@ -178,7 +190,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
       token,
       entry,
       `${base}/issues/${ref.number}/comments?since=${encodeURIComponent(entry.sinceIso)}&per_page=100`,
-      maxId,
+      latestComment,
     );
     if (comments.kind !== "ok") return comments;
 
@@ -190,12 +202,41 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
       value: {
         headSha: pull.value.headSha,
         checkConclusion: suites.value,
-        latestCommentId: comments.value,
+        latestCommentId: comments.value.id,
+        latestCommentAuthor: comments.value.author,
         latestReviewId: reviews.value,
         state: pull.value.state,
         mergeableState: pull.value.mergeableState ?? entry.fingerprint?.mergeableState ?? null,
       },
     };
+  }
+
+  /** The token owner's login, resolved once per token; `null` (not cached) when `GET /user` fails. */
+  async function resolveOwnLogin(token: string, companyId: string): Promise<string | null> {
+    const cached = ownLogins.get(token);
+    if (cached) return cached;
+    try {
+      const response = await fetchImpl(`${GITHUB_API_ORIGIN}/user`, {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": "paperclip-pull-request-monitor",
+          "x-github-api-version": "2022-11-28",
+          authorization: `Bearer ${token}`,
+        },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (response.status === 200) {
+        const login = ((await response.json()) as { login?: unknown } | null)?.login;
+        if (typeof login === "string" && login.length > 0) {
+          ownLogins.set(token, login);
+          return login;
+        }
+      }
+    } catch {
+      // fall through to fail open
+    }
+    log.warn({ companyId }, "pull request monitor could not resolve the token's GitHub login; every new comment wakes");
+    return null;
   }
 
   async function writeBaseline(issueId: string, key: string, fingerprint: PullRequestFingerprint) {
@@ -317,11 +358,29 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
             result.baselined += 1;
             continue;
           }
-          const changed = changedFingerprintFields(stored, current);
-          if (changed.length === 0) {
+          const changedFields = changedFingerprintFields(stored, current);
+          if (changedFields.length === 0) {
             if (stored.mergeableState === null && current.mergeableState !== null) {
               await writeBaseline(monitor.issueId, key, { ...stored, mergeableState: current.mergeableState });
             }
+            continue;
+          }
+          let ownLogin: string | null = null;
+          if (changedFields.includes("comment")) {
+            const commentToken = token ?? (await resolveToken(companyId));
+            ownLogin = commentToken ? await resolveOwnLogin(commentToken, companyId) : null;
+          }
+          const changed = actionableFingerprintChange(stored, current, { ownLogin });
+          if (changed.length === 0) {
+            // Nothing worth a wake: advance the baseline so the same data does not come up again.
+            await writeBaseline(monitor.issueId, key, {
+              ...current,
+              latestCommentId: current.latestCommentId ?? stored.latestCommentId,
+              latestCommentAuthor:
+                current.latestCommentId === null ? stored.latestCommentAuthor ?? null : current.latestCommentAuthor,
+              latestReviewId: current.latestReviewId ?? stored.latestReviewId,
+              mergeableState: current.mergeableState ?? stored.mergeableState,
+            });
             continue;
           }
           const retryKey = `${monitor.issueId}|${key}`;

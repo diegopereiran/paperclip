@@ -281,7 +281,7 @@ describe("task watchdog subtree classifier", () => {
   it("excludes task-watchdog issues and their descendants from watched subtree scans", () => {
     const result = classify({
       issues: [
-        issue({ status: "done" }),
+        issue({ status: "blocked" }),
         issue({
           id: watchdogId,
           identifier: "PAP-3",
@@ -414,7 +414,66 @@ describe("task watchdog subtree classifier", () => {
       completedRunIssueIds: [sourceId],
     });
 
-    expect(result.state).toBe("stopped");
+    expect(result.state).toBe("not_applicable");
+  });
+
+  describe("monitor, terminal and hand-off live paths", () => {
+    const evaluatedAt = new Date("2026-06-18T16:32:45.000Z");
+    const inOneHour = new Date(evaluatedAt.getTime() + 3_600_000);
+    const monitored = (overrides: Partial<TaskWatchdogClassifierIssue> = {}) =>
+      issue({
+        status: "in_review",
+        updatedAt: new Date("2026-06-18T10:00:00.000Z"),
+        monitorNextCheckAt: inOneHour,
+        ...overrides,
+      });
+
+    it.each(["in_progress", "in_review"])(
+      "treats a future monitor on an agent-owned %s issue as live",
+      (status) => {
+        const result = classify({ issues: [monitored({ status })], evaluatedAt });
+        expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+      },
+    );
+
+    it.each([
+      ["past", { monitorNextCheckAt: new Date(evaluatedAt.getTime() - 60_000) }],
+      ["unset", { monitorNextCheckAt: null }],
+      ["user-assigned", { assigneeUserId: "user-1" }],
+      ["unassigned", { assigneeAgentId: null }],
+      ["todo", { status: "todo" }],
+      ["blocked", { status: "blocked" }],
+    ] as const)("stops when the monitor cannot fire: %s", (_label, overrides) => {
+      const result = classify({ issues: [monitored(overrides)], evaluatedAt });
+      expect(result.state).toBe("stopped");
+    });
+
+    it.each(["done", "cancelled"])("is not applicable when every issue is %s", (status) => {
+      const result = classify({
+        issues: [
+          issue({ status, updatedAt: new Date("2026-06-18T10:00:00.000Z") }),
+          issue({ id: childId, parentId: sourceId, status, updatedAt: new Date("2026-06-18T10:00:00.000Z") }),
+        ],
+        evaluatedAt,
+      });
+      expect(result.state).toBe("not_applicable");
+    });
+
+    it("defers a hand-off 30 s old and stops at 60 s", () => {
+      const handoff = (secondsAgo: number) =>
+        classify({
+          issues: [issue({
+            status: "in_review",
+            createdAt: new Date("2026-06-18T10:00:00.000Z"),
+            updatedAt: new Date(evaluatedAt.getTime() - secondsAgo * 1000),
+          })],
+          evaluatedAt,
+          firstRunGraceMs: 45_000,
+          completedRunIssueIds: [sourceId],
+        }).state;
+      expect(handoff(30)).toBe("pending_first_run");
+      expect(handoff(60)).toBe("stopped");
+    });
   });
 
   it("does not evaluate a task-watchdog issue as a watched source", () => {

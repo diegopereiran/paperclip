@@ -1834,7 +1834,15 @@ export function heartbeatService(
     runId?: string | null;
     companyId?: string | null;
   }) {
-    return recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const dependencyWakes =
+      await recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const childrenCompletedWakes =
+      await recovery.reconcileDeferredChildrenCompletedWakes(opts);
+    return {
+      ...dependencyWakes,
+      healed: dependencyWakes.healed + childrenCompletedWakes.healed,
+      childrenCompletedHealed: childrenCompletedWakes.healed,
+    };
   }
 
   // Await every background heartbeat execution that is currently in flight. A

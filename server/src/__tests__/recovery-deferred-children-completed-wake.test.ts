@@ -55,7 +55,7 @@ describeEmbeddedPostgres("recovery reconcileDeferredChildrenCompletedWake", () =
     await tempDb?.cleanup();
   });
 
-  async function seed() {
+  async function seed(completedAt = new Date("2026-05-23T22:01:00.000Z")) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const executionWorkspaceId = randomUUID();
@@ -113,7 +113,7 @@ describeEmbeddedPostgres("recovery reconcileDeferredChildrenCompletedWake", () =
         status: "done",
         priority: "medium",
         executionWorkspaceId,
-        completedAt: new Date("2026-05-23T22:01:00.000Z"),
+        completedAt,
       },
     ]);
     // The child's run prepared the worktree; sync-back has not landed.
@@ -226,5 +226,103 @@ describeEmbeddedPostgres("recovery reconcileDeferredChildrenCompletedWake", () =
       }),
     ).resolves.toMatchObject({ healed: 0, existingWakeSkipped: 1 });
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes the parent again when the child was reopened and completed after the earlier wake", async () => {
+    const { companyId, agentId, executionWorkspaceId, parentId, childId } = await seed();
+    const { enqueueWakeup, recovery } = buildService();
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    // A wake for the first completion, sent before the child's latest completedAt.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      status: "completed",
+      payload: { issueId: parentId, completedChildIssueId: childId },
+      createdAt: new Date("2026-05-23T21:00:00.000Z"),
+    });
+
+    await expect(
+      recovery.reconcileDeferredChildrenCompletedWake({
+        runId: null,
+        companyId,
+        completedChildIssueId: childId,
+      }),
+    ).resolves.toMatchObject({ healed: 1 });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers the wake after a failed finalize when a later finalize clears the barrier", async () => {
+    const { companyId, agentId, executionWorkspaceId, parentId, childId } = await seed(
+      new Date(Date.now() - 60 * 60 * 1000),
+    );
+    const { enqueueWakeup, recovery } = buildService();
+
+    // The child's own finalize failed: the finalize hook finds the parent not ready.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    await expect(
+      recovery.reconcileDeferredChildrenCompletedWake({
+        runId: null,
+        companyId,
+        completedChildIssueId: childId,
+      }),
+    ).resolves.toMatchObject({ notReady: 1, healed: 0 });
+    await expect(recovery.reconcileDeferredChildrenCompletedWakes({ companyId })).resolves.toMatchObject({
+      healed: 0,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    // A later run on the same workspace finalizes successfully. The finalize
+    // hook never re-runs for the child, so the periodic sweep must send the wake.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: null,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+    await expect(recovery.reconcileDeferredChildrenCompletedWakes({ companyId })).resolves.toMatchObject({
+      healed: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        reason: "issue_children_completed",
+        payload: expect.objectContaining({ issueId: parentId, completedChildIssueId: childId }),
+      }),
+    );
+
+    // The sweep repeats every tick: once the wake exists it must stay quiet.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      status: "queued",
+      payload: { issueId: parentId, completedChildIssueId: childId },
+    });
+    await expect(recovery.reconcileDeferredChildrenCompletedWakes({ companyId })).resolves.toMatchObject({
+      healed: 0,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 });

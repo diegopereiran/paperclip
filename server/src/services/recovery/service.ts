@@ -15,6 +15,7 @@ import {
   gte,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   or,
@@ -165,6 +166,8 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const DEFERRED_CHILDREN_COMPLETED_WAKE_CANDIDATE_LIMIT = 200;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -5437,7 +5440,7 @@ export function recoveryService(
     runId?: string | null;
     companyId: string;
     completedChildIssueId: string;
-    source?: "workspace.finalize";
+    source?: ResolvedDependencyWakeBackstopSource;
   }) {
     const result = {
       checked: 0,
@@ -5475,6 +5478,30 @@ export function recoveryService(
       return result;
     }
 
+    // Only the child that completed last owns the parent wake: the route woke
+    // the parent when the last child went terminal, so an earlier child must
+    // not trigger a second one.
+    const laterDoneSibling = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, opts.companyId),
+          eq(issues.parentId, child.parentId),
+          ne(issues.id, child.id),
+          eq(issues.status, "done"),
+          child.completedAt
+            ? gt(issues.completedAt, child.completedAt)
+            : sql`false`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (laterDoneSibling) {
+      result.existingWakeSkipped = 1;
+      return result;
+    }
+
     const existingWake = await db
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
@@ -5483,7 +5510,10 @@ export function recoveryService(
           eq(agentWakeupRequests.companyId, opts.companyId),
           eq(agentWakeupRequests.agentId, parent.assigneeAgentId),
           eq(agentWakeupRequests.reason, "issue_children_completed"),
-          sql`${agentWakeupRequests.payload} ->> 'completedChildIssueId' = ${child.id}`,
+          or(
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${parent.id}`,
+            sql`${agentWakeupRequests.payload} ->> 'completedChildIssueId' = ${child.id}`,
+          ),
           child.completedAt
             ? gte(agentWakeupRequests.createdAt, child.completedAt)
             : sql`true`,
@@ -5546,6 +5576,54 @@ export function recoveryService(
       );
     }
     return result;
+  }
+
+  // Level-triggered companion to the finalize hook: a deferred wake is lost
+  // when the child's own run failed its finalize and a later run on the same
+  // workspace cleared the barrier. Re-check recently completed children on
+  // every recovery tick; the reconciler's dedup keeps this to one wake each.
+  async function reconcileDeferredChildrenCompletedWakes(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+  }) {
+    const total = {
+      checked: 0,
+      healed: 0,
+      notReady: 0,
+      existingWakeSkipped: 0,
+      enqueueFailed: 0,
+    };
+    const since = new Date(
+      Date.now() - DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS,
+    );
+    const candidates = await db
+      .select({ id: issues.id, companyId: issues.companyId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+          sql`${issues.parentId} is not null`,
+          gte(issues.completedAt, since),
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : sql`true`,
+        ),
+      )
+      .orderBy(desc(issues.completedAt))
+      .limit(DEFERRED_CHILDREN_COMPLETED_WAKE_CANDIDATE_LIMIT);
+    for (const candidate of candidates) {
+      const result = await reconcileDeferredChildrenCompletedWake({
+        runId: opts?.runId ?? null,
+        companyId: candidate.companyId,
+        completedChildIssueId: candidate.id,
+        source: "issue_graph_liveness.backstop",
+      });
+      total.checked += result.checked;
+      total.healed += result.healed;
+      total.notReady += result.notReady;
+      total.existingWakeSkipped += result.existingWakeSkipped;
+      total.enqueueFailed += result.enqueueFailed;
+    }
+    return total;
   }
 
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
@@ -5977,6 +6055,7 @@ export function recoveryService(
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
     reconcileDeferredChildrenCompletedWake,
+    reconcileDeferredChildrenCompletedWakes,
     readRecoveryTimerIntervalMs,
   };
 }

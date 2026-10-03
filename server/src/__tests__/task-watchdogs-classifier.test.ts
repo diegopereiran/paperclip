@@ -368,6 +368,55 @@ describe("task watchdog subtree classifier", () => {
     expect(result.state).toBe("stopped");
   });
 
+  it("defers a stopped verdict for an existing issue updated inside the grace window", () => {
+    // Hand-off write: the issue ran before (completed run) and its next
+    // owner's wake is not yet visible 2s after the update.
+    const result = classify({
+      issues: [issue({
+        status: "in_review",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:43.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("pending_first_run");
+    if (result.state !== "pending_first_run") return;
+    expect(result.pendingIssueIds).toEqual([sourceId]);
+  });
+
+  it("stops an existing issue whose last update is older than the grace window", () => {
+    const result = classify({
+      issues: [issue({
+        status: "in_review",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:20.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
+  it("does not defer a recently updated issue that is already terminal", () => {
+    const result = classify({
+      issues: [issue({
+        status: "done",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:43.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
   it("does not evaluate a task-watchdog issue as a watched source", () => {
     const result = classify({
       watchdog: {

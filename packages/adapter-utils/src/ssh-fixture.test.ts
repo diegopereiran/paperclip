@@ -272,7 +272,10 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toBe("hello over ssh stdin\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("stops the remote command when the local ssh client is killed (#14704)", async () => {
+  it.each([
+    { label: "a command that exits on TERM", ignoreTerm: false, stopWithinMs: 20_000 },
+    { label: "a command that ignores TERM", ignoreTerm: true, stopWithinMs: 30_000 },
+  ])("stops $label and its child when the local ssh client is killed (#14704)", async ({ ignoreTerm, stopWithinMs }) => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
@@ -280,40 +283,77 @@ describe("ssh env-lab fixture", () => {
     if (!started) return;
     const config = await buildSshEnvLabFixtureConfig(started);
     const marker = `pc-orphan-probe-${process.pid}-${Date.now()}`;
-    // Two commands keep the shell alive, so its command line carries the marker.
+    // A unique sleep duration identifies the child process of this test only.
+    const sleepSeconds = 100_000 + Math.floor(Math.random() * 800_000);
+    // SIG_IGN is inherited across exec, so with the trap the sleep child also
+    // ignores TERM and only the watchdog's KILL can stop the process group.
+    const script = `${ignoreTerm ? "trap '' TERM; " : ""}sleep ${sleepSeconds}; echo ${marker}`;
     const target = await buildSshSpawnTarget({
       spec: { ...config, remoteCwd: started.workspaceDir },
       command: "sh",
-      args: ["-c", `sleep 120; echo ${marker}`],
+      args: ["-c", script],
       env: {},
     });
-    const remoteRunning = async () => {
+    const running = async (pattern: string) => {
       const result = await new Promise<string>((resolve) => {
-        // Anchor on the remote shell's own command line; the local ssh client's
-        // arguments also contain the marker and must not count as "remote".
-        execFile("pgrep", ["-f", `^sh -c sleep 120; echo ${marker}$`], (_error, stdout) => resolve(stdout.trim()));
+        execFile("pgrep", ["-f", pattern], (_error, stdout) => resolve(stdout.trim()));
       });
       return result.length > 0;
     };
+    // Anchor on the remote processes' own command lines; the local ssh client's
+    // arguments also contain the script and must not count as "remote".
+    const shellPattern = `^sh -c ${script.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+    const childPattern = `^sleep ${sleepSeconds}$`;
+    const remoteRunning = async () => (await running(shellPattern)) || (await running(childPattern));
     const client = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"] });
     try {
       const deadline = Date.now() + 10_000;
-      while (!(await remoteRunning()) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
-      expect(await remoteRunning()).toBe(true);
+      while (!((await running(shellPattern)) && (await running(childPattern))) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(await running(shellPattern)).toBe(true);
+      expect(await running(childPattern)).toBe(true);
 
       client.kill("SIGTERM");
-      const stopDeadline = Date.now() + 20_000;
+      const stopDeadline = Date.now() + stopWithinMs;
       while ((await remoteRunning()) && Date.now() < stopDeadline) await new Promise((r) => setTimeout(r, 250));
-      expect(await remoteRunning()).toBe(false);
+      expect(await running(shellPattern)).toBe(false);
+      expect(await running(childPattern)).toBe(false);
     } finally {
       client.kill("SIGKILL");
-      // Kill the whole remote process group so no `sleep` child is left behind.
+      // Kill any leftover remote process so no child is left behind.
       await new Promise<void>((resolve) =>
-        execFile("sh", ["-c", `for p in $(pgrep -f '^sh -c sleep 120; echo ${marker}$'); do kill -KILL -$(ps -o pgid= -p $p | tr -d ' ') 2>/dev/null; done; true`], () => resolve()),
+        execFile("sh", ["-c", `pkill -KILL -f '^sleep ${sleepSeconds}$'; true`], () => resolve()),
       );
       await target.cleanup();
     }
-  }, 45_000);
+  }, 60_000);
+
+  it("gives every spawned command its own SSH connection", async () => {
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "example.invalid",
+        port: 22,
+        username: "paperclip",
+        remoteCwd: "/tmp",
+        strictHostKeyChecking: false,
+        privateKey: null,
+        knownHosts: null,
+      } as Parameters<typeof buildSshSpawnTarget>[0]["spec"],
+      command: "true",
+      args: [],
+      env: {},
+    });
+    try {
+      // A shared ControlMaster connection keeps its sshd alive after the local
+      // client dies, so the remote watchdog would never see the session end.
+      const options = target.args.flatMap((arg, i) => (target.args[i - 1] === "-o" ? [arg] : []));
+      expect(options).toContain("ControlMaster=no");
+      expect(options).toContain("ControlPath=none");
+    } finally {
+      await target.cleanup();
+    }
+  });
 
   it("does not treat an unrelated reused pid as the running fixture", async () => {
     const rootDir = await createFixtureRootDir();

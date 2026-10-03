@@ -1300,7 +1300,10 @@ export async function buildSshSpawnTarget(input: {
     }
   }
   const auth = await createSshAuthArgs(input.spec);
-  const sshArgs = [...auth.args];
+  // Give each agent command its own connection. With a shared ControlMaster
+  // connection the sshd session outlives the local client, so the orphan
+  // watchdog below would never see the session end.
+  const sshArgs = [...auth.args, "-o", "ControlMaster=no", "-o", "ControlPath=none"];
   const envArgs = Object.entries(input.env)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);

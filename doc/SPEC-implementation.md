@@ -865,7 +865,7 @@ Implementation, security, UI, and QA work for task watchdogs must prove these co
 - watchdog-scoped mutations can touch only the watched subtree and the reusable watchdog issue, with activity records for each mutation
 - interaction tests prove watchdog runs use the same resolver policy as ordinary agents, without a watchdog-only kind or purpose-marker exception
 - interaction tests cover `anyone`, `not_creator`, `human_only`, named addressees, company caps, stale targets, governed actions, newer user comments, low-trust/task-bridge containment, and cross-company denial
-- scheduler tests prove live runs, queued wakes, and scheduled retries suppress watchdog wakeups, while terminal, cancelled, blocked, and review leaves are still verified when the subtree has no live path
+- scheduler tests prove live runs, queued wakes, scheduled retries, and future issue monitors on monitor-eligible issues suppress watchdog wakeups, a subtree where every issue is `done` or `cancelled` is `not_applicable`, and blocked and review leaves are still verified when the subtree has no live path
 - tests prove `task_watchdog` origin issues and descendants are excluded from scans so watchdogs do not trigger themselves
 - recovery-batch tests prove batches are capped at 3 allowed mutations, applied all-or-nothing, and aborted with recorded evidence when the observed stop fingerprint went stale mid-batch
 - restoration-verification tests prove a "live path restored" disposition re-fires on an unchanged fingerprint with an incremented attempt count, a failed intermediate-node restoration is not treated as a reviewed stop, and the N-attempt bound escalates to a human with attempt history instead of firing forever

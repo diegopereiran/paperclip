@@ -30,6 +30,7 @@ interface FakePullRequest {
   mergeableState: string;
   suites: Array<{ status: string; conclusion: string | null }>;
   comments: number[];
+  commentAuthor?: string;
   reviews: number[];
 }
 
@@ -48,6 +49,7 @@ function freshPullRequest(): FakePullRequest {
 function createFakeGitHub() {
   const pulls = new Map<string, FakePullRequest>();
   const requests: Array<{ url: string; ifNoneMatch: string | null; authorization: string | null }> = [];
+  let userResponse: { status: number; login?: string } = { status: 200, login: "paperclip-bot" };
   let failWith: { status: number; headers?: Record<string, string> } | null = null;
 
   function respond(request: Request | { url: string }, init: RequestInit | undefined) {
@@ -60,6 +62,9 @@ function createFakeGitHub() {
     });
     if (failWith) return new Response("{}", { status: failWith.status, headers: failWith.headers });
     const parsed = new URL(url);
+    if (parsed.pathname === "/user") {
+      return new Response(JSON.stringify({ login: userResponse.login }), { status: userResponse.status });
+    }
     const match = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(pulls|issues|commits)\/([^/]+)(?:\/(.+))?$/);
     if (!match) return new Response("{}", { status: 404 });
     const [, owner, repo, kind, id, rest] = match;
@@ -73,7 +78,7 @@ function createFakeGitHub() {
     } else if (kind === "pulls" && rest === "reviews") {
       body = pr.reviews.map((reviewId) => ({ id: reviewId }));
     } else if (kind === "issues" && rest === "comments") {
-      body = pr.comments.map((commentId) => ({ id: commentId }));
+      body = pr.comments.map((commentId) => ({ id: commentId, user: { login: pr.commentAuthor ?? "reviewer" } }));
     } else if (kind === "commits" && rest?.startsWith("check-suites")) {
       body = { total_count: pr.suites.length, check_suites: pr.suites };
     } else {
@@ -90,6 +95,9 @@ function createFakeGitHub() {
     set(ref: string, pr: FakePullRequest = freshPullRequest()) {
       pulls.set(ref, pr);
       return pr;
+    },
+    setUser(response: { status: number; login?: string }) {
+      userResponse = response;
     },
     fail(response: { status: number; headers?: Record<string, string> } | null) {
       failWith = response;
@@ -222,6 +230,7 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
         headSha: "sha-1",
         checkConclusion: "success",
         latestCommentId: null,
+        latestCommentAuthor: null,
         latestReviewId: null,
         state: "open",
         mergeableState: "clean",
@@ -270,6 +279,62 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
         }),
       }),
     );
+  });
+
+  it.each([
+    ["a pending check", (pr: FakePullRequest) => { pr.suites = [{ status: "in_progress", conclusion: null }]; }],
+    ["a blocked mergeable state", (pr: FakePullRequest) => { pr.mergeableState = "blocked"; }],
+    ["an unstable mergeable state", (pr: FakePullRequest) => { pr.mergeableState = "unstable"; }],
+    ["a comment by the token's own login", (pr: FakePullRequest) => { pr.comments = [301]; pr.commentAuthor = "Paperclip-Bot"; }],
+  ])("does not wake for %s and advances the baseline", async (_label, mutate) => {
+    const company = await seedCompany();
+    const issueId = await seedMonitor(company);
+    const { poller, triggerMonitor, github } = setup();
+    await poller.poll(T0);
+
+    mutate(github.set("open/repo#12", { ...freshPullRequest() }));
+    const result = await poller.poll(at(4));
+    expect(result.woken).toBe(0);
+    expect(triggerMonitor).not.toHaveBeenCalled();
+    const stored = (await storedState(issueId))?.["open/repo#12"] as Record<string, unknown>;
+    expect(stored.checkConclusion === "pending" || stored.mergeableState !== "clean" || stored.latestCommentId === 301).toBe(true);
+
+    await poller.poll(at(8));
+    expect(triggerMonitor).not.toHaveBeenCalled();
+  });
+
+  it("wakes on a comment by someone else", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github } = setup();
+    await poller.poll(T0);
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301], commentAuthor: "someone" });
+    await poller.poll(at(4));
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakes on every new comment when GET /user fails", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github, log } = setup();
+    github.setUser({ status: 500 });
+    await poller.poll(T0);
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301], commentAuthor: "paperclip-bot" });
+    await poller.poll(at(4));
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it("resolves the own login once per token", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, github } = setup();
+    await poller.poll(T0);
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301], commentAuthor: "paperclip-bot" });
+    await poller.poll(at(4));
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [302], commentAuthor: "paperclip-bot" });
+    await poller.poll(at(8));
+    expect(github.requests.filter((request) => new URL(request.url).pathname === "/user")).toHaveLength(1);
   });
 
   it("costs one request set for two monitors on one PR and wakes both", async () => {

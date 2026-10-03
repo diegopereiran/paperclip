@@ -14,6 +14,7 @@ import {
   agents,
   companies,
   createDb,
+  environmentLeases,
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
@@ -10066,5 +10067,131 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
         }),
       },
     });
+  });
+});
+
+describeEmbeddedPostgres("unstarted worktree base refresh under an active lease", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-lease-guard-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // ALP-1433 / ALP-466: an SSH run's commits live on the executor until sync-back, so its
+  // worktree looks unstarted locally. Another run's workspace prep must not reset it.
+  it("skips the refresh while another run holds an active lease on the workspace", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const sshRunId = randomUUID();
+    const prepRunId = randomUUID();
+    const now = new Date();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Codex Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Paperclip App", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: repoRoot,
+      isPrimary: true,
+    });
+    for (const id of [sshRunId, prepRunId]) {
+      await db.insert(heartbeatRuns).values({
+        id,
+        companyId,
+        agentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    const realize = () => realizeExecutionWorkspace({
+      db,
+      heartbeatRunId: prepRunId,
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId,
+        workspaceId: projectWorkspaceId,
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-466", title: "Swallowed stop commands" },
+      agent: { id: agentId, name: "Codex Coder", companyId },
+    });
+
+    const initial = await realize();
+    const initialHead = await readGit(initial.cwd, ["rev-parse", "HEAD"]);
+    const executionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "PAP-466",
+      status: "active",
+      cwd: initial.cwd,
+      providerRef: initial.cwd,
+      baseRef: "origin/master",
+      branchName: initial.branchName,
+      providerType: "git_worktree",
+      lastUsedAt: now,
+      updatedAt: now,
+    });
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      executionWorkspaceId,
+      heartbeatRunId: sshRunId,
+      status: "active",
+      provider: "ssh",
+    });
+
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "auth-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const whileLeased = await realize();
+    expect(whileLeased.cwd).toBe(initial.cwd);
+    expect(await readGit(whileLeased.cwd, ["rev-parse", "HEAD"])).toBe(initialHead);
+
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, leaseId));
+    const afterRelease = await realize();
+    expect(await readGit(afterRelease.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
   });
 });

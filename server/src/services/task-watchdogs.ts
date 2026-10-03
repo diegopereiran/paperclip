@@ -200,6 +200,10 @@ export type TaskWatchdogClassifierInput = {
   // be visible). Omit to disable the guard (legacy behavior).
   evaluatedAt?: Date | string | null;
   firstRunGraceMs?: number | null;
+  // Turns off the hand-off guard (recently updated issues defer the verdict).
+  // Mutation revalidation sets it: the reviewer's own comments and edits bump
+  // the source issue's updatedAt and must not make its scope look stale.
+  skipHandoffGuard?: boolean;
   // Ids of included issues that have at least one run in a terminal status.
   // Such issues are never treated as "pending first run" — they have
   // demonstrably executed, so a stop is genuine rather than a snapshot race.
@@ -440,7 +444,7 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
         // always has a completed run. A real stall has a stale updatedAt and
         // is caught by the next reconciler pass.
         const updatedAtMs = toEpochMs(issue.updatedAt);
-        if (updatedAtMs != null && evaluatedAtMs - updatedAtMs < graceMs) return true;
+        if (!input.skipHandoffGuard && updatedAtMs != null && evaluatedAtMs - updatedAtMs < graceMs) return true;
         if (completedRunIssueIds.has(issue.id)) return false;
         const createdAtMs = toEpochMs(issue.createdAt);
         if (createdAtMs == null) return false;
@@ -1650,7 +1654,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     }
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
-    const classification = classifyTaskWatchdogSubtree(input);
+    const classification = classifyTaskWatchdogSubtree({ ...input, skipHandoffGuard: true });
     if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
       return { allowed: true as const, classification };
     }

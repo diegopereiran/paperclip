@@ -434,6 +434,13 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     const pendingIssueIds = included
       .filter((issue) => {
         if (isTerminalIssueStatus(issue.status)) return false;
+        // Hand-off guard: a non-terminal issue written within the grace window
+        // may be mid hand-off, its next owner's wake not yet visible. This is
+        // deliberately not masked by completedRunIssueIds: a handed-off issue
+        // always has a completed run. A real stall has a stale updatedAt and
+        // is caught by the next reconciler pass.
+        const updatedAtMs = toEpochMs(issue.updatedAt);
+        if (updatedAtMs != null && evaluatedAtMs - updatedAtMs < graceMs) return true;
         if (completedRunIssueIds.has(issue.id)) return false;
         const createdAtMs = toEpochMs(issue.createdAt);
         if (createdAtMs == null) return false;
@@ -445,7 +452,7 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       return {
         state: "pending_first_run",
         reason:
-          "A watched issue was created within the first-run grace window and has not yet completed a run; deferring evaluation until its first assignment run/wake is observable.",
+          "A watched issue was created or updated within the grace window and its next run/wake may not be observable yet; deferring evaluation.",
         includedIssueIds: includedIds,
         pendingIssueIds,
       };

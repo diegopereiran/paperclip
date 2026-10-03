@@ -1519,6 +1519,47 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
+  it("archives a cleanup_failed workspace, so a retried archive can finish it", async () => {
+    // A failed cleanup leaves the row closed but not archived. Treating it as
+    // already closed made every retry return 404, so the row stayed forever
+    // (paperclipai/paperclip#13014).
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const failedAt = new Date("2026-09-28T20:11:05.919Z");
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "cleanup_failed", closedAt: failedAt })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+
+    expect(result?.outcome).toBe("archived");
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("archived");
+  });
+
+  it("still refuses to archive a workspace that is already archived", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "archived", closedAt: new Date() })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+
+    expect(result).toBeNull();
+  });
+
   it("does not overwrite a newer archive when a stale cleanup failure lands late", async () => {
     // The archive route records a cleanup failure through the generation-fenced
     // write after the destructive cleanup throws. Simulate a reopen and a fresh

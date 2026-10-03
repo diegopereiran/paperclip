@@ -498,6 +498,111 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(saved.metadata?.remoteExecutionTermination).toEqual({ proof: "newer-receipt" });
   });
 
+  // Local and SSH leases own no provider resource: an SSH lease's provider lease
+  // id is the shared remote-runs root. The sandbox teardown path needs a recorded
+  // sandbox config these leases never have, so retrying them can only fail, and
+  // the stuck lease blocks every wake on its issue. The sweep releases them.
+  async function insertDriverlessLease(input: {
+    companyId: string;
+    driver: "local" | "ssh";
+    metadata?: Record<string, unknown>;
+  }): Promise<string> {
+    const id = randomUUID();
+    const environmentId = randomUUID();
+    const updatedAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db.insert(environments).values({
+      id: environmentId,
+      name: input.driver === "ssh" ? "Build host" : "Local",
+      driver: input.driver,
+      status: "active",
+      config: input.driver === "ssh" ? { host: "192.0.2.1", port: 22, username: "paperclip" } : {},
+      createdAt: updatedAt,
+      updatedAt,
+    });
+    await db.insert(environmentLeases).values({
+      id,
+      companyId: input.companyId,
+      environmentId,
+      status: "pending_cleanup",
+      leasePolicy: "ephemeral",
+      provider: input.driver,
+      providerLeaseId: input.driver === "ssh" ? "ssh://paperclip@192.0.2.1:22/home/paperclip/remote-runs" : null,
+      cleanupStatus: "failed",
+      metadata: { driver: input.driver, ...(input.metadata ?? {}) },
+      acquiredAt: updatedAt,
+      lastUsedAt: updatedAt,
+      releasedAt: updatedAt,
+      createdAt: updatedAt,
+      updatedAt,
+    });
+    return id;
+  }
+
+  async function readLease(id: string) {
+    return await db
+      .select({ status: environmentLeases.status, cleanupStatus: environmentLeases.cleanupStatus })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, id))
+      .then((rows) => rows[0]);
+  }
+
+  it("test_pending_cleanup_sweep_releases_ssh_lease_without_teardown", async () => {
+    const { companyId } = await seedCompanyAndEnvironment();
+    const leaseId = await insertDriverlessLease({ companyId, driver: "ssh" });
+    const destroyRunLease = vi.fn(async () => null);
+    const retryPendingSandboxTeardown = vi.fn(async () => {
+      throw new Error("no recorded sandbox config");
+    });
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: { destroyRunLease, retryPendingSandboxTeardown } as unknown as HeartbeatEnvironmentRuntime,
+    });
+
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ swept: 1, destroyed: 1, capped: 0 });
+    expect(retryPendingSandboxTeardown).not.toHaveBeenCalled();
+    expect(destroyRunLease).not.toHaveBeenCalled();
+    expect(await readLease(leaseId)).toEqual({ status: "expired", cleanupStatus: "success" });
+  });
+
+  it("test_pending_cleanup_sweep_releases_capped_local_lease", async () => {
+    const { companyId } = await seedCompanyAndEnvironment();
+    const leaseId = await insertDriverlessLease({
+      companyId,
+      driver: "local",
+      metadata: { [ATTEMPTS_KEY]: ATTEMPT_CAP, [CAP_WARNED_KEY]: true },
+    });
+    const destroyRunLease = vi.fn(async () => null);
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: fakeRuntime(destroyRunLease as HeartbeatEnvironmentRuntime["destroyRunLease"]),
+    });
+
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ swept: 1, destroyed: 1, capped: 0 });
+    expect(destroyRunLease).not.toHaveBeenCalled();
+    expect(await readLease(leaseId)).toEqual({ status: "expired", cleanupStatus: "success" });
+  });
+
+  it("test_pending_cleanup_sweep_still_caps_sandbox_lease", async () => {
+    const { companyId, environmentId } = await seedCompanyAndEnvironment();
+    const leaseId = await insertOrphanEphemeralLease({
+      companyId,
+      environmentId,
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+      metadata: { [ATTEMPTS_KEY]: ATTEMPT_CAP },
+    });
+    const destroyRunLease = vi.fn(async () => null);
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: fakeRuntime(destroyRunLease as HeartbeatEnvironmentRuntime["destroyRunLease"]),
+    });
+
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ swept: 1, destroyed: 0, capped: 1 });
+    expect(await readLease(leaseId)).toEqual({ status: "pending_cleanup", cleanupStatus: "failed" });
+  });
+
   // Two sweep ticks can overlap. Without an atomic claim, both read the same
   // attempt count, both destroy the same lease, and the retry cap counts one
   // attempt for two destroys. The atomic claim must let only one sweep destroy

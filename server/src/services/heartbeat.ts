@@ -18732,6 +18732,22 @@ export function heartbeatService(
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
 
+      // Local and ssh leases own no provider resource (an ssh
+      // lease's provider lease id is the shared remote-runs root), and the
+      // sandbox teardown below needs a recorded sandbox config they never have.
+      // Retrying can only fail, and a stuck lease defers every wake on its issue,
+      // so release it the way a successful retry does, even past the cap.
+      const leaseDriver = typeof metadata.driver === "string" ? metadata.driver : row.provider;
+      if (leaseDriver === "local" || leaseDriver === "ssh") {
+        await environmentsSvc.releaseLease(row.id, "expired", {
+          cleanupStatus: "success",
+          failureReason: "pending_cleanup_retry",
+        });
+        logger.info({ leaseId: row.id, driver: leaseDriver }, "released pending_cleanup lease with no provider resource");
+        destroyed += 1;
+        continue;
+      }
+
       const environment = row.environmentId
         ? await environmentsSvc.getById(row.environmentId)
         : null;

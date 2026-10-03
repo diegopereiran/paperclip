@@ -592,6 +592,33 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
   });
 
+  it("keeps watchdog mutation scope valid after the reviewer bumps the source updatedAt", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-REVALIDATE-BUMP", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const originalFingerprint = watchdog!.lastObservedFingerprint!;
+    expect(originalFingerprint).toMatch(/^task_watchdog_stop:/);
+
+    // issuesSvc.addComment sets the source issue's updatedAt to now.
+    await db.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, sourceId));
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId: watchdog!.id,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: originalFingerprint,
+    });
+
+    expect(revalidated.classification?.state).toBe("stopped");
+    expect(revalidated.allowed).toBe(true);
+  });
+
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-WAITS", status: "in_review" });

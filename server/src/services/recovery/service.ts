@@ -5012,6 +5012,18 @@ export function recoveryService(
           continue;
         }
 
+        // A review participant that waits on an explicit blocker is released by
+        // the wake-queue policy, and resolving the blocker wakes it. Its
+        // cancelled retry is not a failed recovery, so neither escalate nor
+        // requeue it while an unresolved blocker holds the issue.
+        if (
+          (await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id))
+            .length > 0
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
         if (
           didAutomaticRecoveryFail(
             participantLatestRun,

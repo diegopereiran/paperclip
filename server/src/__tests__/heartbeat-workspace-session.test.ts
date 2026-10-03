@@ -2278,6 +2278,21 @@ describe("effective run session config freshness", () => {
     expect(freshness(base, otherRuntime)).toMatchObject({ reset: true, changedCategories: ["agentRuntimeConfig"] });
   });
 
+  it("does not reset when a scheduler-only heartbeat is added or removed", async () => {
+    const absent = await buildSessionConfigMetadata({ agentRuntimeConfig: { contextMode: "full" } });
+    const capsOnly = await buildSessionConfigMetadata({
+      agentRuntimeConfig: { heartbeat: { maxDailyRuns: 60 }, contextMode: "full" },
+    });
+    const empty = await buildSessionConfigMetadata({ agentRuntimeConfig: { heartbeat: {}, contextMode: "full" } });
+    expect(freshness(absent, capsOnly)).toMatchObject({ reset: false });
+    expect(freshness(capsOnly, absent)).toMatchObject({ reset: false });
+    expect(freshness(absent, empty)).toMatchObject({ reset: false });
+    const realChange = await buildSessionConfigMetadata({
+      agentRuntimeConfig: { heartbeat: { maxDailyRuns: 60, enabled: false }, contextMode: "full" },
+    });
+    expect(freshness(absent, realChange)).toMatchObject({ reset: true, changedCategories: ["agentRuntimeConfig"] });
+  });
+
   it("does not reset for project or environment row timestamps but still resets for environment config", async () => {
     const env = (configRevisionAt: string, config: Record<string, unknown>) => ({
       selectionSource: "default",

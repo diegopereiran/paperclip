@@ -6542,11 +6542,13 @@ const SCHEDULER_ONLY_HEARTBEAT_KEYS = ["maxDailyRuns", "maxConcurrentRuns", "ski
 
 function withoutSchedulerOnlyHeartbeatKeys(agentRuntimeConfig: unknown): unknown {
   const runtime = parseObject(agentRuntimeConfig);
-  const heartbeat = parseObject(runtime.heartbeat);
-  if (!SCHEDULER_ONLY_HEARTBEAT_KEYS.some((key) => key in heartbeat)) return agentRuntimeConfig;
-  const kept = { ...heartbeat };
+  if (!("heartbeat" in runtime)) return agentRuntimeConfig;
+  const kept = { ...parseObject(runtime.heartbeat) };
   for (const key of SCHEDULER_ONLY_HEARTBEAT_KEYS) delete kept[key];
-  return { ...runtime, heartbeat: kept };
+  // An absent heartbeat and one that holds only scheduler keys are the same
+  // session settings, so drop an empty heartbeat instead of hashing {}.
+  const { heartbeat: _heartbeat, ...rest } = runtime;
+  return Object.keys(kept).length > 0 ? { ...rest, heartbeat: kept } : rest;
 }
 
 // Revisions that only touched runtimeConfig or adapterConfig add nothing to the
@@ -6565,6 +6567,44 @@ export function selectSessionFingerprintAgentConfigRevision<
     }
   }
   return null;
+}
+
+// Find the latest revision that the session fingerprint uses, with the same
+// rule as selectSessionFingerprintAgentConfigRevision, in the query itself. A
+// fixed window of recent revisions could hide it behind many runtimeConfig or
+// adapterConfig edits, and a missing revision would reset warm sessions.
+export async function findSessionFingerprintAgentConfigRevision(
+  db: Db,
+  companyId: string,
+  agentId: string,
+) {
+  return db
+    .select({
+      id: agentConfigRevisions.id,
+      changedKeys: agentConfigRevisions.changedKeys,
+      createdAt: agentConfigRevisions.createdAt,
+    })
+    .from(agentConfigRevisions)
+    .where(
+      and(
+        eq(agentConfigRevisions.companyId, companyId),
+        eq(agentConfigRevisions.agentId, agentId),
+        sql`case
+          when jsonb_typeof(${agentConfigRevisions.changedKeys}) <> 'array' then true
+          when jsonb_array_length(${agentConfigRevisions.changedKeys}) = 0 then true
+          else exists (
+            select 1 from jsonb_array_elements_text(${agentConfigRevisions.changedKeys}) as changed(key)
+            where changed.key not in ('runtimeConfig', 'adapterConfig')
+          )
+        end`,
+      ),
+    )
+    .orderBy(
+      desc(agentConfigRevisions.createdAt),
+      desc(agentConfigRevisions.id),
+    )
+    .limit(1)
+    .then((rows) => selectSessionFingerprintAgentConfigRevision(rows));
 }
 
 function buildSessionConfigCategoryValues(input: {
@@ -11237,25 +11277,7 @@ export function heartbeatService(
     companyId: string,
     agentId: string,
   ) {
-    return db
-      .select({
-        id: agentConfigRevisions.id,
-        changedKeys: agentConfigRevisions.changedKeys,
-        createdAt: agentConfigRevisions.createdAt,
-      })
-      .from(agentConfigRevisions)
-      .where(
-        and(
-          eq(agentConfigRevisions.companyId, companyId),
-          eq(agentConfigRevisions.agentId, agentId),
-        ),
-      )
-      .orderBy(
-        desc(agentConfigRevisions.createdAt),
-        desc(agentConfigRevisions.id),
-      )
-      .limit(50)
-      .then((rows) => selectSessionFingerprintAgentConfigRevision(rows));
+    return findSessionFingerprintAgentConfigRevision(db, companyId, agentId);
   }
 
   async function getTaskSession(

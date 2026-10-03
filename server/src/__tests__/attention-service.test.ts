@@ -1585,6 +1585,32 @@ describeEmbeddedPostgres("attention service", () => {
     expect(approvalItems[0]?.subject.metadata?.issueId).toBe(firstIssueId);
   });
 
+  it("does not add a review row when a linked pending approval is the only review path", async () => {
+    const { companyId, reviewerId } = await seedCompany("ATL");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATL-1",
+      title: "Merge the PR",
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+      executionState: pendingAgentExecutionState(reviewerId),
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Merge open-astro/AlpacaBridge#1" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.dedupKey === `approval:${approvalId}`)).toHaveLength(1);
+    expect(feed.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(0);
+  });
+
   it("hides snoozed attention rows until snoozedUntil passes, then returns them unconditionally", async () => {
     const { companyId } = await seedCompany("ATS");
     const approvalId = randomUUID();

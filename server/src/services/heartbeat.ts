@@ -25883,6 +25883,14 @@ export function heartbeatService(
                   blockerIssueId: issueId,
                   source: "workspace.finalize",
                 });
+                // The route also defers the parent's `issue_children_completed`
+                // wake until the child's sync-back lands; send it now.
+                await recovery.reconcileDeferredChildrenCompletedWake({
+                  runId: finalizedRun.id,
+                  companyId: finalizedRun.companyId,
+                  completedChildIssueId: issueId,
+                  source: "workspace.finalize",
+                });
               }
             } catch (finalizeWakeErr) {
               logger.warn(

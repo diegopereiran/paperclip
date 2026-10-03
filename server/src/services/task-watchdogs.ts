@@ -37,7 +37,8 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // treated as not-yet-stopped so the evaluation does not produce a
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
-const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+// Also the hand-off window: a release followed by a claim can take about 30 s.
+const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 45_000;
 
 type ActorFields = {
   agentId?: string | null;
@@ -71,6 +72,7 @@ export type TaskWatchdogClassifierIssue = Pick<
   // grace window keep working; the pending-first-run guard is skipped when
   // it (or `evaluatedAt`) is absent.
   createdAt?: Date | string | null;
+  monitorNextCheckAt?: Date | string | null;
   latestCommentAt?: Date | string | null;
   latestDocumentAt?: Date | string | null;
   latestWorkProductAt?: Date | string | null;
@@ -412,15 +414,34 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
+  if (included.every((issue) => isTerminalIssueStatus(issue.status))) {
+    return {
+      state: "not_applicable",
+      reason: "Every issue in the watched subtree is terminal.",
+      includedIssueIds: includedIds,
+    };
+  }
+  // A future monitor on an issue tickDueIssueMonitors can fire on (agent
+  // assignee, no user assignee, in_progress or in_review) wakes its assignee.
+  const nowMs = toEpochMs(input.evaluatedAt) ?? Date.now();
+  const monitoredIssueIds = included
+    .filter((issue) => {
+      const nextCheckMs = toEpochMs(issue.monitorNextCheckAt);
+      return nextCheckMs != null && nextCheckMs > nowMs &&
+        issue.assigneeAgentId != null && issue.assigneeUserId == null &&
+        (issue.status === "in_progress" || issue.status === "in_review");
+    })
+    .map((issue) => issue.id);
   const liveIssueIds = [
     ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
     ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...monitoredIssueIds,
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
     return {
       state: "live",
-      reason: "At least one issue in the watched subtree has a live run, queued wake, or scheduled retry.",
+      reason: "At least one issue in the watched subtree has a live run, queued wake, scheduled retry, or scheduled monitor.",
       includedIssueIds: includedIds,
       liveIssueIds: uniqueLiveIssueIds,
     };
@@ -886,6 +907,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           origin_kind,
           updated_at,
           created_at,
+          monitor_next_check_at,
           0 AS depth
         FROM issues
         WHERE company_id = ${companyId}
@@ -905,6 +927,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           child.origin_kind,
           child.updated_at,
           child.created_at,
+          child.monitor_next_check_at,
           watched_issues.depth + 1
         FROM issues child
         JOIN watched_issues ON child.parent_id = watched_issues.id
@@ -925,7 +948,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         assignee_user_id AS "assigneeUserId",
         origin_kind AS "originKind",
         updated_at AS "updatedAt",
-        created_at AS "createdAt"
+        created_at AS "createdAt",
+        monitor_next_check_at AS "monitorNextCheckAt"
       FROM watched_issues
     `);
 

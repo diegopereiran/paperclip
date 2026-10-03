@@ -783,6 +783,7 @@ export interface IssueExecutionMonitorPullRequestFingerprint {
   headSha: string | null;
   checkConclusion: "none" | "pending" | "success" | "failure";
   latestCommentId: number | null;
+  latestCommentAuthor?: string | null;
   latestReviewId: number | null;
   state: "open" | "closed" | "merged";
   mergeableState: string | null;

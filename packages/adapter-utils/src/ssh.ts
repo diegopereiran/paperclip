@@ -1256,6 +1256,34 @@ export async function runSshCommand(
   }
 }
 
+// Without a TTY, a remote command does not get SIGHUP when the SSH session
+// ends, so cancel, pause, timeout or a server restart only killed the local
+// ssh client and left the remote agent running (upstream issue #14704). This
+// watchdog runs beside the command: once the owning sshd session is gone
+// while the command still runs, it stops the command's process group (TERM,
+// then KILL after 10 s). It exits on its own when the command finishes.
+// $$ is the shell that will exec the command, so it is the command's pid.
+export const SSH_REMOTE_ORPHAN_WATCHDOG = [
+  "{ if command -v ps >/dev/null 2>&1; then (",
+  "trap '' TERM HUP INT;",
+  "cmd=$$;",
+  "pg=$(ps -o pgid= -p \"$cmd\" 2>/dev/null | tr -d ' ');",
+  "sess=$PPID;",
+  "while [ -n \"$sess\" ] && [ \"$sess\" -gt 1 ]; do",
+  "case \"$(ps -o comm= -p \"$sess\" 2>/dev/null)\" in sshd*) break;; esac;",
+  "sess=$(ps -o ppid= -p \"$sess\" 2>/dev/null | tr -d ' ');",
+  "done;",
+  "[ -n \"$sess\" ] && [ \"$sess\" -gt 1 ] || sess=$PPID;",
+  "while kill -0 \"$sess\" 2>/dev/null && kill -0 \"$cmd\" 2>/dev/null; do sleep 2; done;",
+  "if [ -n \"$pg\" ] && kill -0 \"$cmd\" 2>/dev/null; then",
+  // No "--": dash's kill rejects it ("Illegal number: -").
+  "kill -TERM \"-$pg\" 2>/dev/null; i=0;",
+  "while [ \"$i\" -lt 10 ] && kill -0 \"$cmd\" 2>/dev/null; do sleep 1; i=$((i+1)); done;",
+  "kill -KILL \"-$pg\" 2>/dev/null;",
+  "fi",
+  ") </dev/null >/dev/null 2>&1 & fi; }",
+].join(" ");
+
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
   command: string;
@@ -1294,6 +1322,7 @@ export async function buildSshSpawnTarget(input: {
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
     `cd ${shellQuote(input.spec.remoteCwd)}`,
+    SSH_REMOTE_ORPHAN_WATCHDOG,
     envArgs.length > 0
       ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
       : `exec ${remoteCommandParts}`,

@@ -8,7 +8,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { environmentLeases, executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
   deriveViteHmrPort,
@@ -2533,6 +2533,32 @@ async function resolveAuthoritativeBaseRef(
 // files). This pulls an idle worktree forward to the freshest `origin/master`
 // after a long planning phase without ever destroying in-progress work. Only
 // remote-tracking bases are eligible; local-only bases keep warn-only drift.
+/**
+ * Another run that holds an active environment lease on this worktree's execution workspace
+ * may still have its work on a remote executor (SSH): locally the worktree then looks unstarted
+ * until sync-back, and a reset would race that sync-back (ALP-466). Returns the holding run id.
+ */
+async function findOtherRunLeaseOnWorktree(input: {
+  db?: Db | null;
+  worktreePath: string;
+  heartbeatRunId?: string | null;
+}): Promise<string | null> {
+  if (!input.db) return null;
+  const [lease] = await input.db
+    .select({ heartbeatRunId: environmentLeases.heartbeatRunId })
+    .from(environmentLeases)
+    .innerJoin(executionWorkspaces, eq(environmentLeases.executionWorkspaceId, executionWorkspaces.id))
+    .where(and(
+      eq(environmentLeases.status, "active"),
+      eq(executionWorkspaces.cwd, input.worktreePath),
+      input.heartbeatRunId
+        ? or(isNull(environmentLeases.heartbeatRunId), ne(environmentLeases.heartbeatRunId, input.heartbeatRunId))
+        : undefined,
+    ))
+    .limit(1);
+  return lease ? (lease.heartbeatRunId ?? "unknown run") : null;
+}
+
 async function refreshUnstartedWorktreeToBase(input: {
   repoRoot: string;
   worktreePath: string;
@@ -2540,8 +2566,17 @@ async function refreshUnstartedWorktreeToBase(input: {
   baseRef: string;
   currentBaseRefSha: string;
   recorder?: WorkspaceOperationRecorder | null;
+  db?: Db | null;
+  heartbeatRunId?: string | null;
 }): Promise<{ refreshed: boolean; baseRefSha: string | null }> {
   if (!parseRemoteTrackingRef(input.baseRef)) {
+    return { refreshed: false, baseRefSha: null };
+  }
+  const leaseHolder = await findOtherRunLeaseOnWorktree(input);
+  if (leaseHolder) {
+    console.warn(
+      `[workspace-runtime] skipped the unstarted-worktree base refresh of ${input.worktreePath}: run ${leaseHolder} holds an active environment lease on it`,
+    );
     return { refreshed: false, baseRefSha: null };
   }
 
@@ -3323,6 +3358,8 @@ export async function realizeExecutionWorkspace(input: {
           baseRef,
           currentBaseRefSha,
           recorder: input.recorder ?? null,
+          db: input.db ?? null,
+          heartbeatRunId: input.heartbeatRunId ?? null,
         })
       : { refreshed: false, baseRefSha: null };
     const baseDrift = await inspectExecutionWorkspaceBaseDrift({
@@ -3774,6 +3811,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           baseRef: reuseBaseRef,
           currentBaseRefSha,
           recorder: input.recorder ?? null,
+          db: input.db ?? null,
+          heartbeatRunId: input.heartbeatRunId ?? null,
         })
       : { refreshed: false, baseRefSha: null };
     const baseDrift = await inspectExecutionWorkspaceBaseDrift({

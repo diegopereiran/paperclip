@@ -5427,6 +5427,127 @@ export function recoveryService(
     return result;
   }
 
+  // Sends the `issue_children_completed` wake that the issue route deferred
+  // because the completed child's execution workspace had not finalized yet
+  // (see `getWakeableParentAfterChildCompletion`). Called after a run records
+  // a successful `workspace_finalize`, when sync-back has landed in the local
+  // worktree. Idempotent: a wake already sent for this completion, by the
+  // route or by an earlier finalize pass, suppresses a second one.
+  async function reconcileDeferredChildrenCompletedWake(opts: {
+    runId?: string | null;
+    companyId: string;
+    completedChildIssueId: string;
+    source?: "workspace.finalize";
+  }) {
+    const result = {
+      checked: 0,
+      healed: 0,
+      notReady: 0,
+      existingWakeSkipped: 0,
+      enqueueFailed: 0,
+    };
+    const source = opts.source ?? "workspace.finalize";
+
+    const child = await db
+      .select({
+        id: issues.id,
+        parentId: issues.parentId,
+        status: issues.status,
+        completedAt: issues.completedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.id, opts.completedChildIssueId),
+          eq(issues.companyId, opts.companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!child || !child.parentId || child.status !== "done") return result;
+    result.checked = 1;
+
+    const parent = await issuesSvc.getWakeableParentAfterChildCompletion(
+      child.parentId,
+      { issueId: child.id, summary: null },
+    );
+    if (!parent) {
+      result.notReady = 1;
+      return result;
+    }
+
+    const existingWake = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, opts.companyId),
+          eq(agentWakeupRequests.agentId, parent.assigneeAgentId),
+          eq(agentWakeupRequests.reason, "issue_children_completed"),
+          sql`${agentWakeupRequests.payload} ->> 'completedChildIssueId' = ${child.id}`,
+          child.completedAt
+            ? gte(agentWakeupRequests.createdAt, child.completedAt)
+            : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existingWake) {
+      result.existingWakeSkipped = 1;
+      return result;
+    }
+
+    const childCompletion = {
+      completedChildIssueId: child.id,
+      childIssueIds: parent.childIssueIds,
+      childIssueSummaries: parent.childIssueSummaries,
+      childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+    };
+    const idempotencyKey = `issue_children_completed:${parent.id}:${child.id}`;
+    try {
+      const wake = await deps.enqueueWakeup(parent.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_children_completed",
+        payload: { issueId: parent.id, ...childCompletion },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat_finalize",
+        contextSnapshot: {
+          issueId: parent.id,
+          taskId: parent.id,
+          wakeReason: "issue_children_completed",
+          source: "issue.children_completed",
+          ...childCompletion,
+        },
+      });
+      if (!wake) return result;
+      result.healed = 1;
+      await logActivity(db, {
+        companyId: opts.companyId,
+        actorType: "system",
+        actorId: "heartbeat_finalize",
+        agentId: parent.assigneeAgentId,
+        runId: opts.runId ?? null,
+        action: "issue.children_completed_wake_emitted",
+        entityType: "issue",
+        entityId: parent.id,
+        details: {
+          source,
+          wakeupRunId: wake.id,
+          idempotencyKey,
+          completedChildIssueId: child.id,
+        },
+      });
+    } catch (err) {
+      result.enqueueFailed = 1;
+      logger.warn(
+        { err, parentIssueId: parent.id, completedChildIssueId: child.id, source },
+        "failed to enqueue deferred children-completed wake after workspace_finalize",
+      );
+    }
+    return result;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -5855,6 +5976,7 @@ export function recoveryService(
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileDeferredChildrenCompletedWake,
     readRecoveryTimerIntervalMs,
   };
 }

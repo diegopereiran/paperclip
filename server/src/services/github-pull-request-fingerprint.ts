@@ -7,6 +7,8 @@ export interface PullRequestFingerprint {
   headSha: string | null;
   checkConclusion: PullRequestCheckConclusion;
   latestCommentId: number | null;
+  /** Login of the author of the latest comment; `null` when unknown (older baselines, deleted users). */
+  latestCommentAuthor?: string | null;
   latestReviewId: number | null;
   state: PullRequestFingerprintState;
   /** `null` while GitHub has not computed it yet (`unknown`); a `null` side never counts as a change. */
@@ -60,6 +62,7 @@ export function parsePullRequestFingerprint(value: unknown): PullRequestFingerpr
     headSha: boundedString(raw.headSha),
     checkConclusion: raw.checkConclusion as PullRequestCheckConclusion,
     latestCommentId: idOrNull(raw.latestCommentId),
+    ...(boundedString(raw.latestCommentAuthor) ? { latestCommentAuthor: boundedString(raw.latestCommentAuthor) } : {}),
     latestReviewId: idOrNull(raw.latestReviewId),
     state: raw.state as PullRequestFingerprintState,
     mergeableState: boundedString(raw.mergeableState),
@@ -102,4 +105,35 @@ export function changedFingerprintFields(
     changed.push("mergeable_state");
   }
   return changed;
+}
+
+const ACTIONABLE_MERGEABLE_STATES = new Set(["behind", "dirty", "clean"]);
+
+/**
+ * The subset of `changedFingerprintFields` that is worth waking an agent for. Mirrors `actionable()` in the
+ * host script `pr_event_bridge.py`: transitions to `pending`, `blocked`, `unstable` and the like are noise.
+ * `ownLogin` is the company token's own GitHub login; `null` (unresolved) treats every new comment as actionable.
+ */
+export function actionableFingerprintChange(
+  previous: PullRequestFingerprint,
+  current: PullRequestFingerprint,
+  opts: { ownLogin: string | null },
+): PullRequestFingerprintField[] {
+  const ownLogin = opts.ownLogin?.toLowerCase() ?? null;
+  return changedFingerprintFields(previous, current).filter((field) => {
+    switch (field) {
+      case "state":
+      case "head_sha":
+      case "review":
+        return true;
+      case "check_conclusion":
+        return current.checkConclusion === "success" || current.checkConclusion === "failure";
+      case "mergeable_state":
+        return current.mergeableState !== null && ACTIONABLE_MERGEABLE_STATES.has(current.mergeableState);
+      case "comment": {
+        const author = current.latestCommentAuthor?.toLowerCase() ?? null;
+        return ownLogin === null || author === null || author !== ownLogin;
+      }
+    }
+  });
 }

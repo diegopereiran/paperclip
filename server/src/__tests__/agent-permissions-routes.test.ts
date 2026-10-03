@@ -2156,6 +2156,8 @@ describe.sequential("agent permission routes", () => {
   });
 
   describe("viewer read lockdown", () => {
+    // Run ids are validated as UUIDs before any lookup (#13657).
+    const viewerRunId = "11111111-1111-4111-8111-111111111111";
     // A viewer follows issue work but must not read agent internals, run
     // transcripts, or run logs. The decision engine is mocked to allow
     // everything here, so a 403 can only come from the viewer check.
@@ -2172,7 +2174,7 @@ describe.sequential("agent permission routes", () => {
       userId: "operator-user",
       memberships: [{ companyId, status: "active", membershipRole: "operator" }],
     };
-    const run = { id: "run-1", companyId, agentId, status: "succeeded", contextSnapshot: {} };
+    const run = { id: viewerRunId, companyId, agentId, status: "succeeded", contextSnapshot: {} };
 
     beforeEach(() => {
       mockAccessService.canUser.mockResolvedValue(true);
@@ -2210,8 +2212,8 @@ describe.sequential("agent permission routes", () => {
     });
 
     it.each([
-      ["events", "/api/heartbeat-runs/run-1/events", () => mockHeartbeatService.listEvents],
-      ["log", "/api/heartbeat-runs/run-1/log", () => mockHeartbeatService.readLog],
+      ["events", `/api/heartbeat-runs/${viewerRunId}/events`, () => mockHeartbeatService.listEvents],
+      ["log", `/api/heartbeat-runs/${viewerRunId}/log`, () => mockHeartbeatService.readLog],
     ])("denies a viewer the run %s", async (_name, path, readFn) => {
       const app = await createApp(viewerActor);
       const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));
@@ -2228,7 +2230,7 @@ describe.sequential("agent permission routes", () => {
       const config = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/configuration`));
       expect(config.status).toBe(200);
 
-      const events = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/events"));
+      const events = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/heartbeat-runs/${viewerRunId}/events`));
       expect(events.status).toBe(200);
       expect(mockHeartbeatService.listEvents).toHaveBeenCalled();
     });

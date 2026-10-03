@@ -1079,6 +1079,50 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("dirty remote\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("leaves the local git index at the imported head after a managed runtime restore", async () => {
+    // The fast-forward moves the branch with `git update-ref`, which leaves
+    // the index at the old head. Without a refresh, a clean remote commit
+    // shows up locally as staged changes against the new HEAD.
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "managed-runtime SSH git index test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = {
+      ...config,
+      remoteCwd: started.workspaceDir,
+    } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-index",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "committed\\n" > tracked.txt && printf "new\\n" > added.txt && git add tracked.txt added.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+
+    await prepared.restoreWorkspace();
+
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    expect(await git(localRepo, ["status", "--porcelain"])).toBe("");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("propagates remote commits to the local worktree with no git remote configured (no-remote-git contract)", async () => {
     // Locks in the architectural contract documented in
     // packages/adapter-utils/README.md and packages/adapters/AUTHORING.md:

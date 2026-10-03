@@ -10,6 +10,7 @@ import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   readSanitizedOriginRemoteUrl,
+  resetLocalGitIndexToHead,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
@@ -1713,6 +1714,13 @@ export async function restoreWorkspaceFromSshExecution(input: {
               localDir: input.localDir,
               importedHead,
             });
+          }
+          : undefined,
+        // integrateImportedGitHead moves the branch with update-ref, which
+        // leaves the index at the old head; rebuild it from the new HEAD.
+        afterApply: importedHead
+          ? async () => {
+            await resetLocalGitIndexToHead({ localDir: input.localDir });
           }
           : undefined,
       });

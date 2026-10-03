@@ -65,7 +65,7 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus">,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
-  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop">;
+  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop" | "reconcileDeferredChildrenCompletedWake">;
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
   budgetHooks: BudgetServiceHooks;
   runLogStore: Pick<ReturnType<typeof getRunLogStore>, "finalize">;
@@ -945,6 +945,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               runId: finalizedRun.id,
               companyId: finalizedRun.companyId,
               blockerIssueId: issueId,
+              source: "workspace.finalize",
+            });
+            // The route also defers the parent's `issue_children_completed`
+            // wake until the child's sync-back lands; send it now.
+            await recovery.reconcileDeferredChildrenCompletedWake({
+              runId: finalizedRun.id,
+              companyId: finalizedRun.companyId,
+              completedChildIssueId: issueId,
               source: "workspace.finalize",
             });
           }

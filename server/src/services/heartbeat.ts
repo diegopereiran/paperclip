@@ -18754,7 +18754,14 @@ export function heartbeatService(
       // Retrying can only fail, and a stuck lease defers every wake on its issue,
       // so release it the way a successful retry does, even past the cap.
       const leaseDriver = typeof metadata.driver === "string" ? metadata.driver : row.provider;
-      if (leaseDriver === "local" || leaseDriver === "ssh") {
+      // Only a lease with no provider resource of its own: a local lease with
+      // no provider lease id, or an ssh lease whose id is the shared
+      // remote-runs root. A local lease that holds an unexpected provider
+      // resource keeps the normal teardown, so the resource is not discarded.
+      const ownsNoProviderResource =
+        (leaseDriver === "local" && !row.providerLeaseId) ||
+        (leaseDriver === "ssh" && (!row.providerLeaseId || row.providerLeaseId.startsWith("ssh://")));
+      if (ownsNoProviderResource) {
         await environmentsSvc.releaseLease(row.id, "expired", {
           cleanupStatus: "success",
           failureReason: "pending_cleanup_retry",

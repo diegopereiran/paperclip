@@ -1620,13 +1620,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
 
-      // Local and ssh leases own no provider resource (an ssh
-      // lease's provider lease id is the shared remote-runs root), and the
-      // sandbox teardown below needs a recorded sandbox config they never have.
-      // Retrying can only fail, and a stuck lease defers every wake on its issue,
-      // so release it the way a successful retry does, even past the cap.
+      // An ssh lease owns no provider resource (its provider lease id is the
+      // shared remote-runs root), and the ssh driver has no orphan teardown, so
+      // retrying can only fail while a stuck lease defers every wake on its
+      // issue. Release it the way a successful retry does. Local leases need
+      // nothing here: the local driver's retryPendingSandboxTeardown is a no-op.
       const leaseDriver = typeof metadata.driver === "string" ? metadata.driver : row.provider;
-      if (leaseDriver === "local" || leaseDriver === "ssh") {
+      const ownsNoProviderResource =
+        leaseDriver === "ssh" && (!row.providerLeaseId || row.providerLeaseId.startsWith("ssh://"));
+      if (ownsNoProviderResource) {
         await environmentsSvc.releaseLease(row.id, "expired", {
           cleanupStatus: "success",
           failureReason: "pending_cleanup_retry",

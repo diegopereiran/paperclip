@@ -567,25 +567,6 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(await readLease(leaseId)).toEqual({ status: "expired", cleanupStatus: "success" });
   });
 
-  it("test_pending_cleanup_sweep_releases_capped_local_lease", async () => {
-    const { companyId } = await seedCompanyAndEnvironment();
-    const leaseId = await insertDriverlessLease({
-      companyId,
-      driver: "local",
-      metadata: { [ATTEMPTS_KEY]: ATTEMPT_CAP, [CAP_WARNED_KEY]: true },
-    });
-    const destroyRunLease = vi.fn(async () => null);
-    const heartbeat = heartbeatService(db, {
-      environmentRuntime: fakeRuntime(destroyRunLease as HeartbeatEnvironmentRuntime["destroyRunLease"]),
-    });
-
-    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
-
-    expect(result).toEqual({ swept: 1, destroyed: 1, capped: 0 });
-    expect(destroyRunLease).not.toHaveBeenCalled();
-    expect(await readLease(leaseId)).toEqual({ status: "expired", cleanupStatus: "success" });
-  });
-
   it("test_pending_cleanup_sweep_still_caps_sandbox_lease", async () => {
     const { companyId, environmentId } = await seedCompanyAndEnvironment();
     const leaseId = await insertOrphanEphemeralLease({

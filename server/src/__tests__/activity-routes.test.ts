@@ -310,4 +310,46 @@ describe.sequential("activity routes", () => {
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
   });
+
+  describe("viewer read lockdown", () => {
+    const viewerActor = {
+      type: "board",
+      userId: "viewer-user",
+      companyIds: ["company-1"],
+      source: "session",
+      isInstanceAdmin: false,
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "viewer" }],
+    };
+
+    it("denies a viewer the company activity log", async () => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include the activity log");
+      expect(mockActivityService.list).not.toHaveBeenCalled();
+    });
+
+    it("denies a viewer the all-actors audit log", async () => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get("/api/companies/company-1/audit/agent-actions?actorScope=all"),
+      );
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include the activity log");
+      expect(mockAgentActionAuditService.list).not.toHaveBeenCalled();
+    });
+
+    it("still lets an operator read the company activity log", async () => {
+      mockActivityService.list.mockResolvedValue([]);
+      const app = await createApp({
+        ...viewerActor,
+        memberships: [{ companyId: "company-1", status: "active", membershipRole: "operator" }],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
+
+      expect(res.status).toBe(200);
+    });
+  });
 });

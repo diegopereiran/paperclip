@@ -1,4 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
+import { selectInheritedAgentEnv } from "../agent-env-policy.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -72,7 +73,6 @@ import {
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -554,38 +554,6 @@ export function buildSessionKey(identity: SessionKeyIdentity, fingerprint: strin
 // environment. A runner-backed remote sandbox inherits no ambient host context
 // at all. In particular, native-runner bootstrap and MCP credentials are host
 // authority, not provider credentials.
-const ACPX_INHERITED_HOST_ENV_KEYS = new Set([
-  "PATH",
-  "PATHEXT",
-  "SYSTEMROOT",
-  "WINDIR",
-  "COMSPEC",
-  "HOME",
-  "USERPROFILE",
-  "HOMEDRIVE",
-  "HOMEPATH",
-  "USER",
-  "USERNAME",
-  "LOGNAME",
-  "SHELL",
-  "LANG",
-  "LANGUAGE",
-  "TZ",
-  "TMPDIR",
-  "TEMP",
-  "TMP",
-  "XDG_CONFIG_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_DATA_HOME",
-  "SSL_CERT_FILE",
-  "SSL_CERT_DIR",
-  "NODE_EXTRA_CA_CERTS",
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "NO_PROXY",
-  "ALL_PROXY",
-]);
-
 const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
   codex: new Set([
     "OPENAI_API_KEY",
@@ -646,18 +614,10 @@ export function projectAcpxInheritedHostEnvironment(
   // supplied through adapter config, resolved runtime env, or a contribution.
   if (!inheritHostEnvironment) return {};
 
-  const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
-  const projected: Record<string, string> = {};
-  for (const [key, value] of Object.entries(inheritedEnv)) {
-    if (typeof value !== "string") continue;
-    const normalizedKey = key.toUpperCase();
-    const allowed =
-      ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
-      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
-      providerKeys?.has(normalizedKey) === true;
-    if (allowed) projected[key] = value;
-  }
-  return projected;
+  return selectInheritedAgentEnv(inheritedEnv, {
+    omitHarnessDefaults: true,
+    extraPatterns: [...(ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent] ?? [])],
+  });
 }
 
 /**
@@ -1928,7 +1888,6 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -1937,7 +1896,6 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,

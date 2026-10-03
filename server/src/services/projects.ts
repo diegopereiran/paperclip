@@ -460,8 +460,12 @@ function normalizeWorkspaceCwd(value: unknown): string | null {
   return cwd === REPO_ONLY_CWD_SENTINEL ? null : cwd;
 }
 
-function deriveNameFromCwd(cwd: string): string {
-  const normalized = cwd.replace(/[\\/]+$/, "");
+export function deriveNameFromCwd(cwd: string): string {
+  // A character loop, not /[\\/]+$/: that regex backtracks quadratically on
+  // a long separator run inside the path (code-scanning alert 37).
+  let end = cwd.length;
+  while (end > 0 && (cwd[end - 1] === "/" || cwd[end - 1] === "\\")) end -= 1;
+  const normalized = cwd.slice(0, end);
   const segments = normalized.split(/[\\/]/).filter(Boolean);
   return segments[segments.length - 1] ?? "Local folder";
 }

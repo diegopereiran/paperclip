@@ -1585,6 +1585,32 @@ describeEmbeddedPostgres("attention service", () => {
     expect(approvalItems[0]?.subject.metadata?.issueId).toBe(firstIssueId);
   });
 
+  it("does not add a review row when a linked pending approval is the only review path", async () => {
+    const { companyId, reviewerId } = await seedCompany("ATL");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATL-1",
+      title: "Merge the PR",
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+      executionState: pendingAgentExecutionState(reviewerId),
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Merge open-astro/AlpacaBridge#1" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.dedupKey === `approval:${approvalId}`)).toHaveLength(1);
+    expect(feed.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(0);
+  });
+
   it("hides snoozed attention rows until snoozedUntil passes, then returns them unconditionally", async () => {
     const { companyId } = await seedCompany("ATS");
     const approvalId = randomUUID();
@@ -1994,6 +2020,51 @@ describeEmbeddedPostgres("attention service", () => {
       decideBy: "2026-08-03",
       expiresAt: "2026-08-03T12:00:00.000Z",
     });
+  });
+
+  it("keeps non-decidable rows off the board route but in the full service feed", async () => {
+    const { companyId } = await seedCompany("ATX");
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      payload: { title: "Hire Writer" },
+    });
+    await insertIssue({
+      companyId,
+      identifier: "ATX-1",
+      title: "Needs board action",
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Approve the exception" },
+      blockedTransitionAt: new Date("2026-07-23T18:30:00.000Z"),
+    });
+    const board = {
+      type: "board",
+      source: "local_implicit",
+      userId: "board-user",
+      companyIds: [companyId],
+      isInstanceAdmin: false,
+    };
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = board;
+      next();
+    });
+    testApp.use("/api", attentionRoutes(db));
+    testApp.use(errorHandler);
+
+    const fullFeed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect([...new Set(fullFeed.items.map((item) => item.sourceKind))].sort())
+      .toEqual(["agent_error_alert", "approval", "blocker_attention"]);
+
+    const boardFeed = await request(testApp).get(`/api/companies/${companyId}/attention`).expect(200);
+    expect(boardFeed.body.items.map((item: { sourceKind: string }) => item.sourceKind)).toEqual(["approval"]);
+    expect(boardFeed.body.totalCount).toBe(1);
+    expect(boardFeed.body.countsBySourceKind.blocker_attention ?? 0).toBe(0);
+    expect(boardFeed.body.countsBySourceKind.agent_error_alert ?? 0).toBe(0);
   });
 
   it("serves the route for board users and rejects agent callers", async () => {

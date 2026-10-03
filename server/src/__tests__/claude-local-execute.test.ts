@@ -1105,7 +1105,7 @@ describe("claude execute", () => {
     })).toBe(false);
   });
 
-  it("reuses a stable Paperclip-managed Claude prompt bundle across equivalent runs", async () => {
+  it.each(["unchanged", "added", "removed"])("resumes a stable Claude prompt bundle with %s MCP tools", async (change) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-bundle-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
@@ -1238,12 +1238,12 @@ describe("claude execute", () => {
           },
         },
         runtimeMcp: {
-          getServers: () => [{
+          getServers: () => change === "removed" ? [] : [{
             name: "Paperclip projects",
             url: "http://localhost:3100/api/mcp/project-tools",
             connectionId: "paperclip-project-tools",
             token: "next-run-jwt-token",
-          }],
+          }, ...(change === "added" ? [{ name: "GitHub", url: "https://example.test/github/mcp", connectionId: "github", token: "fresh-github-token" }] : [])],
         },
         authToken: "run-jwt-token",
         onLog: async () => {},
@@ -1274,8 +1274,73 @@ describe("claude execute", () => {
       expect(capture1.skillEntries).toContain("paperclip");
       expect(capture2.argv).toContain("--resume");
       expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
+      if (change === "removed") expect(capture2.mcpConfigContents).toBeNull();
+      else {
+        expect(capture2.mcpConfigContents).toContain("next-run-jwt-token");
+        expect(capture2.mcpConfigContents).not.toContain('"run-jwt-token"');
+        if (change === "added") expect(capture2.mcpConfigContents).toContain("fresh-github-token");
+      }
       expect(capture2.prompt).toContain("## Paperclip Resume Delta");
       expect(capture2.prompt).not.toContain("Follow the paperclip heartbeat.");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("names the cwd, not a remote identity, when a local session was saved for another cwd", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-cwd-"));
+    const firstWorkspace = path.join(root, "workspace-a");
+    const secondWorkspace = path.join(root, "workspace-b");
+    const commandPath = path.join(root, "claude");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    const logs: string[] = [];
+    await fs.mkdir(firstWorkspace, { recursive: true });
+    await fs.mkdir(secondWorkspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "Stable instructions.\n", "utf8");
+    await writeFakeClaudeCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+
+    const run = (runId: string, cwd: string, sessionParams: Record<string, unknown> | null,
+      onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>) => execute({
+      runId,
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+      runtime: { sessionId: null, sessionParams, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli",
+        command: commandPath,
+        cwd,
+        instructionsFilePath: instructionsPath,
+        env: { PAPERCLIP_TEST_CAPTURE_PATH: path.join(root, `${runId}.json`) },
+        promptTemplate: "Follow the paperclip heartbeat.",
+      },
+      context: {},
+      authToken: "run-jwt-token",
+      onLog,
+    });
+
+    try {
+      const first = await run("run-a", firstWorkspace, null, async () => {});
+      const second = await run("run-b", secondWorkspace, first.sessionParams ?? null, async (_stream, chunk) => {
+        logs.push(chunk);
+      });
+
+      expect(second.exitCode).toBe(0);
+      const after = JSON.parse(await fs.readFile(path.join(root, "run-b.json"), "utf8")) as CapturePayload;
+      expect(after.argv).not.toContain("--resume");
+      expect(logs.join("")).toContain(`was saved for cwd "${firstWorkspace}"`);
+      expect(logs.join("")).not.toContain("remote execution identity");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -1383,6 +1448,9 @@ describe("claude execute", () => {
       expect(after.argv).not.toContain("--resume");
       expect(after.prompt).toContain("Follow the paperclip heartbeat.");
       expect(logs.join("")).toContain("will not be resumed with");
+      // Same cwd, local target: the only reason is the prompt bundle (ALP-1475).
+      expect(logs.join("")).not.toContain("was saved for cwd");
+      expect(logs.join("")).not.toContain("remote execution identity");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

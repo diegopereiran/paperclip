@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -47,7 +48,6 @@ import {
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
-  stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
@@ -57,6 +57,7 @@ import {
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
+  resolveRunScratchManagedPath,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -915,7 +916,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const linkedIssueIds = Array.isArray(context.issueIds)
       ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       : [];
-    const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
     const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
     if (wakeTaskId) {
       env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -937,9 +937,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (linkedIssueIds.length > 0) {
       env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-    }
-    if (wakePayloadJson) {
-      env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
     }
     refreshPaperclipWorkspaceEnvForExecution({
       env,
@@ -991,19 +988,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries(buildAgentProcessEnv(env)).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
     const billingType = resolveCodexBillingType(effectiveEnv);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScratchPath = filesystemScope ? await resolveRunScratchManagedPath(effectiveEnv) : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [{ path: effectiveCodexHome, access: "rw" }, ...(runScratchPath ? [runScratchPath] : [])],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases

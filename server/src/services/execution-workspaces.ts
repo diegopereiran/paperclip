@@ -3260,9 +3260,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .from(executionWorkspaces)
           .where(eq(executionWorkspaces.id, input.id))
           .then((rows) => rows[0] ?? null);
-        if (!fresh || isClosedExecutionWorkspaceStatus(fresh.status)) {
-          // The row is missing or already closed by a concurrent path. Do not
-          // archive again.
+        if (!fresh || fresh.status === "archived") {
+          // The row is missing or already archived by a concurrent path. Do not
+          // archive again. A cleanup_failed row is closed but unfinished: archiving
+          // it again retries the cleanup.
           return null;
         }
         if (metadataHasReopenPendingConsumption(fresh.metadata as Record<string, unknown> | null)) {

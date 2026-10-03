@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -48,7 +49,6 @@ import {
   selectPaperclipTaskMarkdown,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -58,6 +58,7 @@ import {
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
+  resolveRunScratchManagedPath,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -241,7 +242,6 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
 
   if (wakeTaskId) {
@@ -264,9 +264,6 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  }
-  if (wakePayloadJson) {
-    env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   }
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
@@ -312,7 +309,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
 
   const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv(buildAgentProcessEnv(env))).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -488,7 +485,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     asNumber(config.terminalResultCleanupGraceMs, 5_000),
   );
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries(buildAgentProcessEnv(env)).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -569,6 +566,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+  const runScratchPath = filesystemScope ? await resolveRunScratchManagedPath(env) : null;
   const localProcessSandbox: LocalProcessSandboxOptions | null =
     (filesystemScope || networkScope) && !executionTargetIsRemote
       ? {
@@ -579,6 +577,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
+            ...(runScratchPath ? [runScratchPath] : []),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
@@ -732,7 +731,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
-      const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+      const runtimeEnv = ensurePathInEnv(buildAgentProcessEnv(env));
       loggedEnv = buildInvocationEnvForLogs(env, {
         runtimeEnv,
         includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
@@ -776,17 +775,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const hasMatchingCwd = claudeSessionCwdMatchesExecutionTarget({
+    runtimeSessionCwd,
+    effectiveExecutionCwd,
+    executionTargetIsRemote,
+  });
+  const hasMatchingExecutionTarget = adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
-    hasMatchingMcpServers &&
-    claudeSessionCwdMatchesExecutionTarget({
-      runtimeSessionCwd,
-      effectiveExecutionCwd,
-      executionTargetIsRemote,
-    }) &&
-    adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+    // Each CLI invocation loads --mcp-config, including --resume invocations.
+    // Refreshing tools does not invalidate the saved conversation.
+    hasMatchingCwd &&
+    hasMatchingExecutionTarget;
   const sessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
@@ -794,27 +796,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" is not a valid UUID and will not be passed to --resume.\n`,
     );
   }
-  if (
-    executionTargetIsRemote &&
-    runtimeSessionId &&
-    isValidUuid &&
-    !canResumeSession
-  ) {
+  // One line per actual refusal reason; the prompt bundle line follows below.
+  if (runtimeSessionId && isValidUuid && !hasMatchingExecutionTarget) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (
-    runtimeSessionId &&
-    isValidUuid &&
-    runtimeSessionCwd.length > 0 &&
-    path.resolve(runtimeSessionCwd) !== path.resolve(effectiveExecutionCwd)
-  ) {
-    await onLog(
-      "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
-    );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  }
+  if (runtimeSessionId && isValidUuid && !hasMatchingCwd) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
@@ -829,7 +818,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimeSessionId && !hasMatchingMcpServers) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
+      `[paperclip] Claude runtime MCP server set changed; loading current tools when resuming session "${runtimeSessionId}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -1196,7 +1185,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? proc.errorCode
       : loginMeta.requiresLogin
       ? "claude_auth_required"
-      : failed && isClaudeModelNotFoundError({
+      // Structured CLI signals outrank the model-not-found detector, which
+      // scans the run's full stdout for a literal "model not found" phrase.
+      // An agent's own tool output (grepping runtime source, tailing logs,
+      // echoing an issue body) lands in that stdout, so a genuine
+      // error_max_turns run that merely *mentions* the phrase would otherwise
+      // be sealed as model_not_found. Same guard the providerQuota and
+      // transientUpstream branches above already apply.
+      : failed && !clearSessionForMaxTurns && !poisonedPreviousMessageId && isClaudeModelNotFoundError({
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,

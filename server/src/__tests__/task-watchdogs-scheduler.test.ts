@@ -107,10 +107,10 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       originKind: overrides.originKind,
       originId: overrides.originId,
       originFingerprint: overrides.originFingerprint,
-      updatedAt: overrides.updatedAt,
-      // Default to an "established" issue (created well before the first-run
-      // grace window) so the pending-first-run guard does not defer it. Tests
-      // exercising the create-race pass an explicit recent `createdAt`.
+      // Default to an "established" issue (created and last written well before
+      // the grace window) so the pending-first-run/hand-off guard does not defer
+      // it. Tests exercising the create-race pass an explicit recent `createdAt`.
+      updatedAt: overrides.updatedAt ?? new Date(Date.now() - 60 * 60 * 1000),
       createdAt: overrides.createdAt ?? new Date(Date.now() - 60 * 60 * 1000),
     });
     return id;
@@ -425,7 +425,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({ status: "blocked", updatedAt: new Date(Date.now() - 20_000) })
       .where(eq(issues.id, childId));
     const retriggered = await service.reconcileTaskWatchdogs({ companyId });
 
@@ -512,7 +512,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({ status: "blocked", updatedAt: new Date(Date.now() - 20_000) })
       .where(eq(issues.id, childId));
     const changedWhileReviewLive = await service.reconcileTaskWatchdogs({ companyId });
     expect(changedWhileReviewLive).toMatchObject({ checked: 1, triggered: 0, live: 1 });
@@ -590,6 +590,33 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       latestDocumentAt: new Date(later.getTime() + 1_000).toISOString(),
       latestWorkProductAt: new Date(later.getTime() + 2_000).toISOString(),
     });
+  });
+
+  it("keeps watchdog mutation scope valid after the reviewer bumps the source updatedAt", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-REVALIDATE-BUMP", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const originalFingerprint = watchdog!.lastObservedFingerprint!;
+    expect(originalFingerprint).toMatch(/^task_watchdog_stop:/);
+
+    // issuesSvc.addComment sets the source issue's updatedAt to now.
+    await db.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, sourceId));
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId: watchdog!.id,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: originalFingerprint,
+    });
+
+    expect(revalidated.classification?.state).toBe("stopped");
+    expect(revalidated.allowed).toBe(true);
   });
 
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {

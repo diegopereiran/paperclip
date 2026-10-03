@@ -200,6 +200,10 @@ export type TaskWatchdogClassifierInput = {
   // be visible). Omit to disable the guard (legacy behavior).
   evaluatedAt?: Date | string | null;
   firstRunGraceMs?: number | null;
+  // Turns off the hand-off guard (recently updated issues defer the verdict).
+  // Mutation revalidation sets it: the reviewer's own comments and edits bump
+  // the source issue's updatedAt and must not make its scope look stale.
+  skipHandoffGuard?: boolean;
   // Ids of included issues that have at least one run in a terminal status.
   // Such issues are never treated as "pending first run" — they have
   // demonstrably executed, so a stop is genuine rather than a snapshot race.
@@ -434,6 +438,13 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     const pendingIssueIds = included
       .filter((issue) => {
         if (isTerminalIssueStatus(issue.status)) return false;
+        // Hand-off guard: a non-terminal issue written within the grace window
+        // may be mid hand-off, its next owner's wake not yet visible. This is
+        // deliberately not masked by completedRunIssueIds: a handed-off issue
+        // always has a completed run. A real stall has a stale updatedAt and
+        // is caught by the next reconciler pass.
+        const updatedAtMs = toEpochMs(issue.updatedAt);
+        if (!input.skipHandoffGuard && updatedAtMs != null && evaluatedAtMs - updatedAtMs < graceMs) return true;
         if (completedRunIssueIds.has(issue.id)) return false;
         const createdAtMs = toEpochMs(issue.createdAt);
         if (createdAtMs == null) return false;
@@ -445,7 +456,7 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       return {
         state: "pending_first_run",
         reason:
-          "A watched issue was created within the first-run grace window and has not yet completed a run; deferring evaluation until its first assignment run/wake is observable.",
+          "A watched issue was created or updated within the grace window and its next run/wake may not be observable yet; deferring evaluation.",
         includedIssueIds: includedIds,
         pendingIssueIds,
       };
@@ -1643,7 +1654,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     }
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
-    const classification = classifyTaskWatchdogSubtree(input);
+    const classification = classifyTaskWatchdogSubtree({ ...input, skipHandoffGuard: true });
     if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
       return { allowed: true as const, classification };
     }

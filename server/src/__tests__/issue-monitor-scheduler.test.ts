@@ -120,6 +120,15 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   }
 
   afterEach(async () => {
+    // The no-op process fixtures deliberately leave no task disposition. The
+    // real lifecycle can now leave a bounded, scheduled repair after the
+    // monitor assertions. Cancel that remaining work only during teardown.
+    const heartbeat = heartbeatService(db);
+    await heartbeat.drainActiveRunExecutions();
+    const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`);
+    for (const run of pending) await heartbeat.cancelRun(run.id, "Monitor fixture teardown", { suppressImmediateRecovery: true });
+    await heartbeat.drainActiveRunExecutions();
     seededAgentIds.clear();
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -516,6 +525,211 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       assigneeAdapterOverrides: null,
     });
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
+  });
+
+  describe("pull request triggers", () => {
+    const trigger = {
+      source: "github" as const,
+      event: "check_suite.completed",
+      deliveryId: "delivery-1",
+      repo: "o/r",
+      number: 5,
+      headSha: "abc123",
+    };
+
+    it("carries the trigger into the wake payload, context snapshot and activity", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "o", repo: "r", number: 5 }] },
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+      expect(result.outcome).toBe("triggered");
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.reason).toBe("issue_monitor_due");
+      expect(wakeup?.payload).toMatchObject({ issueId, trigger });
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.length).toBeGreaterThan(0);
+      expect(runs[0]?.contextSnapshot).toMatchObject({ issueId, trigger });
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({ trigger });
+    });
+
+    it("logs a trigger-driven wake with its own activity source, not manual", async () => {
+      const { issueId, agentId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_pull_request_poll",
+        trigger,
+      });
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      const details = activity.find((row) => row.action === "issue.monitor_triggered")?.details as Record<string, unknown>;
+      expect(details.source).toBe("pull_request_event");
+      expect(details.source).not.toBe("manual");
+
+      const wakeup = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)).then((rows) => rows[0]);
+      expect(wakeup?.payload).toMatchObject({ source: "pull_request_event" });
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)).then((rows) => rows[0]);
+      expect((run?.contextSnapshot as Record<string, unknown>).manualTrigger).not.toBe(true);
+    });
+
+    it("keeps the manual activity source for a trigger without a pull request trigger", async () => {
+      const { issueId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "user",
+        actorId: "local-board",
+      });
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({ source: "manual" });
+    });
+
+    it("copies only the declared trigger fields", async () => {
+      const { issueId, agentId } = await seedFixture();
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger: { ...trigger, token: "secret-value" } as typeof trigger,
+      });
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(JSON.stringify(wakeup?.payload)).not.toContain("secret-value");
+    });
+
+    it("does not consume a maxAttempts attempt", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitorAttemptCount: 1,
+        monitor: { maxAttempts: 1 },
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+
+      expect(result.outcome).toBe("triggered");
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorAttemptCount).toBe(1);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "triggered",
+        attemptCount: 1,
+      });
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.payload).toMatchObject({ monitorAttemptCount: 1 });
+    });
+
+    it("still consumes an attempt for a poll-style trigger without a trigger input", async () => {
+      const { issueId } = await seedFixture({ monitorAttemptCount: 1, monitor: { maxAttempts: 5 } });
+      await heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+      });
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorAttemptCount).toBe(2);
+    });
+
+    it("wakes once per scheduled monitor because the one-shot strip rejects a second trigger", async () => {
+      const { issueId, agentId } = await seedFixture();
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:00:00.000Z"),
+        actorType: "system",
+        actorId: "github_webhook",
+        trigger,
+      });
+      expect(first.outcome).toBe("triggered");
+
+      await expect(
+        heartbeat.triggerIssueMonitor(issueId, {
+          now: new Date("2026-04-11T12:00:05.000Z"),
+          actorType: "system",
+          actorId: "github_webhook",
+          trigger: { ...trigger, deliveryId: "delivery-2" },
+        }),
+      ).rejects.toThrow("Issue has no scheduled monitor");
+
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+    });
+  });
+
+  describe("pull request polling in the scheduler tick", () => {
+    const state = { headSha: "sha-1" };
+    const requests: string[] = [];
+    const fakeFetch = async (url: string) => {
+      requests.push(url);
+      const { pathname } = new URL(url);
+      if (pathname.endsWith("/pulls/5")) {
+        return new Response(
+          JSON.stringify({ state: "open", merged: false, mergeable_state: "clean", head: { sha: state.headSha } }),
+          { status: 200 },
+        );
+      }
+      if (pathname.includes("/check-suites")) {
+        return new Response(JSON.stringify({ check_suites: [{ status: "completed", conclusion: "success" }] }), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    };
+
+    it("baselines, wakes once on a change and logs the pull_request_event source", async () => {
+      state.headSha = "sha-1";
+      requests.length = 0;
+      const { issueId, agentId } = await seedFixture({
+        monitor: { pullRequests: [{ owner: "o", repo: "r", number: 5 }] },
+      });
+      const heartbeat = heartbeatService(db, {
+        pullRequestPoll: { fetch: fakeFetch, getToken: async () => "token-value" },
+      });
+
+      await heartbeat.tickTimers(new Date("2026-04-11T12:00:00.000Z"));
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+
+      state.headSha = "sha-2";
+      await heartbeat.tickTimers(new Date("2026-04-11T12:04:00.000Z"));
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]?.payload).toMatchObject({
+        trigger: { source: "github", repo: "o/r", number: 5, headSha: "sha-2" },
+        source: "pull_request_event",
+      });
+
+      await heartbeat.tickTimers(new Date("2026-04-11T12:08:00.000Z"));
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).toMatchObject({
+        source: "pull_request_event",
+      });
+    });
   });
 
   it("omits external monitor refs from wake payloads and activity details", async () => {

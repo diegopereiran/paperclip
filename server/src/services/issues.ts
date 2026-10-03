@@ -9054,6 +9054,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
           updatedAt: issues.updatedAt,
+          executionWorkspaceId: issues.executionWorkspaceId,
         })
         .from(issues)
         .where(
@@ -9071,6 +9072,28 @@ export function issueService(db: Db) {
       ) {
         return null;
       }
+
+      // Workspace-finalize barrier, same check as the dependency readiness
+      // gate: a done child whose run has not recorded a successful
+      // workspace_finalize may still have commits that only reach the local
+      // worktree at sync-back, so the parent must not read the workspace yet.
+      // The post-finalize reconciler sends the deferred wake.
+      const pendingFinalizeChildIssueIds =
+        await listPendingFinalizeBlockerIssueIds(
+          db,
+          parent.companyId,
+          children.flatMap((child) =>
+            child.status === "done" && child.executionWorkspaceId
+              ? [
+                  {
+                    blockerIssueId: child.id,
+                    executionWorkspaceId: child.executionWorkspaceId,
+                  },
+                ]
+              : [],
+          ),
+        );
+      if (pendingFinalizeChildIssueIds.size > 0) return null;
 
       const childIdsForSummaries = children
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
@@ -9101,7 +9124,7 @@ export function issueService(db: Db) {
       }
       const childIssueSummaries: ChildIssueCompletionSummary[] = children
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
-        .map((child) => ({
+        .map(({ executionWorkspaceId: _executionWorkspaceId, ...child }) => ({
           ...child,
           summary: truncateInlineSummary(
             child.id === completedChildResult?.issueId

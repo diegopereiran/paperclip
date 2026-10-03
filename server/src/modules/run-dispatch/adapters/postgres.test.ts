@@ -13,6 +13,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -55,6 +56,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueTreeHolds);
     await db.delete(issueRelations);
     await db.delete(issues);
@@ -608,6 +610,46 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_assignee_changed",
       });
+    });
+
+    it("keeps the addressee's wake for a pending card on an issue another agent owns", async () => {
+      const { companyId, agentId: assigneeAgentId } = await seedCompanyAndAgent();
+      const addresseeAgentId = randomUUID();
+      await seedAgent({ id: addresseeAgentId, companyId, name: "AddresseeCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId });
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        createdByAgentId: assigneeAgentId,
+        addresseeAgentId,
+        payload: { version: 1, prompt: "Add the packet files." },
+      });
+      const wake = { issueId, interactionId, wakeReason: "interaction_pending", source: "issue.interaction.created" };
+      const addresseeRunId = await seedRun({ companyId, agentId: addresseeAgentId, contextSnapshot: wake });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      expect(
+        await adapter.cancelStaleQueuedRun({ runId: addresseeRunId, companyId, expectedStatus: "queued", now: new Date() }),
+      ).toMatchObject({ outcome: "not_stale" });
+
+      // The bypass is scoped to the addressee of a still-pending card.
+      const otherAgentId = randomUUID();
+      await seedAgent({ id: otherAgentId, companyId, name: "BystanderCoder" });
+      const bystanderRunId = await seedRun({ companyId, agentId: otherAgentId, contextSnapshot: wake });
+      expect(
+        await adapter.cancelStaleQueuedRun({ runId: bystanderRunId, companyId, expectedStatus: "queued", now: new Date() }),
+      ).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+      await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.id, interactionId));
+      const lateRunId = await seedRun({ companyId, agentId: addresseeAgentId, contextSnapshot: wake });
+      expect(
+        await adapter.cancelStaleQueuedRun({ runId: lateRunId, companyId, expectedStatus: "queued", now: new Date() }),
+      ).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
     });
 
     it(

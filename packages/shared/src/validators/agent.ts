@@ -12,6 +12,7 @@ import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema, trustPresetSchema } from "./trust-policy.js";
 import { agentDesiredSkillSelectionSchema } from "./adapter-skills.js";
 import { objectWithoutDefaults } from "./partial.js";
+import { agentEnvPatternSchema } from "./instance.js";
 
 export const agentPermissionsSchema = z.object({
   // No schema default: the server derives the default (enabled unless the
@@ -66,6 +67,9 @@ export const agentRuntimeConfigSchema = z.object({
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),
+  // Server environment variables (names or PREFIX_*) this agent's process may
+  // inherit on top of the instance allow-list. It can only add.
+  inheritEnv: z.array(agentEnvPatternSchema).max(256).optional(),
 }).catchall(z.unknown()).superRefine((value, ctx) => {
   if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
     ctx.addIssue({

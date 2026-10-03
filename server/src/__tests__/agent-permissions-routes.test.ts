@@ -85,6 +85,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
+  getRunLogAccess: vi.fn(),
+  listEvents: vi.fn(),
+  readLog: vi.fn(),
   cancelRun: vi.fn(),
   cancelInvocationsForAgents: vi.fn(),
 }));
@@ -891,6 +894,102 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(403);
+  });
+
+  it("blocks an agent from adding inheritEnv names to itself", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { inheritEnv: ["DATABASE_URL", "BETTER_AUTH_SECRET"] } }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("requires instance administration to add inheritEnv names", async () => {
+    const companyAdmin = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const instanceAdmin = await createApp({
+      type: "board",
+      userId: "instance-admin-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+    const body = { runtimeConfig: { inheritEnv: ["GH_TOKEN"] } };
+
+    const denied = await requestApp(companyAdmin, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send(body));
+    const allowed = await requestApp(instanceAdmin, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send(body));
+
+    expect(denied.status).toBe(403);
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+  });
+
+  it.each([
+    ["direct creation", `/api/companies/${companyId}/agents`],
+    ["hire creation", `/api/companies/${companyId}/agent-hires`],
+  ])("requires instance administration for inheritEnv during %s", async (_label, path) => {
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(path)
+      .send({
+        name: "Env attempt",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { inheritEnv: ["DATABASE_URL"] },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-admin rollback into added inheritEnv names", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: "33333333-3333-4333-8333-333333333333",
+      afterConfig: {
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { inheritEnv: ["DATABASE_URL"] },
+      },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const response = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(
+        `/api/agents/${agentId}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`,
+      ),
+    );
+
+    expect(response.status).toBe(403);
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {
@@ -2053,6 +2152,87 @@ describe.sequential("agent permission routes", () => {
         action: "agent_config:read",
         resource: { type: "company", companyId },
       }));
+    });
+  });
+
+  describe("viewer read lockdown", () => {
+    // Run ids are validated as UUIDs before any lookup (#13657).
+    const viewerRunId = "11111111-1111-4111-8111-111111111111";
+    // A viewer follows issue work but must not read agent internals, run
+    // transcripts, or run logs. The decision engine is mocked to allow
+    // everything here, so a 403 can only come from the viewer check.
+    const viewerActor = {
+      type: "board",
+      userId: "viewer-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    };
+    const operatorActor = {
+      ...viewerActor,
+      userId: "operator-user",
+      memberships: [{ companyId, status: "active", membershipRole: "operator" }],
+    };
+    const run = { id: viewerRunId, companyId, agentId, status: "succeeded", contextSnapshot: {} };
+
+    beforeEach(() => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      mockHeartbeatService.getRun.mockResolvedValue(run);
+      mockHeartbeatService.getRunLogAccess.mockResolvedValue(run);
+      mockHeartbeatService.listEvents.mockResolvedValue([]);
+      mockHeartbeatService.readLog.mockResolvedValue({ content: "", nextOffset: 0 });
+    });
+
+    it.each([
+      [`/api/agents/${agentId}/configuration`],
+      [`/api/agents/${agentId}/config-revisions`],
+      [`/api/companies/${companyId}/agent-configurations`],
+      [`/api/agents/${agentId}/skills`],
+      [`/api/agents/${agentId}/instructions-bundle`],
+      [`/api/agents/${agentId}/instructions-bundle/file?path=AGENTS.md`],
+    ])("denies a viewer GET %s", async (path) => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include agent configuration");
+    });
+
+    it("gives a viewer the restricted agent list without adapter config", async () => {
+      mockAgentService.list.mockResolvedValue([
+        { ...baseAgent, adapterConfig: { model: "secret-model" }, runtimeConfig: { heartbeat: { enabled: true } } },
+      ]);
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].runtimeConfig).toEqual({});
+    });
+
+    it.each([
+      ["events", `/api/heartbeat-runs/${viewerRunId}/events`, () => mockHeartbeatService.listEvents],
+      ["log", `/api/heartbeat-runs/${viewerRunId}/log`, () => mockHeartbeatService.readLog],
+    ])("denies a viewer the run %s", async (_name, path, readFn) => {
+      const app = await createApp(viewerActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Viewer access does not include run transcripts");
+      expect(readFn()).not.toHaveBeenCalled();
+    });
+
+    it("still lets an operator read agent configuration and run events", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterConfig: {} });
+      const app = await createApp(operatorActor);
+
+      const config = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/configuration`));
+      expect(config.status).toBe(200);
+
+      const events = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/heartbeat-runs/${viewerRunId}/events`));
+      expect(events.status).toBe(200);
+      expect(mockHeartbeatService.listEvents).toHaveBeenCalled();
     });
   });
 

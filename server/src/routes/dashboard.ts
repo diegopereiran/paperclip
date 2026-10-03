@@ -6,7 +6,7 @@ import {
   MAX_WINDOW_WEEKS,
   recoveryObservabilityService,
 } from "../services/recovery-observability.js";
-import { assertCompanyAccess } from "./authz.js";
+import { assertCompanyAccess, isCompanyViewer } from "./authz.js";
 
 function parsePositiveNumber(
   value: unknown,
@@ -28,7 +28,8 @@ export function dashboardRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const summary = await svc.summary(companyId);
-    res.json(summary);
+    // Viewers follow work on the dashboard but do not see company spend.
+    res.json(isCompanyViewer(req, companyId) ? { ...summary, costs: null } : summary);
   });
 
   router.get("/companies/:companyId/recovery-observability", async (req, res) => {

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -324,5 +325,122 @@ describeEmbeddedPostgres("recovery reconcileDeferredChildrenCompletedWake", () =
       healed: 0,
     });
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  async function recordFinalize(
+    seeded: { companyId: string; executionWorkspaceId: string; childId: string },
+  ) {
+    await db.insert(workspaceOperations).values({
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.executionWorkspaceId,
+      issueId: seeded.childId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+  }
+
+  it("sends no wake for an earlier child when a later sibling's wake used the native payload shape", async () => {
+    const seeded = await seed();
+    const { companyId, agentId, parentId, childId } = seeded;
+    const { enqueueWakeup, recovery } = buildService();
+    await recordFinalize(seeded);
+    const laterChildId = randomUUID();
+    await db.insert(issues).values({
+      id: laterChildId,
+      companyId,
+      parentId,
+      title: "Later child",
+      status: "done",
+      priority: "medium",
+      completedAt: new Date("2026-05-23T22:03:00.000Z"),
+    });
+    // The native committer's wake carries no `issueId`, only the child id.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      status: "completed",
+      payload: { completedChildIssueId: laterChildId },
+      createdAt: new Date("2026-05-23T22:04:00.000Z"),
+    });
+
+    await expect(
+      recovery.reconcileDeferredChildrenCompletedWake({ runId: null, companyId, completedChildIssueId: childId }),
+    ).resolves.toMatchObject({ healed: 0, existingWakeSkipped: 1 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("treats a wake for the parent naming a different child as already sent", async () => {
+    const seeded = await seed();
+    const { companyId, agentId, parentId, childId } = seeded;
+    const { enqueueWakeup, recovery } = buildService();
+    await recordFinalize(seeded);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      status: "completed",
+      payload: { issueId: parentId, completedChildIssueId: randomUUID() },
+      createdAt: new Date("2026-05-23T22:02:00.000Z"),
+    });
+
+    await expect(
+      recovery.reconcileDeferredChildrenCompletedWake({ runId: null, companyId, completedChildIssueId: childId }),
+    ).resolves.toMatchObject({ healed: 0, existingWakeSkipped: 1 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("sends no second wake after the parent is reassigned to another agent", async () => {
+    const seeded = await seed(new Date(Date.now() - 60 * 60 * 1000));
+    const { companyId, agentId, parentId } = seeded;
+    const { enqueueWakeup, recovery } = buildService();
+    await recordFinalize(seeded);
+    // The route woke the first assignee; a review stage then reassigned the parent.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      status: "completed",
+      payload: { issueId: parentId },
+    });
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId,
+      companyId,
+      name: "Reviewer",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: reviewerId }).where(eq(issues.id, parentId));
+
+    await expect(recovery.reconcileDeferredChildrenCompletedWakes({ companyId })).resolves.toMatchObject({
+      healed: 0,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("skips a parent whose assignee cannot be woken", async () => {
+    const seeded = await seed(new Date(Date.now() - 60 * 60 * 1000));
+    const { companyId, agentId } = seeded;
+    const { enqueueWakeup, recovery } = buildService();
+    await recordFinalize(seeded);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+    await expect(recovery.reconcileDeferredChildrenCompletedWakes({ companyId })).resolves.toMatchObject({
+      healed: 0,
+      notReady: 1,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 });

@@ -5469,15 +5469,6 @@ export function recoveryService(
     if (!child || !child.parentId || child.status !== "done") return result;
     result.checked = 1;
 
-    const parent = await issuesSvc.getWakeableParentAfterChildCompletion(
-      child.parentId,
-      { issueId: child.id, summary: null },
-    );
-    if (!parent) {
-      result.notReady = 1;
-      return result;
-    }
-
     // Only the child that completed last owns the parent wake: the route woke
     // the parent when the last child went terminal, so an earlier child must
     // not trigger a second one.
@@ -5508,10 +5499,11 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, opts.companyId),
-          eq(agentWakeupRequests.agentId, parent.assigneeAgentId),
           eq(agentWakeupRequests.reason, "issue_children_completed"),
+          // Per parent, not per assignee: a reassigned parent (review stage)
+          // must not receive a second wake for a completion already sent.
           or(
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${parent.id}`,
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${child.parentId}`,
             sql`${agentWakeupRequests.payload} ->> 'completedChildIssueId' = ${child.id}`,
           ),
           child.completedAt
@@ -5523,6 +5515,22 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (existingWake) {
       result.existingWakeSkipped = 1;
+      return result;
+    }
+
+    const parent = await issuesSvc.getWakeableParentAfterChildCompletion(
+      child.parentId,
+      { issueId: child.id, summary: null },
+    );
+    if (!parent) {
+      result.notReady = 1;
+      return result;
+    }
+
+    // A paused or budget-blocked assignee cannot take the wake; skip it
+    // instead of writing a skipped wakeup row on every recovery tick.
+    if (!(await isAgentInvokable(await getAgent(parent.assigneeAgentId)))) {
+      result.notReady = 1;
       return result;
     }
 

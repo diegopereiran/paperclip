@@ -184,8 +184,10 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       originId: overrides.originId,
       // Default to an "established" issue (created before the first-run grace
       // window) so attaching a watchdog evaluates immediately instead of being
-      // deferred by the pending-first-run guard.
+      // deferred by the pending-first-run guard. updatedAt gets the same
+      // default so the hand-off grace guard does not defer it either.
       createdAt: overrides.createdAt ?? new Date(Date.now() - 60 * 60 * 1000),
+      updatedAt: overrides.updatedAt ?? new Date(Date.now() - 60 * 60 * 1000),
     });
     return id;
   }

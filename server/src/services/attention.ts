@@ -1657,8 +1657,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const pendingApprovalId = pendingApprovalByIssueId.get(review.id) ?? null;
         const reviewAttention = reviewAttentionByIssueId.get(review.id);
         const stalled = reviewAttention?.state === "stalled";
+        // A linked pending approval alone is not a reason for a second row: the approval row
+        // already carries that decision, so the board would see one card twice. Retention still
+        // counts the approval through the shared predicate.
         if (!requiresReviewAttention({ hasHumanParticipant, hasUserAssignee: Boolean(review.assigneeUserId),
-          hasPendingApproval: Boolean(pendingApprovalId), stalled })) continue;
+          hasPendingApproval: false, stalled })) continue;
         const issue = reviewIssueMap.get(review.id);
         if (!issue) continue;
         const dedupKey = `review:${review.id}`;
@@ -1692,7 +1695,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           inlineResolvable: stalled,
           entryRule: stalled
             ? "issues.status = 'in_review' and reviewAttention.state = 'stalled'."
-            : "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",
+            : "issues.status = 'in_review' and a human reviewer or user assignee exists.",
           exitRule: "Issue leaves in_review or the human review path resolves.",
           dedupKey,
           severity: stalled ? "high" : "medium",

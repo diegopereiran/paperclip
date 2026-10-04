@@ -26,6 +26,10 @@ import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
+// How long tickDueIssueMonitors treats a monitor claim as live before it
+// re-claims the issue. A due monitor is still pending dispatch for this long,
+// so the watchdog counts it as a live path too.
+export const ISSUE_MONITOR_STALE_CLAIM_MS = 5 * 60 * 1000;
 const TASK_WATCHDOG_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution"] as const;
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
@@ -421,13 +425,15 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       includedIssueIds: includedIds,
     };
   }
-  // A future monitor on an issue tickDueIssueMonitors can fire on (agent
+  // A scheduled monitor on an issue tickDueIssueMonitors can fire on (agent
   // assignee, no user assignee, in_progress or in_review) wakes its assignee.
+  // That includes a monitor already due but not yet claimed by the next
+  // scheduler tick, for up to the claim's stale window.
   const nowMs = toEpochMs(input.evaluatedAt) ?? Date.now();
   const monitoredIssueIds = included
     .filter((issue) => {
       const nextCheckMs = toEpochMs(issue.monitorNextCheckAt);
-      return nextCheckMs != null && nextCheckMs > nowMs &&
+      return nextCheckMs != null && nextCheckMs > nowMs - ISSUE_MONITOR_STALE_CLAIM_MS &&
         issue.assigneeAgentId != null && issue.assigneeUserId == null &&
         (issue.status === "in_progress" || issue.status === "in_review");
     })

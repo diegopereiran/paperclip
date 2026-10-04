@@ -4980,6 +4980,49 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("defers the parent wake while the child's run has not finalized, even after the parent's own finalize on the shared workspace", async () => {
+    const { companyId, executionWorkspaceId, blockerId: childId, dependentId: parentId, assigneeAgentId } =
+      await seedSharedWorkspaceDependency();
+    await db.update(issues).set({ parentId }).where(eq(issues.id, childId));
+
+    // The reopened child's run starts on the shared workspace and sets the
+    // child done mid-run; its sync-back has not landed yet.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_config_freshness",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:30:00.000Z"),
+    });
+    // Meanwhile a run on the parent finalizes the same workspace. That
+    // sync-back does not carry the child's commits.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: parentId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:31:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+
+    // Once the child's own sync-back lands, the parent is wakeable.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:35:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
+      id: parentId,
+      assigneeAgentId,
+      childIssueIds: [childId],
+    });
+  });
+
   it("wakes the parent at once when the done child's workspace has nothing to finalize", async () => {
     const { blockerId: childId, dependentId: parentId, assigneeAgentId } =
       await seedSharedWorkspaceDependency();

@@ -2462,6 +2462,7 @@ async function listPendingFinalizeBlockerIssueIds(
     blockerIssueId: string;
     executionWorkspaceId: string;
   }>,
+  opts: { ownFinalizeOnly?: boolean } = {},
 ): Promise<Set<string>> {
   const pending = new Set<string>();
   const blockerIssueIds = [
@@ -2506,6 +2507,7 @@ async function listPendingFinalizeBlockerIssueIds(
     { phase: string; status: string; startedAt: Date }
   >();
   const latestSuccessfulFinalizeByWorkspace = new Map<string, Date>();
+  const latestUnattributedSuccessfulFinalizeByWorkspace = new Map<string, Date>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
     if (row.phase === "workspace_finalize" && row.status === "succeeded") {
@@ -2517,6 +2519,18 @@ async function listPendingFinalizeBlockerIssueIds(
           row.executionWorkspaceId,
           row.startedAt,
         );
+      }
+      if (!row.issueId) {
+        const currentUnattributed =
+          latestUnattributedSuccessfulFinalizeByWorkspace.get(
+            row.executionWorkspaceId,
+          );
+        if (!currentUnattributed || row.startedAt > currentUnattributed) {
+          latestUnattributedSuccessfulFinalizeByWorkspace.set(
+            row.executionWorkspaceId,
+            row.startedAt,
+          );
+        }
       }
     }
     if (row.issueId) {
@@ -2551,9 +2565,14 @@ async function listPendingFinalizeBlockerIssueIds(
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded")
       continue;
-    const laterSuccessfulFinalize = latestSuccessfulFinalizeByWorkspace.get(
-      pair.executionWorkspaceId,
-    );
+    // A finalize by another issue's run on a shared workspace does not carry
+    // this blocker's sync-back, so callers that need its commits count only
+    // unattributed finalizes here.
+    const laterSuccessfulFinalize = (
+      opts.ownFinalizeOnly
+        ? latestUnattributedSuccessfulFinalizeByWorkspace
+        : latestSuccessfulFinalizeByWorkspace
+    ).get(pair.executionWorkspaceId);
     if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
       continue;
     pending.add(pair.blockerIssueId);
@@ -9353,6 +9372,7 @@ export function issueService(db: Db) {
                 ]
               : [],
           ),
+          { ownFinalizeOnly: true },
         );
       if (pendingFinalizeChildIssueIds.size > 0) return null;
 

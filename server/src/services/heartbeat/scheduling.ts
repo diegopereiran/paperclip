@@ -38,6 +38,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../recovery/review-path-recovery.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
+import { ISSUE_MONITOR_STALE_CLAIM_MS } from "../task-watchdogs.js";
 import {
   normalizeIssueExecutionPolicy,
   buildIssueMonitorClearedPatch,
@@ -936,7 +937,7 @@ export function createHeartbeatScheduling(
       );
     }
 
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const claimed = await db.transaction(async (tx) => {
       const [updated] = await tx
         .update(issues)
@@ -996,7 +997,7 @@ export function createHeartbeatScheduling(
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)

@@ -436,8 +436,32 @@ describe("task watchdog subtree classifier", () => {
       },
     );
 
+    it.each(["in_progress", "in_review"])(
+      "treats a monitor 3 s past due on an agent-owned %s issue as live until the scheduler claims it",
+      (status) => {
+        const result = classify({
+          issues: [monitored({ status, monitorNextCheckAt: new Date(evaluatedAt.getTime() - 3_000) })],
+          evaluatedAt,
+        });
+        expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+      },
+    );
+
+    it("stops once a due monitor is overdue past the scheduler stale-claim window", () => {
+      const justInside = classify({
+        issues: [monitored({ monitorNextCheckAt: new Date(evaluatedAt.getTime() - 5 * 60_000 + 1) })],
+        evaluatedAt,
+      });
+      const atBoundary = classify({
+        issues: [monitored({ monitorNextCheckAt: new Date(evaluatedAt.getTime() - 5 * 60_000) })],
+        evaluatedAt,
+      });
+      expect(justInside.state).toBe("live");
+      expect(atBoundary.state).toBe("stopped");
+    });
+
     it.each([
-      ["past", { monitorNextCheckAt: new Date(evaluatedAt.getTime() - 60_000) }],
+      ["overdue by 6 min", { monitorNextCheckAt: new Date(evaluatedAt.getTime() - 6 * 60_000) }],
       ["unset", { monitorNextCheckAt: null }],
       ["user-assigned", { assigneeUserId: "user-1" }],
       ["unassigned", { assigneeAgentId: null }],

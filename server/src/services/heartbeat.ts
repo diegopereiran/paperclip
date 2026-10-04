@@ -540,7 +540,7 @@ import {
   reviewPathConsumedRefFromRun,
 } from "./recovery/review-path-recovery.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
-import { taskWatchdogService } from "./task-watchdogs.js";
+import { ISSUE_MONITOR_STALE_CLAIM_MS, taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -11868,7 +11868,7 @@ export function heartbeatService(
       );
     }
 
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const claimed = await db.transaction(async (tx) => {
       const [updated] = await tx
         .update(issues)
@@ -11927,7 +11927,7 @@ export function heartbeatService(
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)

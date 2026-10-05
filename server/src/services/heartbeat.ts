@@ -21,7 +21,7 @@ import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispa
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import { createStageWakeLeaseRetry } from "./stage-wake-lease-retry.js";
 import {
-  legacyExecutionNeedsReconciliation,
+  legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -11671,7 +11671,7 @@ export function heartbeatService(
             "Native execution recovery owns this provider failure; a quota monitor cannot start a replacement.",
           );
         }
-        if (legacyExecutionNeedsReconciliation(sourceRun)) {
+        if (await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)) {
           await terminalizeLegacyExecution({
             db,
             run: sourceRun,
@@ -12828,7 +12828,7 @@ export function heartbeatService(
     }
     const updated =
       previousStatus &&
-      legacyExecutionNeedsReconciliation({
+      await legacyExecutionNeedsReconciliationWithEvidence(db, {
         ...previousStatus,
         status,
         ...patch,
@@ -12912,7 +12912,7 @@ export function heartbeatService(
     }
     const updated =
       previousStatus &&
-      legacyExecutionNeedsReconciliation({
+      await legacyExecutionNeedsReconciliationWithEvidence(db, {
         ...previousStatus,
         status,
         ...patch,
@@ -14420,7 +14420,7 @@ export function heartbeatService(
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
-    if (run.runtimeMode === "native" || legacyExecutionNeedsReconciliation(run))
+    if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
@@ -15385,7 +15385,7 @@ export function heartbeatService(
       };
     }
 
-    if (legacyExecutionNeedsReconciliation(run)) {
+    if (await legacyExecutionNeedsReconciliationWithEvidence(db, run)) {
       return {
         outcome: "not_scheduled" as const,
         reason:
@@ -25273,7 +25273,7 @@ export function heartbeatService(
             await scheduleBoundedRetryForRun(livenessRun, agent);
           } else if (
             outcome === "failed" &&
-            !legacyExecutionNeedsReconciliation(livenessRun)
+            !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
           ) {
             await scheduleInteractionContinuationInfrastructureRetryIfEligible(
               livenessRun,

@@ -4654,6 +4654,63 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
+  it.each(["failed", "succeeded"] as const)(
+    "releases a blocker on another issue's finalize once the blocker's run is %s",
+    async (runStatus) => {
+      const {
+        companyId,
+        executionWorkspaceId,
+        blockerId,
+        dependentId,
+        assigneeAgentId,
+      } = await seedSharedWorkspaceDependency();
+      const childRunId = randomUUID();
+      const parentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values([
+        { id: childRunId, companyId, agentId: assigneeAgentId, status: runStatus },
+        { id: parentRunId, companyId, agentId: assigneeAgentId, status: "running" },
+      ]);
+
+      await db.insert(workspaceOperations).values([
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerId,
+          heartbeatRunId: childRunId,
+          phase: "worktree_prepare",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:00:00.000Z"),
+        },
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerId,
+          heartbeatRunId: childRunId,
+          phase: "workspace_finalize",
+          status: "failed",
+          startedAt: new Date("2026-05-23T22:05:00.000Z"),
+        },
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: dependentId,
+          heartbeatRunId: parentRunId,
+          phase: "workspace_finalize",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:10:00.000Z"),
+        },
+      ]);
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, blockerIssueIds: [blockerId] }),
+      ]);
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+      });
+    },
+  );
+
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

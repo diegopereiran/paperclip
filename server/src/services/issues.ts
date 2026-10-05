@@ -2410,7 +2410,6 @@ async function listPendingFinalizeBlockerIssueIds(
     blockerIssueId: string;
     executionWorkspaceId: string;
   }>,
-  opts: { ownFinalizeOnly?: boolean } = {},
 ): Promise<Set<string>> {
   const pending = new Set<string>();
   const blockerIssueIds = [
@@ -2434,6 +2433,7 @@ async function listPendingFinalizeBlockerIssueIds(
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
     })
     .from(workspaceOperations)
     .where(
@@ -2448,11 +2448,11 @@ async function listPendingFinalizeBlockerIssueIds(
 
   const latestAttributedByBlockerWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    { phase: string; status: string; startedAt: Date; heartbeatRunId: string | null }
   >();
   const latestUnattributedByWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    { phase: string; status: string; startedAt: Date; heartbeatRunId: string | null }
   >();
   const latestSuccessfulFinalizeByWorkspace = new Map<string, Date>();
   const latestUnattributedSuccessfulFinalizeByWorkspace = new Map<string, Date>();
@@ -2490,6 +2490,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -2501,6 +2502,7 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
   }
@@ -2513,16 +2515,25 @@ async function listPendingFinalizeBlockerIssueIds(
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded")
       continue;
-    // A finalize by another issue's run on a shared workspace does not carry
-    // this blocker's sync-back, so callers that need its commits count only
-    // unattributed finalizes here.
-    const laterSuccessfulFinalize = (
-      opts.ownFinalizeOnly
-        ? latestUnattributedSuccessfulFinalizeByWorkspace
-        : latestSuccessfulFinalizeByWorkspace
-    ).get(pair.executionWorkspaceId);
-    if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
+    const unattributedFinalize =
+      latestUnattributedSuccessfulFinalizeByWorkspace.get(
+        pair.executionWorkspaceId,
+      );
+    if (unattributedFinalize && unattributedFinalize > latest.startedAt)
       continue;
+    // Another issue's finalize on a shared workspace does not carry this
+    // blocker's sync-back while the blocker's run is alive; it releases the
+    // blocker only once that run is terminal or missing and cannot finalize.
+    const laterFinalize = latestSuccessfulFinalizeByWorkspace.get(
+      pair.executionWorkspaceId,
+    );
+    if (laterFinalize && laterFinalize > latest.startedAt) {
+      if (
+        !latest.heartbeatRunId ||
+        (await heartbeatRunIsTerminalOrMissing(dbOrTx, latest.heartbeatRunId))
+      )
+        continue;
+    }
     pending.add(pair.blockerIssueId);
   }
 
@@ -9209,7 +9220,6 @@ export function issueService(db: Db) {
                 ]
               : [],
           ),
-          { ownFinalizeOnly: true },
         );
       if (pendingFinalizeChildIssueIds.size > 0) return null;
 

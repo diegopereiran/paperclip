@@ -219,12 +219,12 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
-
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The login-prompt markers match the parsed terminal fields of a failed run
+  // and stderr. The raw stdout holds tool results and assistant text the model
+  // read, so a phrase like "not logged in" there must not classify the run.
+  const terminalText =
+    parsed !== null && claudeResultIndicatesAuthFailure(parsed) ? collectClaudeTerminalText(parsed) : "";
+  const promptLines = [terminalText, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -241,7 +241,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl([terminalText, input.stderr].join("\n")),
   };
 }
 

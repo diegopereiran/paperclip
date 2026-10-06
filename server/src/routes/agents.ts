@@ -5100,6 +5100,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     if (agentInstructionsBundleMode(existing) === "external") {
       await assertCanReadAgent(req, existing);
@@ -5173,6 +5174,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     if (agentInstructionsBundleMode(existing) === "external") {
       await assertCanReadAgent(req, existing);
@@ -5286,6 +5288,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/candidates", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     res.json(await instructionWorkingCopies.list(existing.companyId, existing.id, req.actor));
   });
@@ -5304,6 +5307,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/history", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const entryFile = typeof req.query.path === "string" ? req.query.path : deriveBundleState(existing).entryFile;
     const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
@@ -5313,6 +5317,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/revision/:revisionId", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const revisionId = req.params.revisionId as string;
     if (!isUuidLike(revisionId)) throw unprocessable("Invalid instruction revision id");
@@ -5322,6 +5327,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/diff", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const fromRevisionId = typeof req.query.from === "string" ? req.query.from : "";
     const toRevisionId = typeof req.query.to === "string" ? req.query.to : "";

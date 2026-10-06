@@ -2191,6 +2191,10 @@ describe.sequential("agent permission routes", () => {
       [`/api/agents/${agentId}/skills`],
       [`/api/agents/${agentId}/instructions-bundle`],
       [`/api/agents/${agentId}/instructions-bundle/file?path=AGENTS.md`],
+      [`/api/agents/${agentId}/instructions-bundle/candidates`],
+      [`/api/agents/${agentId}/instructions-bundle/history`],
+      [`/api/agents/${agentId}/instructions-bundle/revision/${viewerRunId}`],
+      [`/api/agents/${agentId}/instructions-bundle/diff?from=${viewerRunId}&to=${viewerRunId}`],
     ])("denies a viewer GET %s", async (path) => {
       const app = await createApp(viewerActor);
       const res = await requestApp(app, (baseUrl) => request(baseUrl).get(path));

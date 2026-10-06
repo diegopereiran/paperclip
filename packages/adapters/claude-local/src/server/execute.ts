@@ -70,6 +70,7 @@ import {
   parseClaudeStreamJson, createClaudeStreamParser,
   describeClaudeFailure,
   detectClaudeLoginRequired,
+  extractClaudeLoginUrl,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
@@ -391,15 +392,11 @@ export async function runClaudeLogin(input: {
     onLog,
   });
 
-  const loginMeta = detectClaudeLoginRequired({
-    parsed: null,
-    stdout: proc.stdout,
-    stderr: proc.stderr,
-  });
-
+  // `claude login` output is the CLI's own text, not model or tool content, so
+  // the URL may come from stdout here; detectClaudeLoginRequired ignores stdout.
   return buildLoginResult({
     proc,
-    loginUrl: loginMeta.loginUrl,
+    loginUrl: extractClaudeLoginUrl([proc.stdout, proc.stderr].join("\n")),
   });
 }
 

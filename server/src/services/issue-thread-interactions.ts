@@ -2086,6 +2086,7 @@ export function issueThreadInteractionService(
     db: Pick<Db, "select">;
     issue: { id: string; companyId: string };
     sourceRunId: string | null;
+    wait: boolean;
   }) {
     if (!args.sourceRunId) return;
 
@@ -2107,7 +2108,10 @@ export function issueThreadInteractionService(
     // wedge this confirmation forever.
     // The card is actionable as soon as it exists, so Accept can arrive while
     // the source run is still finalizing: wait for it, bounded, before refusing.
-    // Callers run this outside any transaction.
+    // Wait only when `args.wait` is set: an accept nested in an outer
+    // transaction (it passes `deferConfirmationCommitEffects`) holds the issue
+    // row lock, and the source run may be the very run blocked here, so it
+    // checks once and refuses at once, as before.
     const pollMs = Math.max(1, opts.finalizeWaitPollMs ?? DEFAULT_FINALIZE_WAIT_POLL_MS);
     const timeoutMs = opts.finalizeWaitTimeoutMs ?? DEFAULT_FINALIZE_WAIT_TIMEOUT_MS;
     const sleep =
@@ -2121,7 +2125,7 @@ export function issueThreadInteractionService(
         args.sourceRunId,
       );
       if (isFinalized) return;
-      if (waitedMs >= timeoutMs) break;
+      if (!args.wait || waitedMs >= timeoutMs) break;
       await sleep(pollMs);
       waitedMs += pollMs;
     }
@@ -3895,6 +3899,7 @@ export function issueThreadInteractionService(
             db,
             issue,
             sourceRunId: current.sourceRunId,
+            wait: !mutationOptions?.deferConfirmationCommitEffects,
           });
           const accepted = await acceptRequestConfirmation({
             issue,
@@ -3914,6 +3919,7 @@ export function issueThreadInteractionService(
             db,
             issue,
             sourceRunId: current.sourceRunId,
+            wait: !mutationOptions?.deferConfirmationCommitEffects,
           });
           const accepted = await acceptRequestConfirmation({
             issue,

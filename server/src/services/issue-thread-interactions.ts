@@ -186,7 +186,16 @@ export type IssueThreadInteractionServiceOptions = {
   wakeup?: InteractionWakeup;
   pullRequestCacheTtlMs?: number;
   now?: () => Date;
+  /** Accept waits this long between workspace_finalize re-checks. Default 2 s. */
+  finalizeWaitPollMs?: number;
+  /** Accept stops waiting for workspace_finalize after this long. Default 180 s. */
+  finalizeWaitTimeoutMs?: number;
+  /** Test seam for the wait between re-checks. */
+  sleep?: (ms: number) => Promise<void>;
 };
+
+const DEFAULT_FINALIZE_WAIT_POLL_MS = 2_000;
+const DEFAULT_FINALIZE_WAIT_TIMEOUT_MS = 180_000;
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type InteractionResolutionMutationOptions = {
@@ -2050,13 +2059,26 @@ export function issueThreadInteractionService(
     // a `failed` sync-back or a stale `running` record left by an ended run — is
     // treated as settled by `runWorkspaceIsFinalized`, so a dead run can no longer
     // wedge this confirmation forever.
-    const isFinalized = await runWorkspaceIsFinalized(
-      args.db,
-      args.issue.companyId,
-      executionWorkspaceId,
-      args.sourceRunId,
-    );
-    if (isFinalized) return;
+    // The card is actionable as soon as it exists, so Accept can arrive while
+    // the source run is still finalizing: wait for it, bounded, before refusing.
+    // Callers run this outside any transaction.
+    const pollMs = Math.max(1, opts.finalizeWaitPollMs ?? DEFAULT_FINALIZE_WAIT_POLL_MS);
+    const timeoutMs = opts.finalizeWaitTimeoutMs ?? DEFAULT_FINALIZE_WAIT_TIMEOUT_MS;
+    const sleep =
+      opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    let waitedMs = 0;
+    for (;;) {
+      const isFinalized = await runWorkspaceIsFinalized(
+        args.db,
+        args.issue.companyId,
+        executionWorkspaceId,
+        args.sourceRunId,
+      );
+      if (isFinalized) return;
+      if (waitedMs >= timeoutMs) break;
+      await sleep(pollMs);
+      waitedMs += pollMs;
+    }
 
     throw conflict(
       "Cannot accept interaction: the run that created this interaction has not finished syncing its workspace. " +

@@ -19,7 +19,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
+import { legacyExecutionNeedsReconciliationWithEvidence } from "../../../services/legacy-execution-recovery.js";
 import {
   authorizeFailedChatRunRetryWake,
   FailedChatRunRetryAuthorizationError,
@@ -168,17 +168,28 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
   };
 }
 
+/**
+ * A `WakeQueueHost` member that also receives the release transaction. The
+ * adapter calls it while that transaction holds a pooled connection, so the
+ * callback must read through `tx`: a read on the global pool would wait for
+ * a second connection, and enough concurrent releases exhaust the pool.
+ */
+export type TransactionBoundHostCallback<K extends keyof WakeQueueHost> = (
+  tx: Db,
+  input: Parameters<WakeQueueHost[K]>[0],
+) => ReturnType<WakeQueueHost[K]>;
+
 export type WakeQueuePostgresAdapterDeps = {
-  resolveResponsibleUserId: WakeQueueHost["resolveResponsibleUserId"];
-  getRoutineEnv: WakeQueueHost["getRoutineEnv"];
-  resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  resolveResponsibleUserId: TransactionBoundHostCallback<"resolveResponsibleUserId">;
+  getRoutineEnv: TransactionBoundHostCallback<"getRoutineEnv">;
+  resolveSessionBeforeForWakeup: TransactionBoundHostCallback<"resolveSessionBeforeForWakeup">;
 };
 
-function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
+function buildHost(tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   return {
-    resolveResponsibleUserId: deps.resolveResponsibleUserId,
-    getRoutineEnv: deps.getRoutineEnv,
-    resolveSessionBeforeForWakeup: deps.resolveSessionBeforeForWakeup,
+    resolveResponsibleUserId: (input) => deps.resolveResponsibleUserId(tx, input),
+    getRoutineEnv: (input) => deps.getRoutineEnv(tx, input),
+    resolveSessionBeforeForWakeup: (input) => deps.resolveSessionBeforeForWakeup(tx, input),
   };
 }
 
@@ -1104,7 +1115,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run),
+          legacyExecutionNeedsReconciliation: await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.

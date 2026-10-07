@@ -303,6 +303,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
+  carryOverEchoedMonitorPullRequests,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
@@ -11747,7 +11748,7 @@ export function issueRoutes(
       );
 
       const executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(createBody.executionPolicy),
+        normalizeIssueExecutionPolicy(createBody.executionPolicy, { source: "client" }),
         actor.actorType,
       );
       await assertCanManageIssueMonitor(
@@ -12094,7 +12095,7 @@ export function issueRoutes(
         ? await findCurrentSerializedWatchdogChild(parent)
         : null;
       const executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(createBody.executionPolicy),
+        normalizeIssueExecutionPolicy(createBody.executionPolicy, { source: "client" }),
         actor.actorType,
       );
       await assertCanManageIssueMonitor(
@@ -12318,7 +12319,7 @@ export function issueRoutes(
       const normalizedChildren = [];
       for (const child of requestedChildren) {
         const executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(child.executionPolicy),
+          normalizeIssueExecutionPolicy(child.executionPolicy, { source: "client" }),
           actor.actorType,
         );
         await assertCanManageIssueMonitor(
@@ -13102,7 +13103,11 @@ export function issueRoutes(
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          carryOverEchoedMonitorPullRequests({
+            requested: req.body.executionPolicy,
+            normalized: normalizeIssueExecutionPolicy(req.body.executionPolicy, { source: "client" }),
+            stored: existing.executionPolicy ?? null,
+          }),
           actor.actorType,
         );
       }

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -47,6 +47,7 @@ describeEmbeddedPostgres("dashboard service", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -147,7 +148,7 @@ describeEmbeddedPostgres("dashboard service", () => {
       },
     ]);
 
-    const summary = await dashboardService(db).summary(companyId);
+    const summary = await dashboardService(db).summary(companyId, { timeZone: "UTC" });
 
     expect(summary.runActivity).toHaveLength(14);
     const todayBucket = summary.runActivity.find((bucket) => bucket.date === utcDateKey(today));
@@ -222,7 +223,7 @@ describeEmbeddedPostgres("dashboard service", () => {
       { ...base, id: trueFailure, status: "failed", errorCode: "provider_quota" },
     ]);
 
-    const summary = await dashboardService(db).summary(companyId);
+    const summary = await dashboardService(db).summary(companyId, { timeZone: "UTC" });
     const bucket = summary.runActivity.find((b) => b.date === utcDateKey(day));
 
     expect(bucket).toMatchObject({
@@ -236,5 +237,113 @@ describeEmbeddedPostgres("dashboard service", () => {
     });
     // process_lost kills that recovered must not leak into the failed breakdown.
     expect(bucket?.failedByErrorCode.process_lost).toBeUndefined();
+  });
+
+  async function insertCompanyWithAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("buckets run activity by the calendar days of the given time zone", async () => {
+    const { companyId, agentId } = await insertCompanyWithAgent();
+    // 14:00 on 12 March in Auckland (NZDT, UTC+13).
+    const now = new Date("2026-03-12T01:00:00.000Z");
+    const base = { companyId, agentId, invocationSource: "assignment", status: "succeeded" };
+
+    await db.insert(heartbeatRuns).values([
+      // 12:30 on 11 March in Auckland, still 10 March in UTC.
+      { ...base, id: randomUUID(), createdAt: new Date("2026-03-10T23:30:00.000Z") },
+      // 00:30 on 27 February in Auckland: the first day of the window there,
+      // but before the start of a UTC window.
+      { ...base, id: randomUUID(), createdAt: new Date("2026-02-26T11:30:00.000Z") },
+    ]);
+
+    const summary = await dashboardService(db).summary(companyId, { now, timeZone: "Pacific/Auckland" });
+
+    expect(summary.timeZone).toBe("Pacific/Auckland");
+    expect(summary.runActivity).toHaveLength(14);
+    expect(summary.runActivity[0]?.date).toBe("2026-02-27");
+    expect(summary.runActivity[13]?.date).toBe("2026-03-12");
+    const byDate = new Map(summary.runActivity.map((bucket) => [bucket.date, bucket]));
+    expect(byDate.get("2026-03-11")).toMatchObject({ succeeded: 1, total: 1 });
+    expect(byDate.get("2026-03-10")).toMatchObject({ succeeded: 0, total: 0 });
+    expect(byDate.get("2026-02-27")).toMatchObject({ succeeded: 1, total: 1 });
+  });
+
+  it("counts a run cancelled by its own reassignment as handed off, not as other", async () => {
+    const { companyId, agentId } = await insertCompanyWithAgent();
+    const day = utcDay(-1);
+    const finishedSelf = new Date(day.getTime() + 40_000);
+    const finishedBoard = new Date(day.getTime() + 60_000);
+    const selfRun = randomUUID();
+    const boardRun = randomUUID();
+    const base = {
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "cancelled",
+      createdAt: day,
+      startedAt: day,
+    };
+
+    await db.insert(heartbeatRuns).values([
+      // The run reassigned its own issue (a stage hand-off), which cancels it.
+      { ...base, id: selfRun, errorCode: "issue_reassigned", finishedAt: finishedSelf },
+      // The board reassigned the issue while the agent was still working.
+      { ...base, id: boardRun, errorCode: "issue_reassigned", finishedAt: finishedBoard },
+      // A plain cancellation stays in "other".
+      { ...base, id: randomUUID(), errorCode: "cancelled", finishedAt: finishedBoard },
+    ]);
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: randomUUID(),
+        agentId,
+        runId: selfRun,
+        createdAt: new Date(finishedSelf.getTime() + 300),
+      },
+      {
+        companyId,
+        actorType: "user",
+        actorId: "board",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: randomUUID(),
+        createdAt: new Date(finishedBoard.getTime() + 300),
+      },
+    ]);
+
+    const summary = await dashboardService(db).summary(companyId, { timeZone: "UTC" });
+    const bucket = summary.runActivity.find((b) => b.date === utcDateKey(day));
+
+    expect(bucket).toMatchObject({
+      succeeded: 0,
+      handedOff: 1,
+      failed: 0,
+      other: 2,
+      total: 3,
+    });
   });
 });

@@ -32,6 +32,7 @@ import {
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
+  selectSessionFingerprintAgentConfigRevision,
   isWorkspaceSyncConflictFailure,
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
@@ -2250,6 +2251,76 @@ describe("effective run session config freshness", () => {
     const unmanagedNext = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/custom/next") });
     expect(unmanagedFirst.fingerprint).not.toBe(unmanagedNext.fingerprint);
   });
+
+  function freshness(base: SessionConfigMetadata, next: SessionConfigMetadata) {
+    return resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+    });
+  }
+
+  it("does not reset for scheduler-only heartbeat caps but still resets for other runtime config", async () => {
+    const base = await buildSessionConfigMetadata({
+      agentRuntimeConfig: { heartbeat: { maxConcurrentRuns: 1, maxDailyRuns: 60 }, contextMode: "full" },
+    });
+    const capsOnly = await buildSessionConfigMetadata({
+      agentRuntimeConfig: {
+        heartbeat: { maxConcurrentRuns: 2, maxDailyRuns: 500, skipTimerWhenNoActionableWork: true },
+        contextMode: "full",
+      },
+    });
+    const otherRuntime = await buildSessionConfigMetadata({
+      agentRuntimeConfig: { heartbeat: { maxConcurrentRuns: 1, maxDailyRuns: 60 }, contextMode: "lean" },
+    });
+    expect(freshness(base, capsOnly)).toMatchObject({ reset: false });
+    expect(freshness(base, otherRuntime)).toMatchObject({ reset: true, changedCategories: ["agentRuntimeConfig"] });
+  });
+
+  it("does not reset for project or environment row timestamps but still resets for environment config", async () => {
+    const env = (configRevisionAt: string, config: Record<string, unknown>) => ({
+      selectionSource: "default",
+      selectedEnvironmentId: "environment-1",
+      selectedEnvironment: { id: "environment-1", driver: "ssh", config, configRevisionAt },
+    });
+    const ws = (projectConfigRevisionAt: string) => ({
+      requestedMode: "agent_default",
+      effectiveMode: "agent_default",
+      projectConfigRevisionAt,
+    });
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: ws("2026-06-01T00:00:00.000Z"),
+      environment: env("2026-06-01T00:00:00.000Z", { host: "a" }),
+    });
+    const timestampsOnly = await buildSessionConfigMetadata({
+      workspaceConfig: ws("2026-06-02T00:00:00.000Z"),
+      environment: env("2026-06-02T00:00:00.000Z", { host: "a" }),
+    });
+    const envChanged = await buildSessionConfigMetadata({
+      workspaceConfig: ws("2026-06-02T00:00:00.000Z"),
+      environment: env("2026-06-02T00:00:00.000Z", { host: "b" }),
+    });
+    expect(freshness(base, timestampsOnly)).toMatchObject({ reset: false });
+    expect(freshness(base, envChanged)).toMatchObject({ reset: true, changedCategories: ["environment"] });
+  });
+
+  it("fingerprints the latest agent revision that changed something not hashed by content", () => {
+    const at = (i: number) => new Date(Date.UTC(2026, 5, 1, 0, i));
+    expect(selectSessionFingerprintAgentConfigRevision([
+      { id: "r3", changedKeys: ["runtimeConfig"], createdAt: at(3) },
+      { id: "r2", changedKeys: ["adapterConfig", "runtimeConfig"], createdAt: at(2) },
+      { id: "r1", changedKeys: ["name", "title"], createdAt: at(1) },
+    ])?.id).toBe("r1");
+    expect(selectSessionFingerprintAgentConfigRevision([
+      { id: "r2", changedKeys: ["capabilities"], createdAt: at(2) },
+      { id: "r1", changedKeys: ["runtimeConfig"], createdAt: at(1) },
+    ])?.id).toBe("r2");
+    expect(selectSessionFingerprintAgentConfigRevision([
+      { id: "r1", changedKeys: ["runtimeConfig"], createdAt: at(1) },
+    ])).toBeNull();
+  });
+
 
   it("resets when effective adapter config changes after model/profile/env resolution", async () => {
     const base = await buildSessionConfigMetadata();

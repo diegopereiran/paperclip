@@ -94,7 +94,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, assertNotCompanyViewer, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess, isCompanyViewer } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -118,6 +118,7 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 import {
   persistReprojectedWorkspaceDiffs,
   projectCodexWorkspaceDiffsFromTrace,
@@ -1163,6 +1164,12 @@ export function agentRoutes(
     return false;
   }
 
+  async function assertRunContentReadAllowed(req: Request, res: Response, companyId: string) {
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return false;
+    assertNotCompanyViewer(req, companyId, "run transcripts");
+    return true;
+  }
+
   async function filterAgentsForActor<T extends Record<string, unknown>>(
     req: Request,
     rows: T[],
@@ -2005,8 +2012,10 @@ export function agentRoutes(
     //
     // For AGENT actors we keep a stricter gate: an agent must have either
     // agents:configure or agents:suggest-changes before it can inspect peer
-    // agent configuration for a proposed diff.
+    // agent configuration for a proposed diff. Viewers are the exception on
+    // the board side: they follow issue work, not agent internals.
     assertCompanyAccess(req, companyId);
+    assertNotCompanyViewer(req, companyId, "agent configuration");
     if (req.actor.type === "agent") {
       const decision = await access.decide({
         actor: req.actor,
@@ -2040,7 +2049,7 @@ export function agentRoutes(
     } catch {
       return false;
     }
-    if (req.actor.type === "board") return true;
+    if (req.actor.type === "board") return !isCompanyViewer(req, companyId);
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:read",
@@ -2274,6 +2283,10 @@ export function agentRoutes(
     const nextRaw =
       asRecord(asRecord(nextRuntimeConfig)?.debug)?.providerTrace === "raw";
     if (previousRaw !== nextRaw) assertInstanceAdmin(req);
+    const previousInherit = new Set(normalizeAgentEnvPatterns(asRecord(previousRuntimeConfig)?.inheritEnv));
+    const addsInherit = normalizeAgentEnvPatterns(asRecord(nextRuntimeConfig)?.inheritEnv)
+      .some((pattern) => !previousInherit.has(pattern));
+    if (addsInherit) assertInstanceAdmin(req);
   }
 
   async function assertAgentDefaultEnvironmentSelection(
@@ -5087,6 +5100,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     if (agentInstructionsBundleMode(existing) === "external") {
       await assertCanReadAgent(req, existing);
@@ -5160,6 +5174,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     if (agentInstructionsBundleMode(existing) === "external") {
       await assertCanReadAgent(req, existing);
@@ -5273,6 +5288,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/candidates", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     res.json(await instructionWorkingCopies.list(existing.companyId, existing.id, req.actor));
   });
@@ -5291,6 +5307,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/history", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const entryFile = typeof req.query.path === "string" ? req.query.path : deriveBundleState(existing).entryFile;
     const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
@@ -5300,6 +5317,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/revision/:revisionId", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const revisionId = req.params.revisionId as string;
     if (!isUuidLike(revisionId)) throw unprocessable("Invalid instruction revision id");
@@ -5309,6 +5327,7 @@ export function agentRoutes(
   router.get("/agents/:id/instructions-bundle/diff", async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNotCompanyViewer(req, existing.companyId, "agent configuration");
     assertExternalInstructionsAdmin(req, existing);
     const fromRevisionId = typeof req.query.from === "string" ? req.query.from : "";
     const toRevisionId = typeof req.query.to === "string" ? req.query.to : "";
@@ -6970,7 +6989,7 @@ export function agentRoutes(
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(await runRedactions.redactForRun(
@@ -7444,7 +7463,7 @@ export function agentRoutes(
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
@@ -7463,7 +7482,7 @@ export function agentRoutes(
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
@@ -7480,7 +7499,7 @@ export function agentRoutes(
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, run.companyId))) return;
 
     const context = asRecord(run.contextSnapshot);
     const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
@@ -7492,7 +7511,7 @@ export function agentRoutes(
     const operationId = req.params.operationId as string;
     const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
     if (!operation) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, operation.companyId))) return;
+    if (!(await assertRunContentReadAllowed(req, res, operation.companyId))) return;
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);

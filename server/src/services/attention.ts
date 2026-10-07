@@ -158,7 +158,20 @@ type AttentionListOptions = AttentionFeedQuery & {
   userId?: string | null;
   /** Internal-only escape hatch for callers that need one stable, unpaginated feed snapshot. */
   allowUnscopedAll?: boolean;
+  /** Board view: drop rows the board cannot decide in place (see NON_DECIDABLE_BOARD_KINDS). */
+  decidableOnly?: boolean;
 };
+
+// Rows with nothing to decide on the Decisions board: they only offer Open or
+// Dismiss. The Inbox already shows each of them (Blocked tab, failed runs,
+// alerts), so the board route leaves them out; other callers still get them.
+const NON_DECIDABLE_BOARD_KINDS: ReadonlySet<AttentionSourceKind> = new Set<AttentionSourceKind>([
+  "recovery_action",
+  "blocker_attention",
+  "failed_run",
+  "agent_error_alert",
+  "budget_alert",
+]);
 
 type AttentionServiceOptions = {
   openDecisionLimit?: number;
@@ -1085,6 +1098,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const collected: AttentionItem[] = [];
 
       const add = (item: AttentionItem) => {
+        if (options.decidableOnly && NON_DECIDABLE_BOARD_KINDS.has(item.sourceKind)) return;
         const dismissal = activeDismissalState(dismissals, item.dismissalKey, item.activityAt, now);
         if (!includeDismissed && dismissal?.isActive) return;
         collected.push({ ...item, dismissal });
@@ -1614,7 +1628,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const pendingApprovalId = pendingApprovalByIssueId.get(review.id) ?? null;
         const reviewAttention = reviewAttentionByIssueId.get(review.id);
         const stalled = reviewAttention?.state === "stalled";
-        if (!hasHumanParticipant && !review.assigneeUserId && !pendingApprovalId && !stalled) continue;
+        // A linked pending approval alone is not a reason for a second row: the approval row
+        // already carries that decision, so the board would see one card twice.
+        if (!hasHumanParticipant && !review.assigneeUserId && !stalled) continue;
         const issue = reviewIssueMap.get(review.id);
         if (!issue) continue;
         const dedupKey = `review:${review.id}`;
@@ -1648,7 +1664,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           inlineResolvable: stalled,
           entryRule: stalled
             ? "issues.status = 'in_review' and reviewAttention.state = 'stalled'."
-            : "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",
+            : "issues.status = 'in_review' and a human reviewer or user assignee exists.",
           exitRule: "Issue leaves in_review or the human review path resolves.",
           dedupKey,
           severity: stalled ? "high" : "medium",

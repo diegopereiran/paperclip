@@ -39,9 +39,10 @@ import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
+import { createStageWakeLeaseRetry } from "./stage-wake-lease-retry.js";
 import {
-  legacyExecutionNeedsReconciliation,
   settleInterruptedNativeBootstrap,
+  legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -56,6 +57,7 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { normalizeAgentEnvPatterns, runWithAgentEnvPolicy } from "@paperclipai/adapter-utils/agent-env-policy";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -190,6 +192,10 @@ import {
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
+import {
+  createPullRequestMonitorPoller,
+  type PullRequestMonitorPollerOptions,
+} from "./issue-monitor-pull-request-poller.js";
 import {
   createGitRemoteAuthProvider,
   resolveManagedGitHubIdentitySelection,
@@ -436,6 +442,10 @@ import {
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
 import {
+  sanitizeIssueMonitorTrigger,
+  type IssueMonitorTrigger,
+} from "./issue-monitor-pull-requests.js";
+import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -559,7 +569,7 @@ import {
   reviewPathConsumedRefFromRun,
 } from "./recovery/review-path-recovery.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
-import { taskWatchdogService } from "./task-watchdogs.js";
+import { ISSUE_MONITOR_STALE_CLAIM_MS, taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -6471,6 +6481,37 @@ async function resolveInstructionsConfigFingerprintMetadata(
   return metadata;
 }
 
+// Heartbeat keys that only decide when runs start. They never change what a
+// session sees, so a caps-only edit must not throw away warm sessions.
+const SCHEDULER_ONLY_HEARTBEAT_KEYS = ["maxDailyRuns", "maxConcurrentRuns", "skipTimerWhenNoActionableWork"];
+
+function withoutSchedulerOnlyHeartbeatKeys(agentRuntimeConfig: unknown): unknown {
+  const runtime = parseObject(agentRuntimeConfig);
+  const heartbeat = parseObject(runtime.heartbeat);
+  if (!SCHEDULER_ONLY_HEARTBEAT_KEYS.some((key) => key in heartbeat)) return agentRuntimeConfig;
+  const kept = { ...heartbeat };
+  for (const key of SCHEDULER_ONLY_HEARTBEAT_KEYS) delete kept[key];
+  return { ...runtime, heartbeat: kept };
+}
+
+// Revisions that only touched runtimeConfig or adapterConfig add nothing to the
+// session fingerprint: both are already hashed by content (scheduler-only keys
+// excluded). Fingerprint the latest revision that changed anything else
+// (name, role, capabilities, environment, ...).
+const CONTENT_HASHED_AGENT_CONFIG_KEYS = new Set(["runtimeConfig", "adapterConfig"]);
+
+export function selectSessionFingerprintAgentConfigRevision<
+  T extends { changedKeys: unknown },
+>(revisionsNewestFirst: readonly T[]): T | null {
+  for (const revision of revisionsNewestFirst) {
+    const keys = Array.isArray(revision.changedKeys) ? revision.changedKeys : [];
+    if (keys.length === 0 || keys.some((key) => !CONTENT_HASHED_AGENT_CONFIG_KEYS.has(String(key)))) {
+      return revision;
+    }
+  }
+  return null;
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -6495,6 +6536,9 @@ function buildSessionConfigCategoryValues(input: {
   // the timestamp here makes every comment invalidate an otherwise reusable
   // task session.
   delete workspaceConfig.issueConfigRevisionAt;
+  // Same for the project row: projectPolicy is hashed by content below, and
+  // any project edit (name, color, ...) advances updatedAt.
+  delete workspaceConfig.projectConfigRevisionAt;
   // This row is runtime state, not requested configuration. It is absent
   // before the first reusable run is realized and present on the next turn;
   // fingerprinting that transition would rotate the native session exactly
@@ -6503,17 +6547,30 @@ function buildSessionConfigCategoryValues(input: {
   // boundary; the reusable row and its evolving generation are state.
   delete workspaceConfig.existingExecutionWorkspace;
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
+  // The selected environment's config is hashed by content; its row timestamp
+  // advances on unrelated edits.
+  const environment = parseObject(input.environment);
+  const selectedEnvironment = parseObject(environment.selectedEnvironment);
+  const environmentForFingerprint =
+    "configRevisionAt" in selectedEnvironment
+      ? {
+          ...environment,
+          selectedEnvironment: Object.fromEntries(
+            Object.entries(selectedEnvironment).filter(([key]) => key !== "configRevisionAt"),
+          ),
+        }
+      : input.environment;
   return {
     adapter: {
       adapterType: input.adapterType,
       agentConfigRevision: input.agentConfigRevision,
     },
     adapterConfig: input.effectiveAdapterConfig,
-    agentRuntimeConfig: input.agentRuntimeConfig,
+    agentRuntimeConfig: withoutSchedulerOnlyHeartbeatKeys(input.agentRuntimeConfig),
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig,
-    environment: input.environment,
+    environment: environmentForFingerprint,
     envBindings: {
       environment: { env: input.environmentEnv },
       project: { env: input.projectEnv },
@@ -6982,6 +7039,10 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
+  // A parked backlog issue stays parked unless it is explicitly assigned.
+  // Continuation, timer and comment wakes used to flip it back to
+  // in_progress, which let a parked issue loop.
+  if (issueStatus === "backlog" && wakeReason !== "issue_assigned") return false;
 
   return true;
 }
@@ -9309,7 +9370,12 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
   typeof environmentRuntimeService
 >;
 
+/** Why an issue monitor was dispatched; a pull request event is neither a person's check-now nor the due timer. */
+type IssueMonitorActivitySource = "manual" | "scheduled" | "pull_request_event";
+
 export interface HeartbeatServiceOptions {
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: Pick<PullRequestMonitorPollerOptions, "fetch" | "getToken" | "intervalMs">;
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -9685,13 +9751,17 @@ export function heartbeatService(
   }
 
   const wakeQueue = createWakeQueue(db, {
-    resolveResponsibleUserId: async (input) => {
+    // All three callbacks run inside the wake-queue release transaction, which
+    // already holds a pooled connection. Every read goes through `tx`; a read
+    // on the global pool would wait for a second connection, and enough
+    // concurrent releases would exhaust the pool and deadlock the server.
+    resolveResponsibleUserId: async (tx, input) => {
       // `input.issue` is the wake-queue module's own transaction-scoped
       // snapshot; using it here, instead of re-reading the issue through
-      // `getIssueExecutionContext`, keeps this read off a second connection
-      // while the module's transaction is open, and keeps it seeing the
-      // in-transaction issue status rather than a stale one.
+      // `getIssueExecutionContext`, keeps it seeing the in-transaction issue
+      // status rather than a stale one.
       return resolveResponsibleUserIdForRunSeed({
+        executor: tx,
         companyId: input.companyId,
         contextSnapshot: input.contextSnapshot,
         issueContext: input.issue,
@@ -9708,23 +9778,23 @@ export function heartbeatService(
         existingRunResponsibleUserId: input.existingRunResponsibleUserId,
       });
     },
-    getRoutineEnv: async (input) => {
+    getRoutineEnv: async (tx, input) => {
       // Same reason as `resolveResponsibleUserId` above: use the passed-in
       // transaction-scoped issue snapshot instead of reading the issue again.
-      return getRoutineEnvForExecutionIssue(input.companyId, input.issue);
+      return getRoutineEnvForExecutionIssue(input.companyId, input.issue, tx);
     },
-    resolveSessionBeforeForWakeup: async (input) => {
+    resolveSessionBeforeForWakeup: async (tx, input) => {
       // Scoped to this port only, so a wake-queue agent id can never resolve
       // a session against another company's agent row. The shared `getAgent`
       // helper below has no company predicate, so this reads the agent
       // directly with the company named in its own `WHERE` clause.
-      const agent = await db
+      const agent = await tx
         .select()
         .from(agents)
         .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!agent) return null;
-      return resolveSessionBeforeForWakeup(agent, input.taskKey);
+      return resolveSessionBeforeForWakeup(agent, input.taskKey, tx);
     },
     // These four helpers stay in this file today; the wake-queue module
     // receives them here so it never imports this file, the service it is
@@ -10695,8 +10765,8 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(companyId: string, issueId: string, executor: Db = db) {
+    return executor
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
@@ -10807,6 +10877,7 @@ export function heartbeatService(
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    executor: Db = db,
   ) {
     if (
       !issueContext ||
@@ -10817,7 +10888,7 @@ export function heartbeatService(
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await executor
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -10834,7 +10905,7 @@ export function heartbeatService(
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await executor
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -10863,7 +10934,7 @@ export function heartbeatService(
       }
     }
 
-    const routine = await db
+    const routine = await executor
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -10884,8 +10955,8 @@ export function heartbeatService(
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(companyId: string, executor: Db = db) {
+    const company = await executor
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -10895,7 +10966,7 @@ export function heartbeatService(
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await executor
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10911,7 +10982,7 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await executor
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10930,9 +11001,10 @@ export function heartbeatService(
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    executor: Db = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await executor
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -10968,7 +11040,10 @@ export function heartbeatService(
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
+    /** Pass the open transaction when called inside one, so these reads never wait on a second pooled connection. */
+    executor?: Db;
   }) {
+    const executor = input.executor ?? db;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -10988,7 +11063,7 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await executor
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -11013,7 +11088,7 @@ export function heartbeatService(
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await executor
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -11035,11 +11110,12 @@ export function heartbeatService(
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      executor,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, executor);
   }
 
   async function resolveResponsibleUserIdForRun(input: {
@@ -11100,8 +11176,8 @@ export function heartbeatService(
     });
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(agentId: string, executor: Db = db) {
+    return executor
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -11129,8 +11205,8 @@ export function heartbeatService(
         desc(agentConfigRevisions.createdAt),
         desc(agentConfigRevisions.id),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .limit(50)
+      .then((rows) => selectSessionFingerprintAgentConfigRevision(rows));
   }
 
   async function getTaskSession(
@@ -11138,8 +11214,9 @@ export function heartbeatService(
     agentId: string,
     adapterType: string,
     taskKey: string,
+    executor: Db = db,
   ) {
-    return db
+    return executor
       .select()
       .from(agentTaskSessions)
       .where(
@@ -11256,7 +11333,7 @@ export function heartbeatService(
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     monitor: IssueExecutionMonitorPolicy | null;
-    source: "manual" | "scheduled";
+    source: IssueMonitorActivitySource;
   }) {
     return {
       identifier: input.claimed.identifier,
@@ -11337,7 +11414,7 @@ export function heartbeatService(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -11520,7 +11597,7 @@ export function heartbeatService(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     await db
       .update(issues)
@@ -11584,7 +11661,8 @@ export function heartbeatService(
       agentId: string | null;
       runId: string | null;
       clearOnClientError: boolean;
-      activitySource: "manual" | "scheduled";
+      activitySource: IssueMonitorActivitySource;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -11592,7 +11670,10 @@ export function heartbeatService(
     }
 
     const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
-    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + 1;
+    // An event-driven trigger is real work, not a poll, so it keeps the attempt count.
+    const trigger = input.trigger ? sanitizeIssueMonitorTrigger(input.trigger) : null;
+    const consumeAttempt = trigger === null;
+    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + (consumeAttempt ? 1 : 0);
     const policy = normalizeIssueExecutionPolicy(
       claimed.executionPolicy ?? null,
     );
@@ -11688,7 +11769,7 @@ export function heartbeatService(
             "Native execution recovery owns this provider failure; a quota monitor cannot start a replacement.",
           );
         }
-        if (legacyExecutionNeedsReconciliation(sourceRun)) {
+        if (await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)) {
           await terminalizeLegacyExecution({
             db,
             run: sourceRun,
@@ -11729,6 +11810,7 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(trigger ? { trigger } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -11744,7 +11826,8 @@ export function heartbeatService(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
-            manualTrigger: input.activitySource === "manual",
+            ...(trigger ? { trigger } : {}),
+            manualTrigger: input.activitySource === "manual" && trigger === null,
           },
         });
 
@@ -11755,6 +11838,7 @@ export function heartbeatService(
             issue: claimed,
             policy,
             triggeredAt: input.now,
+            consumeAttempt,
           }),
           updatedAt: new Date(),
         })
@@ -11776,6 +11860,7 @@ export function heartbeatService(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          ...(trigger ? { trigger } : {}),
           source: input.activitySource,
         },
       });
@@ -11849,6 +11934,7 @@ export function heartbeatService(
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     const now = input?.now ?? new Date();
@@ -11880,7 +11966,7 @@ export function heartbeatService(
       );
     }
 
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const claimed = await db.transaction(async (tx) => {
       const [updated] = await tx
         .update(issues)
@@ -11919,12 +12005,27 @@ export function heartbeatService(
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
-      activitySource: "manual",
+      activitySource: input?.trigger ? "pull_request_event" : "manual",
+      trigger: input?.trigger ?? null,
     });
   }
 
+  const pullRequestMonitorPoller = createPullRequestMonitorPoller(db, {
+    ...options.pullRequestPoll,
+    triggerMonitor: (issueId, input) => triggerIssueMonitor(issueId, input),
+  });
+
+  async function tickPullRequestMonitors(now: Date) {
+    try {
+      return await pullRequestMonitorPoller.poll(now);
+    } catch (err) {
+      logger.error({ err }, "pull request monitor polling failed");
+      return { polled: 0, baselined: 0, woken: 0 };
+    }
+  }
+
   async function tickDueIssueMonitors(now = new Date()) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -12195,6 +12296,7 @@ export function heartbeatService(
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    executor: Db = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -12203,6 +12305,7 @@ export function heartbeatService(
         agent.id,
         agent.adapterType,
         taskKey,
+        executor,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -12214,7 +12317,7 @@ export function heartbeatService(
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, executor);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -12236,6 +12339,7 @@ export function heartbeatService(
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    executor?: Db;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -12252,6 +12356,7 @@ export function heartbeatService(
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.executor,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,
@@ -12826,7 +12931,7 @@ export function heartbeatService(
     }
     const updated =
       previousStatus &&
-      legacyExecutionNeedsReconciliation({
+      await legacyExecutionNeedsReconciliationWithEvidence(db, {
         ...previousStatus,
         status,
         ...patch,
@@ -12912,7 +13017,7 @@ export function heartbeatService(
     }
     const updated =
       previousStatus &&
-      legacyExecutionNeedsReconciliation({
+      await legacyExecutionNeedsReconciliationWithEvidence(db, {
         ...previousStatus,
         status,
         ...patch,
@@ -14427,7 +14532,7 @@ export function heartbeatService(
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
-    if (run.runtimeMode === "native" || legacyExecutionNeedsReconciliation(run))
+    if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
@@ -15397,7 +15502,7 @@ export function heartbeatService(
       };
     }
 
-    if (legacyExecutionNeedsReconciliation(run)) {
+    if (await legacyExecutionNeedsReconciliationWithEvidence(db, run)) {
       return {
         outcome: "not_scheduled" as const,
         reason:
@@ -18643,6 +18748,29 @@ export function heartbeatService(
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
 
+      // Local and ssh leases own no provider resource (an ssh
+      // lease's provider lease id is the shared remote-runs root), and the
+      // sandbox teardown below needs a recorded sandbox config they never have.
+      // Retrying can only fail, and a stuck lease defers every wake on its issue,
+      // so release it the way a successful retry does, even past the cap.
+      const leaseDriver = typeof metadata.driver === "string" ? metadata.driver : row.provider;
+      // Only a lease with no provider resource of its own: a local lease with
+      // no provider lease id, or an ssh lease whose id is the shared
+      // remote-runs root. A local lease that holds an unexpected provider
+      // resource keeps the normal teardown, so the resource is not discarded.
+      const ownsNoProviderResource =
+        (leaseDriver === "local" && !row.providerLeaseId) ||
+        (leaseDriver === "ssh" && (!row.providerLeaseId || row.providerLeaseId.startsWith("ssh://")));
+      if (ownsNoProviderResource) {
+        await environmentsSvc.releaseLease(row.id, "expired", {
+          cleanupStatus: "success",
+          failureReason: "pending_cleanup_retry",
+        });
+        logger.info({ leaseId: row.id, driver: leaseDriver }, "released pending_cleanup lease with no provider resource");
+        destroyed += 1;
+        continue;
+      }
+
       const environment = row.environmentId
         ? await environmentsSvc.getById(row.environmentId)
         : null;
@@ -19824,7 +19952,15 @@ export function heartbeatService(
     runId?: string | null;
     companyId?: string | null;
   }) {
-    return recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const dependencyWakes =
+      await recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const childrenCompletedWakes =
+      await recovery.reconcileDeferredChildrenCompletedWakes(opts);
+    return {
+      ...dependencyWakes,
+      healed: dependencyWakes.healed + childrenCompletedWakes.healed,
+      childrenCompletedHealed: childrenCompletedWakes.healed,
+    };
   }
 
   async function updateRuntimeState(
@@ -24773,11 +24909,16 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            // Instance default for every company; the agent can only add.
+            const agentEnvPolicy = {
+              allowlist: (await instanceSettings.getGeneral()).agentEnvAllowlist ?? null,
+              inheritEnv: normalizeAgentEnvPatterns(parseObject(agent.runtimeConfig).inheritEnv),
+            };
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
-                  return adapter.execute({
+                  return runWithAgentEnvPolicy(agentEnvPolicy, () => adapter.execute({
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -24851,7 +24992,7 @@ export function heartbeatService(
                       });
                     },
                     authToken: authToken ?? undefined,
-                  });
+                  }));
                 },
               );
             if (!guardedDispatch.dispatched) return;
@@ -25662,7 +25803,7 @@ export function heartbeatService(
             await scheduleBoundedRetryForRun(livenessRun, agent);
           } else if (
             outcome === "failed" &&
-            !legacyExecutionNeedsReconciliation(livenessRun)
+            !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
           ) {
             await scheduleInteractionContinuationInfrastructureRetryIfEligible(
               livenessRun,
@@ -25748,6 +25889,14 @@ export function heartbeatService(
                   runId: finalizedRun.id,
                   companyId: finalizedRun.companyId,
                   blockerIssueId: issueId,
+                  source: "workspace.finalize",
+                });
+                // The route also defers the parent's `issue_children_completed`
+                // wake until the child's sync-back lands; send it now.
+                await recovery.reconcileDeferredChildrenCompletedWake({
+                  runId: finalizedRun.id,
+                  companyId: finalizedRun.companyId,
+                  completedChildIssueId: issueId,
                   source: "workspace.finalize",
                 });
               }
@@ -26665,6 +26814,12 @@ export function heartbeatService(
     }
   }
 
+  const stageWakeLeaseRetry = createStageWakeLeaseRetry<WakeupOptions>({
+    enqueue: (retryAgentId, retryOpts) => enqueueWakeup(retryAgentId, retryOpts),
+    onGiveUp: (key, attempts) => logger.warn({ key, attempts }, "stage wake still blocked by environment lease; giving up"),
+    onError: (key, err) => logger.warn({ err, key }, "stage wake lease retry failed"),
+  });
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -26974,7 +27129,8 @@ export function heartbeatService(
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
+    // Called from inside the issue wakeup transaction; reads go through `tx`.
+    const resolveHasResolvablePriorSessionWorkspace = async (tx: Db) => {
       if (hasResolvablePriorSessionWorkspace !== null)
         return hasResolvablePriorSessionWorkspace;
       hasResolvablePriorSessionWorkspace = issueId
@@ -26983,6 +27139,7 @@ export function heartbeatService(
             contextSnapshot: enrichedContextSnapshot,
             taskKey: effectiveTaskKey,
             explicitResumeSession,
+            executor: tx,
           })
         : false;
       return hasResolvablePriorSessionWorkspace;
@@ -27051,18 +27208,24 @@ export function heartbeatService(
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    // Always called from inside a wakeup transaction that already holds a
+    // pooled connection, so every read here must go through `tx`. A read on
+    // the global pool would wait for a second connection, and enough
+    // concurrent wakeups exhaust the pool and deadlock the server.
+    const resolveQueuedResponsibleUserId = (tx: Db) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, tx)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          tx,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
+            executor: tx,
             companyId: agent.companyId,
             contextSnapshot: enrichedContextSnapshot,
             issueContext: queuedIssueContext,
@@ -27638,6 +27801,12 @@ export function heartbeatService(
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
             } else {
+              // Local patch (paperclip#13532): a stage wake blocked only by an
+              // unreleased lease is retried after the lease is released.
+              if (executionBlocker.cause === "execution_owner_active" && !executionBlocker.recoveryActionId &&
+                  (parseObject(payload).executionStage || parseObject(enrichedContextSnapshot).executionStage)) {
+                stageWakeLeaseRetry.schedule(agentId, issue.id, opts);
+              }
               await recordExecutionWait(tx as unknown as Db, {
                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,
                 request: {
@@ -28096,7 +28265,7 @@ export function heartbeatService(
               existingExecutionWorkspaceStatus,
             });
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await resolveHasResolvablePriorSessionWorkspace(tx as unknown as Db);
 
             if (
               isUnrunnableWorktreeCombo({
@@ -28532,7 +28701,7 @@ export function heartbeatService(
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -28804,7 +28973,7 @@ export function heartbeatService(
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
@@ -30211,10 +30380,11 @@ export function heartbeatService(
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const pullRequestMonitors = await tickPullRequestMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
+        checked: checked + issueMonitors.checked + pullRequestMonitors.polled,
+        enqueued: enqueued + issueMonitors.triggered + pullRequestMonitors.woken,
         skipped: skipped + issueMonitors.skipped,
       };
     },

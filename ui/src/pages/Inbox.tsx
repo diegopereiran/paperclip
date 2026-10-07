@@ -2341,7 +2341,7 @@ function StreamlinedInbox() {
     !dismissedAlerts.has("alert:agent-errors");
   const showBudgetAlert =
     showCompanyAlerts &&
-    !!dashboard &&
+    !!dashboard?.costs &&
     dashboard.costs.monthBudgetCents > 0 &&
     dashboard.costs.monthUtilizationPercent >= 80 &&
     !dismissedAlerts.has("alert:budget");
@@ -3300,7 +3300,7 @@ function StreamlinedInbox() {
                     <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-400" />
                     <span className="text-sm">
                       Budget at{" "}
-                      <span className="font-medium">{dashboard!.costs.monthUtilizationPercent}%</span>{" "}
+                      <span className="font-medium">{dashboard!.costs!.monthUtilizationPercent}%</span>{" "}
                       utilization this month
                     </span>
                   </Link>

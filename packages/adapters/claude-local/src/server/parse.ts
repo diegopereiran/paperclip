@@ -162,16 +162,26 @@ function extractClaudeErrorMessages(parsed: Record<string, unknown>): string[] {
   return messages;
 }
 
+const LOGIN_URL_TRAILING_PUNCTUATION = new Set([..."])}.!,?;:'\""]);
+
+// A character loop, not /[...]+$/: that regex backtracks quadratically on a
+// long punctuation run that is not at the end (code-scanning alerts 40, 41).
+function trimLoginUrlTrailingPunctuation(url: string): string {
+  let end = url.length;
+  while (end > 0 && LOGIN_URL_TRAILING_PUNCTUATION.has(url[end - 1]!)) end -= 1;
+  return url.slice(0, end);
+}
+
 export function extractClaudeLoginUrl(text: string): string | null {
   const match = text.match(URL_RE);
   if (!match || match.length === 0) return null;
   for (const rawUrl of match) {
-    const cleaned = rawUrl.replace(/[\])}.!,?;:'\"]+$/g, "");
+    const cleaned = trimLoginUrlTrailingPunctuation(rawUrl);
     if (cleaned.includes("claude") || cleaned.includes("anthropic") || cleaned.includes("auth")) {
       return cleaned;
     }
   }
-  return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
+  return match[0] ? trimLoginUrlTrailingPunctuation(match[0]) : null;
 }
 
 // Collect the parsed terminal result fields that carry an auth failure. The
@@ -209,12 +219,12 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
-
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The login-prompt markers match the parsed terminal fields of a failed run
+  // and stderr. The raw stdout holds tool results and assistant text the model
+  // read, so a phrase like "not logged in" there must not classify the run.
+  const terminalText =
+    parsed !== null && claudeResultIndicatesAuthFailure(parsed) ? collectClaudeTerminalText(parsed) : "";
+  const promptLines = [terminalText, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -231,7 +241,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl([terminalText, input.stderr].join("\n")),
   };
 }
 
@@ -326,8 +336,14 @@ export function isClaudePoisonedPreviousMessageIdError(parsed: Record<string, un
     .map((msg) => msg.trim())
     .filter(Boolean);
 
+  // Same meaning as /diagnostics\.previous_message_id.*starts with `msg_`/i
+  // (both on one line), without the regex's quadratic backtracking when the
+  // first phrase repeats many times (code-scanning alert 43).
   return allMessages.some((msg) =>
-    /diagnostics\.previous_message_id.*starts with `msg_`/i.test(msg),
+    msg.toLowerCase().split("\n").some((line) => {
+      const start = line.indexOf("diagnostics.previous_message_id");
+      return start >= 0 && line.indexOf("starts with `msg_`", start + "diagnostics.previous_message_id".length) >= 0;
+    }),
   );
 }
 
@@ -507,7 +523,12 @@ export function extractClaudeRetryNotBefore(
   },
   now = new Date(),
 ): Date | null {
-  const haystack = buildClaudeTransientHaystack(input);
+  // Bound each line before the reset regex: its lazy groups backtrack
+  // quadratically on one long crafted line (code-scanning alert 42).
+  const haystack = buildClaudeTransientHaystack(input)
+    .split("\n")
+    .map((line) => (line.length > 1024 ? line.slice(0, 1024) : line))
+    .join("\n");
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);

@@ -4230,6 +4230,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
   });
 
   describe("workspace_finalize accept gate", () => {
+    // Accept now waits for workspace_finalize; refusal tests must not wait in real time.
+    const noWaitSvc = () => issueThreadInteractionService(db, { finalizeWaitTimeoutMs: 0 });
     type AcceptGateInteractionKind = "request_confirmation" | "request_checkbox_confirmation";
 
     async function seedAcceptGateFixture(options?: {
@@ -4425,7 +4427,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
 
       await expect(
-        interactionsSvc.acceptInteraction(
+        noWaitSvc().acceptInteraction(
           { id: issueId, companyId, goalId, projectId: null },
           interactionId,
           {},
@@ -4553,7 +4555,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
 
       await expect(
-        interactionsSvc.acceptInteraction(
+        noWaitSvc().acceptInteraction(
           { id: issueId, companyId, goalId, projectId: null },
           interactionId,
           {},
@@ -4566,6 +4568,130 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         ),
         details: { executionWorkspaceId, sourceRunId },
       });
+    });
+
+    it("waits for a pending workspace_finalize and accepts once it turns terminal", async () => {
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture();
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+      const sleeps: number[] = [];
+      const svc = issueThreadInteractionService(db, {
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          if (sleeps.length === 2) {
+            await db.insert(workspaceOperations).values({
+              companyId,
+              executionWorkspaceId,
+              heartbeatRunId: sourceRunId,
+              phase: "workspace_finalize",
+              status: "succeeded",
+              startedAt: new Date("2026-05-23T22:05:00.000Z"),
+            });
+          }
+        },
+      });
+
+      const accepted = await svc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({ id: interactionId, status: "accepted" });
+      expect(sleeps).toEqual([2_000, 2_000]);
+    });
+
+    it("refuses with the same 409 after the 180 s deadline", async () => {
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({ sourceRunStatus: "running" });
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "running",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+      const sleeps: number[] = [];
+      const svc = issueThreadInteractionService(db, {
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      });
+
+      await expect(
+        svc.acceptInteraction(
+          { id: issueId, companyId, goalId, projectId: null },
+          interactionId,
+          {},
+          { userId: "local-board" },
+        ),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining(
+          "the run that created this interaction has not finished syncing its workspace",
+        ),
+        details: { executionWorkspaceId, sourceRunId },
+      });
+      expect(sleeps).toHaveLength(90);
+      expect(sleeps.reduce((a, b) => a + b, 0)).toBe(180_000);
+    });
+
+    it("does not wait when sourceRunId is null or the workspace is already finalized", async () => {
+      const sleep = vi.fn(async () => {});
+      const svc = issueThreadInteractionService(db, { sleep });
+
+      const nullRun = await seedAcceptGateFixture({ sourceRunId: null });
+      await svc.acceptInteraction(
+        { id: nullRun.issueId, companyId: nullRun.companyId, goalId: nullRun.goalId, projectId: null },
+        nullRun.interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      const done = await seedAcceptGateFixture();
+      await db.insert(workspaceOperations).values({
+        companyId: done.companyId,
+        executionWorkspaceId: done.executionWorkspaceId,
+        heartbeatRunId: done.sourceRunId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+      await svc.acceptInteraction(
+        { id: done.issueId, companyId: done.companyId, goalId: done.goalId, projectId: null },
+        done.interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      const noWorkspace = await seedAcceptGateFixture();
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: null })
+        .where(eq(issues.id, noWorkspace.issueId));
+      const accepted = await svc.acceptInteraction(
+        {
+          id: noWorkspace.issueId,
+          companyId: noWorkspace.companyId,
+          goalId: noWorkspace.goalId,
+          projectId: null,
+        },
+        noWorkspace.interactionId,
+        {},
+        { userId: "local-board" },
+      );
+      expect(accepted.interaction.status).toBe("accepted");
+
+      expect(sleep).not.toHaveBeenCalled();
     });
 
     it("allows request_confirmation accept when sourceRunId is null", async () => {
@@ -4647,7 +4773,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
 
       await expect(
-        interactionsSvc.acceptInteraction(
+        noWaitSvc().acceptInteraction(
           { id: issueId, companyId, goalId, projectId: null },
           interactionId,
           { selectedOptionIds: ["file-a"] },

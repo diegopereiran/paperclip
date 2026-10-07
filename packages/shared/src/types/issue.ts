@@ -668,6 +668,26 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /** Server-derived GitHub pull request coordinates (lower-cased) named by externalRef or notes. Never client-writable. */
+  pullRequests?: IssueExecutionMonitorPullRequest[];
+  /** Server-written pull request baselines keyed by `owner/repo#N`. Never client-writable; a rescheduled monitor starts empty. */
+  pullRequestState?: Record<string, IssueExecutionMonitorPullRequestFingerprint>;
+}
+
+export interface IssueExecutionMonitorPullRequestFingerprint {
+  headSha: string | null;
+  checkConclusion: "none" | "pending" | "success" | "failure";
+  latestCommentId: number | null;
+  latestCommentAuthor?: string | null;
+  latestReviewId: number | null;
+  state: "open" | "closed" | "merged";
+  mergeableState: string | null;
+}
+
+export interface IssueExecutionMonitorPullRequest {
+  owner: string;
+  repo: string;
+  number: number;
 }
 
 export interface IssueExecutionPolicy {

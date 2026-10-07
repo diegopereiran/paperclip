@@ -26,6 +26,10 @@ import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
+// How long tickDueIssueMonitors treats a monitor claim as live before it
+// re-claims the issue. A due monitor is still pending dispatch for this long,
+// so the watchdog counts it as a live path too.
+export const ISSUE_MONITOR_STALE_CLAIM_MS = 5 * 60 * 1000;
 const TASK_WATCHDOG_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution"] as const;
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
@@ -37,7 +41,8 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // treated as not-yet-stopped so the evaluation does not produce a
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
-const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+// Also the hand-off window: a release followed by a claim can take about 30 s.
+const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 45_000;
 
 type ActorFields = {
   agentId?: string | null;
@@ -71,6 +76,7 @@ export type TaskWatchdogClassifierIssue = Pick<
   // grace window keep working; the pending-first-run guard is skipped when
   // it (or `evaluatedAt`) is absent.
   createdAt?: Date | string | null;
+  monitorNextCheckAt?: Date | string | null;
   latestCommentAt?: Date | string | null;
   latestDocumentAt?: Date | string | null;
   latestWorkProductAt?: Date | string | null;
@@ -200,6 +206,10 @@ export type TaskWatchdogClassifierInput = {
   // be visible). Omit to disable the guard (legacy behavior).
   evaluatedAt?: Date | string | null;
   firstRunGraceMs?: number | null;
+  // Turns off the hand-off guard (recently updated issues defer the verdict).
+  // Mutation revalidation sets it: the reviewer's own comments and edits bump
+  // the source issue's updatedAt and must not make its scope look stale.
+  skipHandoffGuard?: boolean;
   // Ids of included issues that have at least one run in a terminal status.
   // Such issues are never treated as "pending first run" — they have
   // demonstrably executed, so a stop is genuine rather than a snapshot race.
@@ -408,15 +418,36 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
+  if (included.every((issue) => isTerminalIssueStatus(issue.status))) {
+    return {
+      state: "not_applicable",
+      reason: "Every issue in the watched subtree is terminal.",
+      includedIssueIds: includedIds,
+    };
+  }
+  // A scheduled monitor on an issue tickDueIssueMonitors can fire on (agent
+  // assignee, no user assignee, in_progress or in_review) wakes its assignee.
+  // That includes a monitor already due but not yet claimed by the next
+  // scheduler tick, for up to the claim's stale window.
+  const nowMs = toEpochMs(input.evaluatedAt) ?? Date.now();
+  const monitoredIssueIds = included
+    .filter((issue) => {
+      const nextCheckMs = toEpochMs(issue.monitorNextCheckAt);
+      return nextCheckMs != null && nextCheckMs > nowMs - ISSUE_MONITOR_STALE_CLAIM_MS &&
+        issue.assigneeAgentId != null && issue.assigneeUserId == null &&
+        (issue.status === "in_progress" || issue.status === "in_review");
+    })
+    .map((issue) => issue.id);
   const liveIssueIds = [
     ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
     ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...monitoredIssueIds,
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
     return {
       state: "live",
-      reason: "At least one issue in the watched subtree has a live run, queued wake, or scheduled retry.",
+      reason: "At least one issue in the watched subtree has a live run, queued wake, scheduled retry, or scheduled monitor.",
       includedIssueIds: includedIds,
       liveIssueIds: uniqueLiveIssueIds,
     };
@@ -434,6 +465,13 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     const pendingIssueIds = included
       .filter((issue) => {
         if (isTerminalIssueStatus(issue.status)) return false;
+        // Hand-off guard: a non-terminal issue written within the grace window
+        // may be mid hand-off, its next owner's wake not yet visible. This is
+        // deliberately not masked by completedRunIssueIds: a handed-off issue
+        // always has a completed run. A real stall has a stale updatedAt and
+        // is caught by the next reconciler pass.
+        const updatedAtMs = toEpochMs(issue.updatedAt);
+        if (!input.skipHandoffGuard && updatedAtMs != null && evaluatedAtMs - updatedAtMs < graceMs) return true;
         if (completedRunIssueIds.has(issue.id)) return false;
         const createdAtMs = toEpochMs(issue.createdAt);
         if (createdAtMs == null) return false;
@@ -445,7 +483,7 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       return {
         state: "pending_first_run",
         reason:
-          "A watched issue was created within the first-run grace window and has not yet completed a run; deferring evaluation until its first assignment run/wake is observable.",
+          "A watched issue was created or updated within the grace window and its next run/wake may not be observable yet; deferring evaluation.",
         includedIssueIds: includedIds,
         pendingIssueIds,
       };
@@ -875,6 +913,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           origin_kind,
           updated_at,
           created_at,
+          monitor_next_check_at,
           0 AS depth
         FROM issues
         WHERE company_id = ${companyId}
@@ -894,6 +933,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           child.origin_kind,
           child.updated_at,
           child.created_at,
+          child.monitor_next_check_at,
           watched_issues.depth + 1
         FROM issues child
         JOIN watched_issues ON child.parent_id = watched_issues.id
@@ -914,7 +954,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         assignee_user_id AS "assigneeUserId",
         origin_kind AS "originKind",
         updated_at AS "updatedAt",
-        created_at AS "createdAt"
+        created_at AS "createdAt",
+        monitor_next_check_at AS "monitorNextCheckAt"
       FROM watched_issues
     `);
 
@@ -1643,7 +1684,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     }
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
-    const classification = classifyTaskWatchdogSubtree(input);
+    const classification = classifyTaskWatchdogSubtree({ ...input, skipHandoffGuard: true });
     if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
       return { allowed: true as const, classification };
     }

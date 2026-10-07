@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { selectInheritedAgentEnv } from "./agent-env-policy.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -3509,6 +3510,14 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Set by Paperclip for its own children; not secrets, so they outlive the
+// PAPERCLIP_* strip.
+const PAPERCLIP_RUNTIME_PASS_THROUGH = new Set([
+  "PAPERCLIP_RUNTIME_API_URL",
+  "PAPERCLIP_LISTEN_HOST",
+  "PAPERCLIP_LISTEN_PORT",
+]);
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -3516,10 +3525,19 @@ export function sanitizeInheritedPaperclipEnv(
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
-    if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
-    if (key === "PAPERCLIP_LISTEN_HOST") continue;
-    if (key === "PAPERCLIP_LISTEN_PORT") continue;
+    if (PAPERCLIP_RUNTIME_PASS_THROUGH.has(key)) continue;
     delete env[key];
+  }
+  return env;
+}
+
+/** The server environment an agent process inherits: the allow-list only. */
+export function inheritedAgentProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = selectInheritedAgentEnv(source);
+  for (const key of PAPERCLIP_RUNTIME_PASS_THROUGH) {
+    if (typeof source[key] === "string") env[key] = source[key];
   }
   return env;
 }
@@ -4704,8 +4722,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // A remote launch only runs the local ssh client here; the agent's own
+    // env travels in opts.env. Every other launch is the agent process itself
+    // and inherits only the allow-listed part of the server environment.
     const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
+      ...(opts.remoteExecution
+        ? sanitizeInheritedPaperclipEnv(process.env)
+        : inheritedAgentProcessEnv()),
       ...opts.env,
     };
 
@@ -4898,10 +4921,35 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
-          void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+          let stdinFailureHandled = false;
+          const handleStdinFailure = (err: unknown) => {
+            if (!err || stdinFailureHandled) return;
+            stdinFailureHandled = true;
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
+            onLogError(err, runId, "failed to write child process stdin");
+          };
+
+          // A child may stay alive after closing fd 0. In that window neither
+          // child.killed nor stdin.destroyed reflects the closed pipe, and a
+          // write emits EPIPE asynchronously. Keep the handler local to this
+          // child stream so the process result still comes from the child's
+          // close event, while unexpected stream failures remain observable.
+          stdin.on("error", handleStdinFailure);
+          void spawnPersistPromise.then(() => {
+            if (
+              child.exitCode !== null ||
+              child.signalCode !== null ||
+              child.killed ||
+              stdin.destroyed
+            )
+              return;
+            try {
+              stdin.write(opts.stdin as string, handleStdinFailure);
+              stdin.end();
+            } catch (err) {
+              handleStdinFailure(err);
+            }
           });
         }
 

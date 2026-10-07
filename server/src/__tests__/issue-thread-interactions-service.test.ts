@@ -4673,6 +4673,24 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { userId: "local-board" },
       );
 
+      const noWorkspace = await seedAcceptGateFixture();
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: null })
+        .where(eq(issues.id, noWorkspace.issueId));
+      const accepted = await svc.acceptInteraction(
+        {
+          id: noWorkspace.issueId,
+          companyId: noWorkspace.companyId,
+          goalId: noWorkspace.goalId,
+          projectId: null,
+        },
+        noWorkspace.interactionId,
+        {},
+        { userId: "local-board" },
+      );
+      expect(accepted.interaction.status).toBe("accepted");
+
       expect(sleep).not.toHaveBeenCalled();
     });
 

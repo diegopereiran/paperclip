@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, authUsers, companies, companyMemberships, createDb, documents, documentRevisions, heartbeatRuns,
-  issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
+  issueComments, issueDocuments, issues, issueThreadInteractions, executionWorkspaces, projects, workspaceOperations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -229,6 +229,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await readCard(f.card.id)).status).toBe("pending");
     expect(await audit(f.issueId)).toHaveLength(0);
   });
+  it("refuses at once, without waiting, when the source run has not finalized its workspace", async () => {
+    const f = await seed();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId: f.companyId, name: "Project", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId: f.companyId, projectId, mode: "isolated_workspace",
+      strategyType: "git_worktree", name: "exec", status: "active", providerType: "git_worktree" });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, f.issueId));
+    await db.update(issueThreadInteractions).set({ sourceRunId: f.runId }).where(eq(issueThreadInteractions.id, f.card.id));
+    await db.insert(workspaceOperations).values({ companyId: f.companyId, executionWorkspaceId, heartbeatRunId: f.runId,
+      phase: "worktree_prepare", status: "succeeded", startedAt: new Date() });
+    const started = Date.now();
+    await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow("has not finished syncing its workspace");
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect((await readCard(f.card.id)).status).toBe("pending");
+  }, 10_000);
   it("rechecks narrowed permissions on an otherwise matching retry", async () => {
     const f = await seed();
     await resolveConfirmationFromComment(db, f.args);

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   activityLog,
@@ -527,6 +527,44 @@ describeEmbeddedPostgres("status card routes", () => {
       finishedAt: expect.any(Date),
       error: expect.stringContaining("cancelled"),
     });
+  });
+
+  it("wakes the summarizer when a manual refresh reopens a finished update task", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    await seedSummarizer(company.id);
+    const service = statusCardService(db);
+    const card = await service.create(
+      company.id,
+      {
+        interestPrompt: "Recently updated launch tasks",
+        titlePinned: false,
+        refreshPolicy: defaultStatusCardRefreshPolicy,
+      },
+      { agentId: null, userId: "board-user" },
+    );
+    await db.update(statusCards).set({
+      state: "active",
+      queries: [{ scope: "issues", status: ["blocked"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 }] as typeof card.queries,
+    }).where(eq(statusCards.id, card.id));
+    const wakeup = vi.fn(async () => undefined);
+    const app = createApp(db, localBoardActor(), { wakeup });
+
+    const first = await request(app).post(`/api/status-cards/${card.id}/refresh`).send({});
+    expect(first.status).toBe(202);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    const updateIssueId = first.body.generatingIssue.id as string;
+    // The task finishes without a write; the card is free again but the data fingerprint is unchanged.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, updateIssueId));
+    await db.update(statusCards).set({ generatingIssueId: null }).where(eq(statusCards.id, card.id));
+
+    const second = await request(app).post(`/api/status-cards/${card.id}/refresh`).send({});
+
+    expect(second.status).toBe(202);
+    expect(second.body).toMatchObject({ enqueued: true, alreadyGenerating: false });
+    expect(second.body.generatingIssue.id).toBe(updateIssueId);
+    expect(await db.select().from(issues).where(eq(issues.id, updateIssueId)).then((rows) => rows[0])).toMatchObject({ status: "todo" });
+    expect(wakeup).toHaveBeenCalledTimes(2);
   });
 
   it("cancels a refresh task when its optimistic claim loses to archival", async () => {

@@ -13,6 +13,12 @@ export interface PullRequestFingerprint {
   state: PullRequestFingerprintState;
   /** `null` while GitHub has not computed it yet (`unknown`); a `null` side never counts as a change. */
   mergeableState: string | null;
+  /** Login of the head commit's author; set only when the poller saw the head change. `null` when unknown. */
+  headAuthorLogin?: string | null;
+  /** Another open pull request holds the configured review-slot label while this one does not. */
+  reviewSlotBusy?: boolean;
+  /** The latest review of at least one reviewer approves and none of them requests changes. */
+  approved?: boolean;
 }
 
 export type PullRequestFingerprintField =
@@ -66,6 +72,9 @@ export function parsePullRequestFingerprint(value: unknown): PullRequestFingerpr
     latestReviewId: idOrNull(raw.latestReviewId),
     state: raw.state as PullRequestFingerprintState,
     mergeableState: boundedString(raw.mergeableState),
+    ...(boundedString(raw.headAuthorLogin) ? { headAuthorLogin: boundedString(raw.headAuthorLogin) } : {}),
+    ...(typeof raw.reviewSlotBusy === "boolean" ? { reviewSlotBusy: raw.reviewSlotBusy } : {}),
+    ...(typeof raw.approved === "boolean" ? { approved: raw.approved } : {}),
   };
 }
 
@@ -108,32 +117,105 @@ export function changedFingerprintFields(
 }
 
 const ACTIONABLE_MERGEABLE_STATES = new Set(["behind", "dirty", "clean"]);
+/** Mergeable states that only matter once the checks have settled and the PR can move. */
+const SETTLED_MERGEABLE_STATES = new Set(["behind", "clean"]);
+
+function isSettled(fingerprint: PullRequestFingerprint) {
+  return fingerprint.checkConclusion === "success" || fingerprint.checkConclusion === "failure";
+}
+
+/** The PR waits for the review slot, unless GitHub already calls it mergeable and a reviewer approved it. */
+function waitsForReviewSlot(fingerprint: PullRequestFingerprint) {
+  return fingerprint.reviewSlotBusy === true && !(fingerprint.mergeableState === "clean" && fingerprint.approved === true);
+}
+
+function isOwnHead(current: PullRequestFingerprint, ownLogin: string | null) {
+  const author = current.headAuthorLogin?.toLowerCase() ?? null;
+  return ownLogin !== null && author !== null && author === ownLogin;
+}
+
+export interface FingerprintChangeEvaluation {
+  /** Fields worth waking for. */
+  actionable: PullRequestFingerprintField[];
+  /** Fields that may matter later (the PR cannot move yet): the baseline must keep their old value. */
+  deferred: PullRequestFingerprintField[];
+}
 
 /**
- * The subset of `changedFingerprintFields` that is worth waking an agent for. Mirrors `actionable()` in the
- * host script `pr_event_bridge.py`: transitions to `pending`, `blocked`, `unstable` and the like are noise.
- * `ownLogin` is the company token's own GitHub login; `null` (unresolved) treats every new comment as actionable.
+ * Sorts the changed fields into `actionable`, `deferred` and noise (everything else). Mirrors `actionable()` in
+ * the host script `pr_event_bridge.py`: transitions to `pending`, `blocked`, `unstable` and the like are noise.
+ * A head pushed by the own token, `behind` and green wake only once the checks have settled and the review slot
+ * is not held by another PR. `ownLogin` is the company token's own GitHub login; `null` (unresolved) fails open:
+ * every new comment and every head wakes.
  */
+export function evaluateFingerprintChange(
+  previous: PullRequestFingerprint,
+  current: PullRequestFingerprint,
+  opts: { ownLogin: string | null },
+): FingerprintChangeEvaluation {
+  const ownLogin = opts.ownLogin?.toLowerCase() ?? null;
+  const actionable: PullRequestFingerprintField[] = [];
+  const deferred: PullRequestFingerprintField[] = [];
+  const blockedFromMoving = waitsForReviewSlot(current);
+  for (const field of changedFingerprintFields(previous, current)) {
+    switch (field) {
+      case "state":
+      case "review":
+        actionable.push(field);
+        break;
+      case "head_sha":
+        if (!isOwnHead(current, ownLogin)) actionable.push(field);
+        else if (isSettled(current)) (current.checkConclusion === "success" && blockedFromMoving ? deferred : actionable).push(field);
+        break;
+      case "check_conclusion":
+        if (current.checkConclusion === "failure") actionable.push(field);
+        else if (current.checkConclusion === "success") (blockedFromMoving ? deferred : actionable).push(field);
+        break;
+      case "mergeable_state":
+        if (current.mergeableState === null || !ACTIONABLE_MERGEABLE_STATES.has(current.mergeableState)) break;
+        if (SETTLED_MERGEABLE_STATES.has(current.mergeableState) && (current.checkConclusion === "pending" || blockedFromMoving)) {
+          deferred.push(field);
+        } else {
+          actionable.push(field);
+        }
+        break;
+      case "comment": {
+        const author = current.latestCommentAuthor?.toLowerCase() ?? null;
+        if (ownLogin === null || author === null || author !== ownLogin) actionable.push(field);
+        break;
+      }
+    }
+  }
+  return { actionable, deferred };
+}
+
 export function actionableFingerprintChange(
   previous: PullRequestFingerprint,
   current: PullRequestFingerprint,
   opts: { ownLogin: string | null },
 ): PullRequestFingerprintField[] {
-  const ownLogin = opts.ownLogin?.toLowerCase() ?? null;
-  return changedFingerprintFields(previous, current).filter((field) => {
-    switch (field) {
-      case "state":
-      case "head_sha":
-      case "review":
-        return true;
-      case "check_conclusion":
-        return current.checkConclusion === "success" || current.checkConclusion === "failure";
-      case "mergeable_state":
-        return current.mergeableState !== null && ACTIONABLE_MERGEABLE_STATES.has(current.mergeableState);
-      case "comment": {
-        const author = current.latestCommentAuthor?.toLowerCase() ?? null;
-        return ownLogin === null || author === null || author !== ownLogin;
-      }
-    }
-  });
+  return evaluateFingerprintChange(previous, current, opts).actionable;
+}
+
+/**
+ * The baseline to store when nothing is woken: the current data, except that ids the poll window dropped keep
+ * their stored value and deferred fields keep theirs, so the change still shows once the PR can move.
+ */
+export function advanceBaseline(
+  stored: PullRequestFingerprint,
+  current: PullRequestFingerprint,
+  opts: { ownLogin: string | null },
+): PullRequestFingerprint {
+  const { deferred } = evaluateFingerprintChange(stored, current, opts);
+  return {
+    ...current,
+    headSha: deferred.includes("head_sha") ? stored.headSha : current.headSha,
+    checkConclusion: deferred.includes("check_conclusion") ? stored.checkConclusion : current.checkConclusion,
+    latestCommentId: current.latestCommentId ?? stored.latestCommentId,
+    latestCommentAuthor: current.latestCommentId === null ? stored.latestCommentAuthor ?? null : current.latestCommentAuthor,
+    latestReviewId: current.latestReviewId ?? stored.latestReviewId,
+    mergeableState: deferred.includes("mergeable_state")
+      ? stored.mergeableState
+      : current.mergeableState ?? stored.mergeableState,
+  };
 }

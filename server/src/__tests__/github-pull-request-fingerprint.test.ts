@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   actionableFingerprintChange,
+  advanceBaseline,
   changedFingerprintFields,
   parsePullRequestFingerprint,
   parsePullRequestState,
@@ -101,11 +102,90 @@ describe("actionableFingerprintChange", () => {
   });
 });
 
+describe("actionableFingerprintChange: settled states only", () => {
+  const own = { ownLogin: "Bot" };
+  const ownPush = { headSha: "bbb", headAuthorLogin: "bot" };
+
+  it("skips a head pushed by the own token while its checks are pending or absent", () => {
+    for (const checkConclusion of ["pending", "none"] as const) {
+      expect(actionableFingerprintChange(base, { ...base, ...ownPush, checkConclusion }, own)).toEqual([]);
+    }
+  });
+
+  it("wakes for an own-token head once its checks settle", () => {
+    expect(actionableFingerprintChange(base, { ...base, ...ownPush }, own)).toEqual(["head_sha"]);
+    expect(
+      actionableFingerprintChange(base, { ...base, ...ownPush, checkConclusion: "failure" }, own),
+    ).toEqual(["head_sha", "check_conclusion"]);
+  });
+
+  it("still wakes for a head from someone else, an unknown author or an unresolved own login", () => {
+    const pending = { ...base, headSha: "bbb", checkConclusion: "pending" as const };
+    expect(actionableFingerprintChange(base, { ...pending, headAuthorLogin: "human" }, own)).toEqual(["head_sha"]);
+    expect(actionableFingerprintChange(base, { ...pending, headAuthorLogin: null }, own)).toEqual(["head_sha"]);
+    expect(actionableFingerprintChange(base, { ...pending, headAuthorLogin: "bot" }, { ownLogin: null })).toEqual(["head_sha"]);
+  });
+
+  it("skips behind and clean while the checks are pending", () => {
+    const pending = { ...base, checkConclusion: "pending" as const };
+    expect(actionableFingerprintChange(base, { ...pending, mergeableState: "behind" }, own)).toEqual([]);
+    expect(actionableFingerprintChange({ ...base, mergeableState: "blocked" }, pending, own)).toEqual([]);
+    expect(actionableFingerprintChange(base, { ...pending, mergeableState: "dirty" }, own)).toEqual(["mergeable_state"]);
+  });
+
+  it("skips behind and green while another pull request holds the review slot", () => {
+    const busy = { ...base, reviewSlotBusy: true };
+    expect(actionableFingerprintChange(base, { ...busy, mergeableState: "behind" }, own)).toEqual([]);
+    expect(
+      actionableFingerprintChange({ ...base, checkConclusion: "pending" }, { ...busy, mergeableState: "blocked" }, own),
+    ).toEqual([]);
+    expect(actionableFingerprintChange({ ...base, checkConclusion: "pending" }, busy, own)).toEqual([]);
+  });
+
+  it("wakes when the slot is free, or the pull request is clean and approved", () => {
+    const free = { ...base, reviewSlotBusy: false };
+    expect(actionableFingerprintChange({ ...base, checkConclusion: "pending" }, free, own)).toEqual(["check_conclusion"]);
+    const approved = { ...base, reviewSlotBusy: true, approved: true };
+    expect(actionableFingerprintChange({ ...base, checkConclusion: "pending" }, approved, own)).toEqual(["check_conclusion"]);
+    expect(
+      actionableFingerprintChange(base, { ...approved, mergeableState: "behind" }, own),
+    ).toEqual([]);
+  });
+
+  it("keeps waking for a check failure and a dirty branch under a busy slot", () => {
+    const busy = { ...base, reviewSlotBusy: true };
+    expect(actionableFingerprintChange(base, { ...busy, checkConclusion: "failure" }, own)).toEqual(["check_conclusion"]);
+    expect(actionableFingerprintChange(base, { ...busy, mergeableState: "dirty" }, own)).toEqual(["mergeable_state"]);
+  });
+});
+
+describe("advanceBaseline", () => {
+  it("keeps a deferred field at its stored value so the later change still wakes", () => {
+    const stored = { ...base, checkConclusion: "pending" as const };
+    const current = { ...base, reviewSlotBusy: true };
+    const next = advanceBaseline(stored, current, { ownLogin: null });
+    expect(next.checkConclusion).toBe("pending");
+    expect(actionableFingerprintChange(next, { ...current, reviewSlotBusy: false }, { ownLogin: null })).toEqual([
+      "check_conclusion",
+    ]);
+  });
+
+  it("advances every other field and keeps ids the poll window dropped", () => {
+    const next = advanceBaseline(base, { ...base, latestCommentId: null, latestReviewId: null, mergeableState: null }, {
+      ownLogin: null,
+    });
+    expect(next).toMatchObject({ latestCommentId: 10, latestReviewId: 20, mergeableState: "clean" });
+    expect(advanceBaseline(base, { ...base, headSha: "ccc" }, { ownLogin: null }).headSha).toBe("ccc");
+  });
+});
+
 describe("fingerprint parsing", () => {
   it("round trips a valid fingerprint and drops a malformed one", () => {
     expect(parsePullRequestFingerprint(base)).toEqual(base);
     expect(parsePullRequestFingerprint({ ...base, state: "weird" })).toBeNull();
     expect(parsePullRequestFingerprint("nope")).toBeNull();
+    const extended = { ...base, headAuthorLogin: "bot", reviewSlotBusy: true, approved: false };
+    expect(parsePullRequestFingerprint(extended)).toEqual(extended);
   });
 
   it("drops a key with a dot-only owner or repository", () => {

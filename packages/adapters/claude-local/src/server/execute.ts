@@ -495,18 +495,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed
-  // file that includes both the file content and the path directive, so we only
-  // need --append-system-prompt-file (Claude CLI forbids using both flags together).
+  // file from the instructions body only. The path directive holds the run
+  // directory, so it goes in the first user message instead; keeping it out of
+  // the bundle keeps the bundle key, system prompt and --resume stable across runs.
   let combinedInstructionsContents: string | null = null;
+  let instructionsPathDirective = "";
   if (instructionsFilePath) {
     try {
       const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
-      const pathDirective =
-        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
+      instructionsPathDirective =
+        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
         `Resolve any relative file references from ${instructionsFileDir}. ` +
         `This base directory is authoritative for sibling instruction files such as ` +
         `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`;
-      combinedInstructionsContents = instructionsContent + pathDirective;
+      combinedInstructionsContents = instructionsContent;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
@@ -903,6 +905,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const prompt = joinPromptSections([
       renderedBootstrapPrompt,
+      instructionsPathDirective,
       selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
       wakePrompt,
       sessionHandoffNote,
@@ -930,7 +933,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (attemptInstructionsFilePath && !resumeSessionId) {
       commandNotes.push(
-        `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with path directive appended)`,
+        `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (path directive sent in the prompt)`,
       );
     }
     if (runtimeMcpServers.length > 0) {

@@ -179,6 +179,28 @@ describe("advanceBaseline", () => {
   });
 });
 
+describe("bot comments", () => {
+  const stored = { ...base, latestBotCommentId: 30 };
+  const opts = { ownLogin: null };
+
+  it("wakes for a new bot comment once the checks have settled", () => {
+    expect(actionableFingerprintChange(stored, { ...stored, latestBotCommentId: 31 }, opts)).toEqual(["bot_comment"]);
+  });
+
+  it("defers a new bot comment while the checks are pending and keeps it in the baseline", () => {
+    const pendingStored = { ...stored, checkConclusion: "pending" as const };
+    const current = { ...pendingStored, latestBotCommentId: 31 };
+    expect(actionableFingerprintChange(pendingStored, current, opts)).toEqual([]);
+    const next = advanceBaseline(pendingStored, current, opts);
+    expect(next.latestBotCommentId).toBe(30);
+    expect(actionableFingerprintChange(next, { ...current, checkConclusion: "success" }, opts)).toContain("bot_comment");
+  });
+
+  it("ignores a baseline stored before bot comments were tracked", () => {
+    expect(changedFingerprintFields(base, { ...base, latestBotCommentId: 31 })).toEqual([]);
+  });
+});
+
 describe("fingerprint parsing", () => {
   it("round trips a valid fingerprint and drops a malformed one", () => {
     expect(parsePullRequestFingerprint(base)).toEqual(base);

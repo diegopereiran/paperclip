@@ -100,19 +100,24 @@ function isBotUser(user: { login?: unknown; type?: unknown } | null | undefined)
   return user?.type === "Bot" || (typeof user?.login === "string" && user.login.endsWith("[bot]"));
 }
 
-/** Bot comments (CI, coverage, "review in progress" placeholders) never count; a bot's final review is a PR review. */
-function latestComment(value: unknown): { id: number | null; author: string | null } {
-  if (!Array.isArray(value)) return { id: null, author: null };
-  const humanComments = value.filter(
-    (candidate) => !isBotUser((candidate as { user?: { login?: unknown; type?: unknown } | null } | null)?.user),
-  );
+/**
+ * The latest human comment, and separately the latest bot comment id: bot comments (CI, coverage, "review in
+ * progress" placeholders, a review bot's verdict) are judged by the fingerprint rules, which defer them while
+ * the checks are pending.
+ */
+function latestComment(value: unknown): { id: number | null; author: string | null; botId: number | null } {
+  if (!Array.isArray(value)) return { id: null, author: null, botId: null };
+  const isBot = (candidate: unknown) =>
+    isBotUser((candidate as { user?: { login?: unknown; type?: unknown } | null } | null)?.user);
+  const humanComments = value.filter((candidate) => !isBot(candidate));
+  const botId = maxId(value.filter(isBot));
   const id = maxId(humanComments);
-  if (id === null) return { id: null, author: null };
+  if (id === null) return { id: null, author: null, botId };
   const entry = humanComments.find((candidate) => (candidate as { id?: unknown } | null)?.id === id) as
     | { user?: { login?: unknown } | null }
     | undefined;
   const login = entry?.user?.login;
-  return { id, author: typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null };
+  return { id, author: typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null, botId };
 }
 
 /** True when some reviewer's latest decisive review approves and no reviewer's latest one requests changes. */
@@ -271,8 +276,9 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
               })
             : [],
       );
-      if (holders.kind !== "ok") return holders;
-      reviewSlotBusy = holders.value.length > 0 && !holders.value.includes(ref.number);
+      if (holders.kind === "paused") return holders;
+      // A failed lookup leaves the slot state unknown, which fails open (no deferral), like the head author.
+      if (holders.kind === "ok") reviewSlotBusy = holders.value.length > 0 && !holders.value.includes(ref.number);
     }
 
     return {
@@ -282,6 +288,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
         checkConclusion: suites.value,
         latestCommentId: comments.value.id,
         latestCommentAuthor: comments.value.author,
+        latestBotCommentId: comments.value.botId,
         latestReviewId: reviews.value.id,
         ...(reviews.value.approved ? { approved: true } : {}),
         ...(headAuthorLogin ? { headAuthorLogin } : {}),

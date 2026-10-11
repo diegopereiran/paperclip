@@ -9,6 +9,8 @@ export interface PullRequestFingerprint {
   latestCommentId: number | null;
   /** Login of the author of the latest comment; `null` when unknown (older baselines, deleted users). */
   latestCommentAuthor?: string | null;
+  /** Id of the latest bot issue comment (CI, coverage, review bot); absent in baselines stored before it existed. */
+  latestBotCommentId?: number | null;
   latestReviewId: number | null;
   state: PullRequestFingerprintState;
   /** `null` while GitHub has not computed it yet (`unknown`); a `null` side never counts as a change. */
@@ -25,6 +27,7 @@ export type PullRequestFingerprintField =
   | "head_sha"
   | "check_conclusion"
   | "comment"
+  | "bot_comment"
   | "review"
   | "state"
   | "mergeable_state";
@@ -69,6 +72,7 @@ export function parsePullRequestFingerprint(value: unknown): PullRequestFingerpr
     checkConclusion: raw.checkConclusion as PullRequestCheckConclusion,
     latestCommentId: idOrNull(raw.latestCommentId),
     ...(boundedString(raw.latestCommentAuthor) ? { latestCommentAuthor: boundedString(raw.latestCommentAuthor) } : {}),
+    ...(raw.latestBotCommentId !== undefined ? { latestBotCommentId: idOrNull(raw.latestBotCommentId) } : {}),
     latestReviewId: idOrNull(raw.latestReviewId),
     state: raw.state as PullRequestFingerprintState,
     mergeableState: boundedString(raw.mergeableState),
@@ -104,6 +108,10 @@ export function changedFingerprintFields(
   if (previous.headSha !== current.headSha) changed.push("head_sha");
   if (previous.checkConclusion !== current.checkConclusion) changed.push("check_conclusion");
   if (idGrew(previous.latestCommentId, current.latestCommentId)) changed.push("comment");
+  // A baseline stored before bot comments were tracked has no value to compare with.
+  if (previous.latestBotCommentId !== undefined && idGrew(previous.latestBotCommentId, current.latestBotCommentId ?? null)) {
+    changed.push("bot_comment");
+  }
   if (idGrew(previous.latestReviewId, current.latestReviewId)) changed.push("review");
   if (previous.state !== current.state) changed.push("state");
   if (
@@ -144,7 +152,7 @@ export interface FingerprintChangeEvaluation {
 /**
  * Sorts the changed fields into `actionable`, `deferred` and noise (everything else). Mirrors `actionable()` in
  * the host script `pr_event_bridge.py`: transitions to `pending`, `blocked`, `unstable` and the like are noise.
- * A head pushed by the own token, `behind` and green wake only once the checks have settled and the review slot
+ * A bot comment, a head pushed by the own token, `behind` and green wake only once the checks have settled and the review slot
  * is not held by another PR. `ownLogin` is the company token's own GitHub login; `null` (unresolved) fails open:
  * every new comment and every head wakes.
  */
@@ -178,6 +186,11 @@ export function evaluateFingerprintChange(
         } else {
           actionable.push(field);
         }
+        break;
+      case "bot_comment":
+        // A bot comment (placeholder, CI or coverage note, or a review bot's verdict) folds into the wake for
+        // the checks settling; one posted after the checks settled is a verdict and wakes on its own.
+        (current.checkConclusion === "pending" ? deferred : actionable).push(field);
         break;
       case "comment": {
         const author = current.latestCommentAuthor?.toLowerCase() ?? null;
@@ -213,6 +226,9 @@ export function advanceBaseline(
     checkConclusion: deferred.includes("check_conclusion") ? stored.checkConclusion : current.checkConclusion,
     latestCommentId: current.latestCommentId ?? stored.latestCommentId,
     latestCommentAuthor: current.latestCommentId === null ? stored.latestCommentAuthor ?? null : current.latestCommentAuthor,
+    latestBotCommentId: deferred.includes("bot_comment")
+      ? stored.latestBotCommentId
+      : current.latestBotCommentId ?? stored.latestBotCommentId ?? null,
     latestReviewId: current.latestReviewId ?? stored.latestReviewId,
     mergeableState: deferred.includes("mergeable_state")
       ? stored.mergeableState

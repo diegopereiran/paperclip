@@ -253,6 +253,7 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
         checkConclusion: "success",
         latestCommentId: null,
         latestCommentAuthor: null,
+        latestBotCommentId: null,
         latestReviewId: null,
         state: "open",
         mergeableState: "clean",
@@ -325,18 +326,41 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
     expect(triggerMonitor).not.toHaveBeenCalled();
   });
 
-  it("does not wake for a bot comment but wakes for a bot review", async () => {
+  it("wakes for a bot issue comment posted after the checks settled (a review bot verdict)", async () => {
     const company = await seedCompany();
     await seedMonitor(company);
     const { poller, triggerMonitor, github } = setup();
     await poller.poll(T0);
-    github.set("open/repo#12", { ...freshPullRequest(), comments: [301], commentAuthor: "coverage", commentUserType: "Bot" });
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301], commentAuthor: "github-actions[bot]", commentUserType: "Bot" });
     await poller.poll(at(4));
-    github.set("open/repo#12", { ...freshPullRequest(), comments: [302], commentAuthor: "review-app[bot]" });
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+    expect(triggerMonitor.mock.calls[0]![1].trigger.event).toBe("poll:bot_comment");
+  });
+
+  it("defers a bot comment posted while the checks are pending and wakes once they settle", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github } = setup();
+    await poller.poll(T0);
+    const pending = [{ status: "in_progress", conclusion: null }];
+    github.set("open/repo#12", { ...freshPullRequest(), suites: pending });
+    await poller.poll(at(4));
+    github.set("open/repo#12", { ...freshPullRequest(), suites: pending, comments: [301, 302], commentAuthor: "review-app[bot]" });
     await poller.poll(at(8));
-    expect(triggerMonitor).not.toHaveBeenCalled();
-    github.set("open/repo#12", { ...freshPullRequest(), comments: [302], commentAuthor: "review-app[bot]", reviews: [401] });
     await poller.poll(at(12));
+    expect(triggerMonitor).not.toHaveBeenCalled();
+    github.set("open/repo#12", { ...freshPullRequest(), comments: [301, 302], commentAuthor: "review-app[bot]" });
+    await poller.poll(at(16));
+    expect(triggerMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakes for a bot review", async () => {
+    const company = await seedCompany();
+    await seedMonitor(company);
+    const { poller, triggerMonitor, github } = setup();
+    await poller.poll(T0);
+    github.set("open/repo#12", { ...freshPullRequest(), reviews: [401] });
+    await poller.poll(at(4));
     expect(triggerMonitor).toHaveBeenCalledTimes(1);
   });
 

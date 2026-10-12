@@ -673,6 +673,7 @@ describe("claude execute", () => {
         argv: string[];
         appendedSystemPromptFilePath: string | null;
         appendedSystemPromptFileContents: string | null;
+        prompt: string;
       }>;
       expect(captured).toHaveLength(2);
       expect(getFreshSessionHandoff).toHaveBeenCalledOnce();
@@ -685,7 +686,8 @@ describe("claude execute", () => {
       expect(captured[1]?.appendedSystemPromptFilePath).toContain("agent-instructions.md");
       expect(captured[1]?.appendedSystemPromptFilePath).not.toBe(instructionsFile);
       expect(captured[1]?.appendedSystemPromptFileContents).toContain("# Agent instructions");
-      expect(captured[1]?.appendedSystemPromptFileContents).toContain(
+      expect(captured[1]?.appendedSystemPromptFileContents).not.toContain("were loaded from");
+      expect(captured[1]?.prompt).toContain(
         `The above agent instructions were loaded from ${instructionsFile}. ` +
         `Resolve any relative file references from ${path.dirname(instructionsFile)}/. ` +
         `This base directory is authoritative for sibling instruction files such as ` +
@@ -1338,7 +1340,8 @@ describe("claude execute", () => {
       expect(capture1.addDir?.startsWith(expectedRoot)).toBe(true);
       expect(capture1.instructionsFilePath?.startsWith(expectedRoot)).toBe(true);
       expect(capture1.instructionsContents).toContain("You are managed instructions.");
-      expect(capture1.instructionsContents).toContain(`The above agent instructions were loaded from ${instructionsPath}.`);
+      expect(capture1.instructionsContents).not.toContain("were loaded from");
+      expect(capture1.prompt).toContain(`The above agent instructions were loaded from ${instructionsPath}.`);
       expect(capture1.skillEntries).toContain("paperclip");
       expect(capture2.argv).toContain("--resume");
       expect(getFreshSessionHandoff).not.toHaveBeenCalled();

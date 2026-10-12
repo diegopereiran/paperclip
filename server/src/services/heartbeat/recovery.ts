@@ -36,7 +36,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
-import { fastForwardStrandedSshImports } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { fastForwardStrandedSshImport } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   claimNativeRestartRecoveries,
   closeIdleWarmNativeSessionsForRestart,
@@ -1931,15 +1931,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
-  async function landStrandedSshImports(run: typeof heartbeatRuns.$inferSelect) {
+  async function landStrandedSshImport(run: typeof heartbeatRuns.$inferSelect) {
     const cwd = readNonEmptyString(
       parseObject(parseObject(run.contextSnapshot).paperclipWorkspace).cwd,
     );
     if (!cwd) return;
     try {
-      // A ticket and its children share one workspace. A live run there may sit
-      // between its own fetch and branch update, so landing its ref here would
-      // merge and delete it underneath that run.
+      // A ticket and its children share one workspace. A live run there took
+      // its baseline from the current tree and merges back against it, so the
+      // branch must not move underneath it. The import then stays under its
+      // ref (logged) and is not retried.
       const [liveSibling] = await db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -1959,16 +1960,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         );
         return;
       }
-      const { landed, skipped } = await fastForwardStrandedSshImports({ localDir: cwd });
-      for (const item of landed) {
+      const result = await fastForwardStrandedSshImport({ localDir: cwd, runId: run.id });
+      if (!result || result.outcome === "already_on_branch") return;
+      if (result.outcome === "landed") {
         logger.warn(
-          { runId: run.id, ref: item.ref, head: item.head },
+          { runId: run.id, ref: result.ref, head: result.head },
           "fast-forwarded workspace branch to stranded SSH import",
         );
-      }
-      for (const item of skipped) {
+      } else {
         logger.warn(
-          { runId: run.id, ref: item.ref, head: item.head, reason: item.reason },
+          { runId: run.id, ref: result.ref, head: result.head, reason: result.outcome },
           "kept stranded SSH import under its ref; branch not moved",
         );
       }
@@ -2423,9 +2424,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!failureWrite.updated || !failureWrite.run) continue;
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
-      // A run lost mid sync-back leaves its commit only under the imported
+      // A run lost mid sync-back leaves its commit only under its imported
       // ref; land it on the branch as a clean exit would. Fast-forward only.
-      await landStrandedSshImports(run);
+      await landStrandedSshImport(run);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,

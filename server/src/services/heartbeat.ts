@@ -67,7 +67,7 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { normalizeAgentEnvPatterns, runWithAgentEnvPolicy } from "@paperclipai/adapter-utils/agent-env-policy";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot, fastForwardStrandedSshImports } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -19229,6 +19229,30 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  async function landStrandedSshImports(run: typeof heartbeatRuns.$inferSelect) {
+    const cwd = readNonEmptyString(
+      parseObject(parseObject(run.contextSnapshot).paperclipWorkspace).cwd,
+    );
+    if (!cwd) return;
+    try {
+      const { landed, skipped } = await fastForwardStrandedSshImports({ localDir: cwd });
+      for (const item of landed) {
+        logger.warn(
+          { runId: run.id, ref: item.ref, head: item.head },
+          "fast-forwarded workspace branch to stranded SSH import",
+        );
+      }
+      for (const item of skipped) {
+        logger.warn(
+          { runId: run.id, ref: item.ref, head: item.head, reason: item.reason },
+          "kept stranded SSH import under its ref; branch not moved",
+        );
+      }
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to land stranded SSH import");
+    }
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -19662,6 +19686,9 @@ export function heartbeatService(
       if (!failureWrite.updated || !failureWrite.run) continue;
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
+      // A run lost mid sync-back leaves its commit only under the imported
+      // ref; land it on the branch as a clean exit would. Fast-forward only.
+      await landStrandedSshImports(run);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,

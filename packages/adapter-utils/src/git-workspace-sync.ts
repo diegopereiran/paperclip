@@ -848,6 +848,74 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   return graftCommit.stdout.trim();
 }
 
+const SSH_IMPORTED_REF_PREFIX = "refs/paperclip/ssh-sync/imported/";
+
+export interface StrandedSshImport {
+  ref: string;
+  head: string;
+}
+
+export interface SkippedStrandedSshImport extends StrandedSshImport {
+  reason: "not_fast_forward" | "working_tree_conflict";
+}
+
+/**
+ * Land SSH sync-back imports that never reached the branch.
+ *
+ * Sync-back fetches the run's commit into `refs/paperclip/ssh-sync/imported/*`
+ * and deletes that ref once the branch has absorbed it. When the control plane
+ * dies in between (a run reaped as `process_lost`), the commit stays only
+ * under that ref and no later run sees it. This fast-forwards the checked-out
+ * branch to each such ref, oldest first, and deletes the ref. It never merges,
+ * grafts or resets: an import that is not a descendant of the current head
+ * keeps its ref and is reported as skipped so the caller can log why.
+ */
+export async function fastForwardStrandedSshImports(input: {
+  localDir: string;
+}): Promise<{ landed: StrandedSshImport[]; skipped: SkippedStrandedSshImport[] }> {
+  const landed: StrandedSshImport[] = [];
+  const skipped: SkippedStrandedSshImport[] = [];
+  const listed = await runLocalGit(
+    input.localDir,
+    ["for-each-ref", "--sort=committerdate", "--format=%(refname) %(objectname)", SSH_IMPORTED_REF_PREFIX],
+    { timeout: 10_000, maxBuffer: 256 * 1024 },
+  );
+  for (const line of listed.stdout.split("\n")) {
+    const [ref, head] = line.trim().split(" ");
+    if (!ref || !head) continue;
+    const isAncestor = async (ancestor: string, descendant: string) =>
+      runLocalGit(input.localDir, ["merge-base", "--is-ancestor", ancestor, descendant], {
+        timeout: 10_000,
+        maxBuffer: 16 * 1024,
+      }).then(() => true, (error: { code?: unknown }) => {
+        if (error?.code === 1) return false;
+        throw error;
+      });
+    if (await isAncestor(head, "HEAD")) {
+      // Already on the branch: only the ref is stale.
+    } else if (!(await isAncestor("HEAD", head))) {
+      skipped.push({ ref, head, reason: "not_fast_forward" });
+      continue;
+    } else {
+      try {
+        await runLocalGit(input.localDir, ["merge", "--ff-only", "--quiet", head], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+      } catch {
+        skipped.push({ ref, head, reason: "working_tree_conflict" });
+        continue;
+      }
+      landed.push({ ref, head });
+    }
+    await runLocalGit(input.localDir, ["update-ref", "-d", ref], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+  }
+  return { landed, skipped };
+}
+
 export async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;

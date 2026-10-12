@@ -13,6 +13,7 @@ import {
   createRemoteGitExportRef,
   deleteLocalGitRef,
   fetchGitBundleIntoLocalRef,
+  fastForwardStrandedSshImports,
   integrateImportedGitHead,
   isMissingGitPrerequisiteError,
   readGitWorkspaceSnapshot as readRawSnapshot,
@@ -725,6 +726,74 @@ describe("git workspace sync", () => {
     await expect(integrateImportedGitHead({ localDir: repo, importedHead: missingHead }))
       .rejects.toThrow(/Failed to merge concurrent remote git histories/);
     expect(await git(repo, ["rev-parse", "HEAD"])).toBe(currentHead);
+  });
+
+  describe("fastForwardStrandedSshImports", () => {
+    const setupIdentity = ["-c", "user.name=Setup", "-c", "user.email=setup@paperclip.dev"];
+    const importedPrefix = "refs/paperclip/ssh-sync/imported";
+
+    async function makeRepo() {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-stranded-import-"));
+      cleanupDirs.push(rootDir);
+      const repo = path.join(rootDir, "repo");
+      await mkdir(repo, { recursive: true });
+      await git(repo, ["init"]);
+      await git(repo, ["checkout", "-b", "ticket"]);
+      await writeFile(path.join(repo, "tracked.txt"), "base\n", "utf8");
+      await git(repo, ["add", "tracked.txt"]);
+      await git(repo, [...setupIdentity, "commit", "-m", "base"]);
+      return repo;
+    }
+
+    async function commitFile(repo: string, file: string, message: string) {
+      await writeFile(path.join(repo, file), `${message}\n`, "utf8");
+      await git(repo, ["add", file]);
+      await git(repo, [...setupIdentity, "commit", "-m", message]);
+      return git(repo, ["rev-parse", "HEAD"]);
+    }
+
+    it("fast-forwards the checked-out branch to a stranded imported commit and drops the ref", async () => {
+      const repo = await makeRepo();
+      const baseHead = await git(repo, ["rev-parse", "HEAD"]);
+      const runHead = await commitFile(repo, "work.txt", "run work");
+      await git(repo, ["update-ref", `${importedPrefix}/run-1`, runHead]);
+      await git(repo, ["reset", "--hard", baseHead]);
+
+      const result = await fastForwardStrandedSshImports({ localDir: repo });
+
+      expect(await git(repo, ["rev-parse", "HEAD"])).toBe(runHead);
+      expect(await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("ticket");
+      expect(await readFile(path.join(repo, "work.txt"), "utf8")).toBe("run work\n");
+      expect(await git(repo, ["status", "--porcelain"])).toBe("");
+      expect(await git(repo, ["for-each-ref", importedPrefix])).toBe("");
+      expect(result.landed).toEqual([{ ref: `${importedPrefix}/run-1`, head: runHead }]);
+    });
+
+    it("leaves a diverged imported commit and the branch untouched, and says why", async () => {
+      const repo = await makeRepo();
+      const baseHead = await git(repo, ["rev-parse", "HEAD"]);
+      const runHead = await commitFile(repo, "work.txt", "run work");
+      await git(repo, ["update-ref", `${importedPrefix}/run-2`, runHead]);
+      await git(repo, ["reset", "--hard", baseHead]);
+      const localHead = await commitFile(repo, "local.txt", "local work");
+
+      const result = await fastForwardStrandedSshImports({ localDir: repo });
+
+      expect(await git(repo, ["rev-parse", "HEAD"])).toBe(localHead);
+      expect(await git(repo, ["rev-parse", `${importedPrefix}/run-2`])).toBe(runHead);
+      expect(result.landed).toEqual([]);
+      expect(result.skipped).toEqual([
+        { ref: `${importedPrefix}/run-2`, head: runHead, reason: "not_fast_forward" },
+      ]);
+    });
+
+    it("does nothing when no imported ref exists", async () => {
+      const repo = await makeRepo();
+      const head = await git(repo, ["rev-parse", "HEAD"]);
+      const result = await fastForwardStrandedSshImports({ localDir: repo });
+      expect(result).toEqual({ landed: [], skipped: [] });
+      expect(await git(repo, ["rev-parse", "HEAD"])).toBe(head);
+    });
   });
 
   describe("readReferencedSourceGitIgnoredPaths", () => {

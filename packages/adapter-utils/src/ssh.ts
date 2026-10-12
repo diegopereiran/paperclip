@@ -1831,6 +1831,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  // Ref to import the run's commit into; see sshImportedRefForRun.
+  importedRef?: string;
   onProgress?: RuntimeProgressSink;
   repositories?: Array<{ path: string; baselineSnapshot?: DirectorySnapshot }>;
 }): Promise<void> {
@@ -1891,7 +1893,7 @@ async function restoreWorkspaceRootFromSsh(input: {
   if (input.baselineSnapshot) {
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
-      ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
+      ? input.importedRef ?? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
       : null;
     try {
       const importedHead = input.restoreGitHistory

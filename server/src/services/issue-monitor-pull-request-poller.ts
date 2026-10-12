@@ -6,8 +6,9 @@ import { defaultTokenProvider, retryAfterSeconds } from "./github-external-objec
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import {
-  actionableFingerprintChange,
+  advanceBaseline,
   changedFingerprintFields,
+  evaluateFingerprintChange,
   parsePullRequestState,
   pullRequestStateKey,
   summarizeCheckSuites,
@@ -25,6 +26,11 @@ export const PULL_REQUEST_POLL_INTERVAL_MS = 3 * 60 * 1000;
 const MAX_PAUSE_SECONDS = 60 * 60;
 const AUTH_PAUSE_SECONDS = 5 * 60;
 const REQUEST_TIMEOUT_MS = 20_000;
+/** A burst of changes on one PR wakes once: the PR must stay unchanged this long before a wake. */
+export const PULL_REQUEST_SETTLE_MS = 2 * 60 * 1000;
+const REVIEW_SLOT_LABEL_ENV = "PAPERCLIP_PR_MONITOR_REVIEW_SLOT_LABEL";
+/** A check failure and a state change wake without waiting for the settle window. */
+const IMMEDIATE_FIELDS = new Set(["state", "check_conclusion"]);
 const GITHUB_API_ORIGIN = gitHubApiBase("github.com");
 
 type PollerLog = Pick<typeof logger, "info" | "warn" | "debug" | "error">;
@@ -43,6 +49,14 @@ export interface PullRequestMonitorPollerOptions {
     },
   ) => Promise<unknown>;
   intervalMs?: number;
+  /** Minimum quiet time on one PR before a wake (coalesces bursts); `0` wakes on the first poll that sees a change. */
+  settleMs?: number;
+  /**
+   * Label that marks the pull request holding a repository's review slot. While another open PR of the repo
+   * carries it, this PR's green and `behind` states do not wake. Defaults to `PAPERCLIP_PR_MONITOR_REVIEW_SLOT_LABEL`;
+   * unset disables the slot rule.
+   */
+  reviewSlotLabel?: string | null;
   log?: PollerLog;
 }
 
@@ -63,6 +77,8 @@ interface PullRequestCacheEntry {
   sinceIso: string;
   responses: Map<string, CachedResponse<unknown>>;
   fingerprint: PullRequestFingerprint | null;
+  /** When the fetched fingerprint last differed from the one before it. */
+  changedAtMs: number;
 }
 
 type GetResult<T> =
@@ -80,14 +96,43 @@ function maxId(value: unknown) {
   return max;
 }
 
-function latestComment(value: unknown): { id: number | null; author: string | null } {
-  const id = maxId(value);
-  if (id === null || !Array.isArray(value)) return { id: null, author: null };
-  const entry = value.find((candidate) => (candidate as { id?: unknown } | null)?.id === id) as
+function isBotUser(user: { login?: unknown; type?: unknown } | null | undefined) {
+  return user?.type === "Bot" || (typeof user?.login === "string" && user.login.endsWith("[bot]"));
+}
+
+/**
+ * The latest human comment, and separately the latest bot comment id: bot comments (CI, coverage, "review in
+ * progress" placeholders, a review bot's verdict) are judged by the fingerprint rules, which defer them while
+ * the checks are pending.
+ */
+function latestComment(value: unknown): { id: number | null; author: string | null; botId: number | null } {
+  if (!Array.isArray(value)) return { id: null, author: null, botId: null };
+  const isBot = (candidate: unknown) =>
+    isBotUser((candidate as { user?: { login?: unknown; type?: unknown } | null } | null)?.user);
+  const humanComments = value.filter((candidate) => !isBot(candidate));
+  const botId = maxId(value.filter(isBot));
+  const id = maxId(humanComments);
+  if (id === null) return { id: null, author: null, botId };
+  const entry = humanComments.find((candidate) => (candidate as { id?: unknown } | null)?.id === id) as
     | { user?: { login?: unknown } | null }
     | undefined;
   const login = entry?.user?.login;
-  return { id, author: typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null };
+  return { id, author: typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null, botId };
+}
+
+/** True when some reviewer's latest decisive review approves and no reviewer's latest one requests changes. */
+function reviewsApprove(value: unknown) {
+  if (!Array.isArray(value)) return false;
+  const latest = new Map<string, string>();
+  for (const review of value as Array<{ state?: unknown; user?: { login?: unknown } | null }>) {
+    const login = review?.user?.login;
+    if (typeof login !== "string" || typeof review.state !== "string") continue;
+    if (review.state === "APPROVED" || review.state === "CHANGES_REQUESTED" || review.state === "DISMISSED") {
+      latest.set(login, review.state);
+    }
+  }
+  const states = [...latest.values()];
+  return states.includes("APPROVED") && !states.includes("CHANGES_REQUESTED");
 }
 
 function isRateLimited(response: Response) {
@@ -101,6 +146,8 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
   const getToken = options.getToken ?? ((companyId: string) => defaultTokenProvider(db, companyId, DEFAULT_GITHUB_TOKEN_SECRET_NAMES));
   const intervalMs = options.intervalMs ?? PULL_REQUEST_POLL_INTERVAL_MS;
   const log = options.log ?? logger;
+  const settleMs = options.settleMs ?? PULL_REQUEST_SETTLE_MS;
+  const reviewSlotLabel = (options.reviewSlotLabel ?? process.env[REVIEW_SLOT_LABEL_ENV])?.trim() || null;
 
   const cache = new Map<string, PullRequestCacheEntry>();
   const pausedUntil = new Map<string, number>();
@@ -194,8 +241,45 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
     );
     if (comments.kind !== "ok") return comments;
 
-    const reviews = await request(token, entry, `${base}/pulls/${ref.number}/reviews?per_page=100`, maxId);
+    const reviews = await request(token, entry, `${base}/pulls/${ref.number}/reviews?per_page=100`, (body) => ({
+      id: maxId(body),
+      approved: reviewsApprove(body),
+    }));
     if (reviews.kind !== "ok") return reviews;
+
+    // Only a head change needs its author (the pushes of our own token do not wake), so skip the extra call otherwise.
+    const previousHead = entry.fingerprint?.headSha ?? null;
+    let headAuthorLogin: string | null | undefined;
+    if (pull.value.headSha && previousHead !== null && previousHead !== pull.value.headSha) {
+      const commit = await request(token, entry, `${base}/commits/${encodeURIComponent(pull.value.headSha)}`, (body) => {
+        const login = (body as { author?: { login?: unknown } | null } | null)?.author?.login;
+        return typeof login === "string" && login.length > 0 && login.length <= 100 ? login : null;
+      });
+      if (commit.kind === "paused") return commit;
+      // A failed lookup leaves the author unknown, which fails open (the head change wakes).
+      if (commit.kind === "ok") headAuthorLogin = commit.value;
+    } else if (pull.value.headSha && previousHead === pull.value.headSha) {
+      headAuthorLogin = entry.fingerprint?.headAuthorLogin;
+    }
+
+    let reviewSlotBusy: boolean | undefined;
+    if (reviewSlotLabel) {
+      const holders = await request(
+        token,
+        entry,
+        `${base}/issues?labels=${encodeURIComponent(reviewSlotLabel)}&state=open&per_page=100`,
+        (body) =>
+          Array.isArray(body)
+            ? body.flatMap((item) => {
+                const number = (item as { number?: unknown; pull_request?: unknown } | null)?.number;
+                return typeof number === "number" && (item as { pull_request?: unknown }).pull_request ? [number] : [];
+              })
+            : [],
+      );
+      if (holders.kind === "paused") return holders;
+      // A failed lookup leaves the slot state unknown, which fails open (no deferral), like the head author.
+      if (holders.kind === "ok") reviewSlotBusy = holders.value.length > 0 && !holders.value.includes(ref.number);
+    }
 
     return {
       kind: "ok",
@@ -204,7 +288,11 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
         checkConclusion: suites.value,
         latestCommentId: comments.value.id,
         latestCommentAuthor: comments.value.author,
-        latestReviewId: reviews.value,
+        latestBotCommentId: comments.value.botId,
+        latestReviewId: reviews.value.id,
+        ...(reviews.value.approved ? { approved: true } : {}),
+        ...(headAuthorLogin ? { headAuthorLogin } : {}),
+        ...(reviewSlotBusy !== undefined ? { reviewSlotBusy } : {}),
         state: pull.value.state,
         mergeableState: pull.value.mergeableState ?? entry.fingerprint?.mergeableState ?? null,
       },
@@ -327,7 +415,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
           }
           if (!token) break;
 
-          entry ??= { polledAt: 0, sinceIso: now.toISOString(), responses: new Map(), fingerprint: null };
+          entry ??= { polledAt: 0, sinceIso: now.toISOString(), responses: new Map(), fingerprint: null, changedAtMs: nowMs };
           entry.polledAt = nowMs;
           cache.set(cacheKey, entry);
           const fetched = await fetchFingerprint(token, ref, entry);
@@ -345,6 +433,7 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
             log.debug({ companyId, pullRequest: key }, "pull request monitor poll failed; will retry later");
             continue;
           }
+          if (JSON.stringify(entry.fingerprint) !== JSON.stringify(fetched.value)) entry.changedAtMs = nowMs;
           entry.fingerprint = fetched.value;
         }
 
@@ -366,23 +455,18 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
             continue;
           }
           let ownLogin: string | null = null;
-          if (changedFields.includes("comment")) {
+          if (changedFields.includes("comment") || changedFields.includes("head_sha")) {
             const commentToken = token ?? (await resolveToken(companyId));
             ownLogin = commentToken ? await resolveOwnLogin(commentToken, companyId) : null;
           }
-          const changed = actionableFingerprintChange(stored, current, { ownLogin });
+          const { actionable: changed } = evaluateFingerprintChange(stored, current, { ownLogin });
           if (changed.length === 0) {
             // Nothing worth a wake: advance the baseline so the same data does not come up again.
-            await writeBaseline(monitor.issueId, key, {
-              ...current,
-              latestCommentId: current.latestCommentId ?? stored.latestCommentId,
-              latestCommentAuthor:
-                current.latestCommentId === null ? stored.latestCommentAuthor ?? null : current.latestCommentAuthor,
-              latestReviewId: current.latestReviewId ?? stored.latestReviewId,
-              mergeableState: current.mergeableState ?? stored.mergeableState,
-            });
+            await writeBaseline(monitor.issueId, key, advanceBaseline(stored, current, { ownLogin }));
             continue;
           }
+          // Coalesce a burst: wait until the PR has been quiet for the settle window.
+          if (!changed.some((field) => IMMEDIATE_FIELDS.has(field)) && nowMs - (entry?.changedAtMs ?? 0) < settleMs) continue;
           const retryKey = `${monitor.issueId}|${key}`;
           if (wakeRetryAt.has(retryKey)) continue;
           try {

@@ -19069,6 +19069,28 @@ export function heartbeatService(
     );
     if (!cwd) return;
     try {
+      // A ticket and its children share one workspace. A live run there may sit
+      // between its own fetch and branch update, so landing its ref here would
+      // merge and delete it underneath that run.
+      const [liveSibling] = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.status, "running"),
+            ne(heartbeatRuns.id, run.id),
+            sql`${heartbeatRuns.contextSnapshot} -> 'paperclipWorkspace' ->> 'cwd' = ${cwd}`,
+          ),
+        )
+        .limit(1);
+      if (liveSibling) {
+        logger.warn(
+          { runId: run.id, liveRunId: liveSibling.id },
+          "kept stranded SSH import under its ref; another run is live in the workspace",
+        );
+        return;
+      }
       const { landed, skipped } = await fastForwardStrandedSshImports({ localDir: cwd });
       for (const item of landed) {
         logger.warn(

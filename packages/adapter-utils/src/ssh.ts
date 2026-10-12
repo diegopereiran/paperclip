@@ -1871,6 +1871,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
     remoteDir,
     baselineSnapshot: input.baselineSnapshot,
     restoreGitHistory: input.restoreGitHistory,
+    importedRef: input.importedRef,
     onProgress: input.onProgress,
     progressLabel: "workspace",
     hasProjectRepositories: repositories.length > 0,
@@ -1883,6 +1884,8 @@ async function restoreWorkspaceRootFromSsh(input: {
   remoteDir: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  // Ref to import the run's commit into; see sshImportedRefForRun.
+  importedRef?: string;
   onProgress?: RuntimeProgressSink;
   progressLabel: string;
   hasProjectRepositories?: boolean;

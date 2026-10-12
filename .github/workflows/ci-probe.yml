@@ -1,0 +1,11 @@
+name: CI probe
+on:
+  push:
+    branches: [ci-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "dispatch works"

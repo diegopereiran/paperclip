@@ -22,7 +22,8 @@ import { recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution } from 
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -488,6 +489,8 @@ async function spawnOrphanedProcessGroup() {
     descendantPid,
   };
 }
+
+const execFileAsync = promisify(execFile);
 
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
@@ -3188,6 +3191,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     // Terminal run cleanup releases the checkout lock so future checkout 409s only mean a live owner exists.
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
+  });
+
+  it("fast-forwards the workspace branch to a stranded SSH import when the run is lost", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-lost-ssh-import-"));
+    try {
+      const git = async (...args: string[]) =>
+        (await execFileAsync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: root })).stdout.trim();
+      await git("init", "-q", "-b", "ticket");
+      await fs.writeFile(path.join(root, "a.txt"), "base\n");
+      await git("add", "a.txt");
+      await git("commit", "-q", "-m", "base");
+      const baseHead = await git("rev-parse", "HEAD");
+      await fs.writeFile(path.join(root, "b.txt"), "run\n");
+      await git("add", "b.txt");
+      await git("commit", "-q", "-m", "run work");
+      const runHead = await git("rev-parse", "HEAD");
+      await git("update-ref", "refs/paperclip/ssh-sync/imported/lost-run", runHead);
+      await git("reset", "-q", "--hard", baseHead);
+
+      await seedRunFixture({
+        agentStatus: "idle",
+        processPid: 999_999_999,
+        contextSnapshot: { paperclipWorkspace: { cwd: root } },
+      });
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(1);
+
+      expect(await git("rev-parse", "HEAD")).toBe(runHead);
+      expect(await git("for-each-ref", "refs/paperclip/ssh-sync/imported")).toBe("");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("requires reconciliation for a lost monitor whose provider outcomes are unknown", async () => {

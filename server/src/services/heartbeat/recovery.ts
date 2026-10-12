@@ -36,6 +36,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { fastForwardStrandedSshImports } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   claimNativeRestartRecoveries,
   closeIdleWarmNativeSessionsForRestart,
@@ -1930,6 +1931,30 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  async function landStrandedSshImports(run: typeof heartbeatRuns.$inferSelect) {
+    const cwd = readNonEmptyString(
+      parseObject(parseObject(run.contextSnapshot).paperclipWorkspace).cwd,
+    );
+    if (!cwd) return;
+    try {
+      const { landed, skipped } = await fastForwardStrandedSshImports({ localDir: cwd });
+      for (const item of landed) {
+        logger.warn(
+          { runId: run.id, ref: item.ref, head: item.head },
+          "fast-forwarded workspace branch to stranded SSH import",
+        );
+      }
+      for (const item of skipped) {
+        logger.warn(
+          { runId: run.id, ref: item.ref, head: item.head, reason: item.reason },
+          "kept stranded SSH import under its ref; branch not moved",
+        );
+      }
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to land stranded SSH import");
+    }
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -2376,6 +2401,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!failureWrite.updated || !failureWrite.run) continue;
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
+      // A run lost mid sync-back leaves its commit only under the imported
+      // ref; land it on the branch as a clean exit would. Fast-forward only.
+      await landStrandedSshImports(run);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,

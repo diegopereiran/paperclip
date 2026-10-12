@@ -44,24 +44,6 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
-  /** Board user whose membership in companyId has the viewer role. */
-  viewer?: boolean;
-}
-
-/**
- * Viewers follow issue work but do not read run transcripts. Returns the
- * event to send to this subscriber, or null to skip it.
- */
-export function liveEventForSubscriber<T extends { type: string; payload?: unknown }>(
-  subscriber: { viewer?: boolean },
-  event: T,
-): T | null {
-  if (!subscriber.viewer) return event;
-  if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") return null;
-  if (event.type === "heartbeat.run.progress" && event.payload && typeof event.payload === "object") {
-    return { ...event, payload: { ...event.payload, lastAssistantSnippet: null, currentToolName: null } };
-  }
-  return event;
 }
 
 /** Cloud-proxied browser identity resolved from trusted x-paperclip-cloud-* headers. */
@@ -198,7 +180,7 @@ async function authorizeUpgrade(
         .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
         .then((rows) => rows[0] ?? null),
       db
-        .select({ companyId: companyMemberships.companyId, membershipRole: companyMemberships.membershipRole })
+        .select({ companyId: companyMemberships.companyId })
         .from(companyMemberships)
         .where(
           and(
@@ -209,14 +191,13 @@ async function authorizeUpgrade(
         ),
     ]);
 
-    const companyMembership = memberships.find((row) => row.companyId === companyId);
-    if (!roleRow && !companyMembership) return null;
+    const hasCompanyMembership = memberships.some((row) => row.companyId === companyId);
+    if (!roleRow && !hasCompanyMembership) return null;
 
     return {
       companyId,
       actorType: "board",
       actorId: userId,
-      viewer: !roleRow && companyMembership?.membershipRole === "viewer",
     };
   }
 
@@ -281,9 +262,7 @@ export function setupLiveEventsWebSocketServer(
 
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      const delivered = liveEventForSubscriber(context, event);
-      if (!delivered) return;
-      socket.send(JSON.stringify(delivered));
+      socket.send(JSON.stringify(event));
     });
 
     cleanupByClient.set(socket, unsubscribe);

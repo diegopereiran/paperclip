@@ -2794,6 +2794,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("keeps a stranded SSH import under its ref while another run is live in the same workspace", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-lost-ssh-import-live-"));
+    try {
+      const git = async (...args: string[]) =>
+        (await execFileAsync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: root })).stdout.trim();
+      await git("init", "-q", "-b", "ticket");
+      await fs.writeFile(path.join(root, "a.txt"), "base\n");
+      await git("add", "a.txt");
+      await git("commit", "-q", "-m", "base");
+      const baseHead = await git("rev-parse", "HEAD");
+      await fs.writeFile(path.join(root, "b.txt"), "run\n");
+      await git("add", "b.txt");
+      await git("commit", "-q", "-m", "run work");
+      const runHead = await git("rev-parse", "HEAD");
+      await git("update-ref", "refs/paperclip/ssh-sync/imported/live-run", runHead);
+      await git("reset", "-q", "--hard", baseHead);
+
+      const { companyId, agentId } = await seedRunFixture({
+        agentStatus: "idle",
+        processPid: 999_999_999,
+        contextSnapshot: { paperclipWorkspace: { cwd: root } },
+      });
+      // A second run of the same workspace is mid sync-back and recently active.
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { paperclipWorkspace: { cwd: root } },
+        nextEventSeq: 1,
+        startedAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 60_000 });
+      expect(result.reaped).toBe(1);
+
+      expect(await git("rev-parse", "HEAD")).toBe(baseHead);
+      expect(await git("for-each-ref", "--format=%(refname)", "refs/paperclip/ssh-sync/imported")).toBe(
+        "refs/paperclip/ssh-sync/imported/live-run",
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("requires reconciliation for a lost monitor whose provider outcomes are unknown", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",

@@ -79,7 +79,10 @@ describe("claude_local stable prompt bundle", () => {
     >;
     const call = calls.at(-1)!;
     const args = call[3];
-    const flag = (name: string) => args[args.indexOf(name) + 1];
+    const flag = (name: string) => {
+      const i = args.indexOf(name);
+      return i < 0 ? undefined : args[i + 1];
+    };
     const systemPromptFile = flag("--append-system-prompt-file");
     return {
       instructionsFilePath,
@@ -109,8 +112,9 @@ describe("claude_local stable prompt bundle", () => {
   it("keeps the directive in the prompt on a resumed session", async () => {
     const sessionId = "11111111-1111-4111-8111-111111111111";
     const first = await run({ runId: "run-dddd" });
-    const key = path.basename(path.dirname(first.addDir));
+    const key = path.basename(first.addDir!);
     const result = await run({ runId: "run-eeee", resumeSessionId: sessionId, promptBundleKey: key });
+    expect(result.args).toContain("--resume");
     expect(result.prompt).toContain(`were loaded from ${result.instructionsFilePath}.`);
   });
 });

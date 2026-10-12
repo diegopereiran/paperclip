@@ -2570,14 +2570,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await git("add", "b.txt");
       await git("commit", "-q", "-m", "run work");
       const runHead = await git("rev-parse", "HEAD");
-      await git("update-ref", "refs/paperclip/ssh-sync/imported/lost-run", runHead);
       await git("reset", "-q", "--hard", baseHead);
 
-      await seedRunFixture({
+      const { runId } = await seedRunFixture({
         agentStatus: "idle",
         processPid: 999_999_999,
         contextSnapshot: { paperclipWorkspace: { cwd: root } },
       });
+      await git("update-ref", `refs/paperclip/ssh-sync/imported/${runId}`, runHead);
       const heartbeat = heartbeatService(db);
       const result = await heartbeat.reapOrphanedRuns();
       expect(result.reaped).toBe(1);
@@ -2603,14 +2603,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await git("add", "b.txt");
       await git("commit", "-q", "-m", "run work");
       const runHead = await git("rev-parse", "HEAD");
-      await git("update-ref", "refs/paperclip/ssh-sync/imported/live-run", runHead);
       await git("reset", "-q", "--hard", baseHead);
 
-      const { companyId, agentId } = await seedRunFixture({
+      const { companyId, agentId, runId } = await seedRunFixture({
         agentStatus: "idle",
         processPid: 999_999_999,
         contextSnapshot: { paperclipWorkspace: { cwd: root } },
       });
+      await git("update-ref", `refs/paperclip/ssh-sync/imported/${runId}`, runHead);
       // A second run of the same workspace is mid sync-back and recently active.
       await db.insert(heartbeatRuns).values({
         id: randomUUID(),
@@ -2630,8 +2630,49 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       expect(await git("rev-parse", "HEAD")).toBe(baseHead);
       expect(await git("for-each-ref", "--format=%(refname)", "refs/paperclip/ssh-sync/imported")).toBe(
-        "refs/paperclip/ssh-sync/imported/live-run",
+        `refs/paperclip/ssh-sync/imported/${runId}`,
       );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not land another ticket's stranded SSH import on the lost run's branch", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-lost-ssh-import-cross-"));
+    try {
+      const repo = path.join(root, "repo");
+      const worktreeA = path.join(root, "ticket-a");
+      const worktreeB = path.join(root, "ticket-b");
+      await fs.mkdir(repo);
+      const git = async (cwd: string, ...args: string[]) =>
+        (await execFileAsync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd })).stdout.trim();
+      await git(repo, "init", "-q", "-b", "main");
+      await fs.writeFile(path.join(repo, "a.txt"), "base\n");
+      await git(repo, "add", "a.txt");
+      await git(repo, "commit", "-q", "-m", "base");
+      const baseHead = await git(repo, "rev-parse", "HEAD");
+      // Execution workspaces are worktrees of one repo, so they share refs/.
+      await git(repo, "worktree", "add", "-q", "-b", "ticket-a", worktreeA);
+      await git(repo, "worktree", "add", "-q", "-b", "ticket-b", worktreeB);
+      await fs.writeFile(path.join(worktreeB, "b.txt"), "ticket b\n");
+      await git(worktreeB, "add", "b.txt");
+      await git(worktreeB, "commit", "-q", "-m", "ticket b work");
+      const ticketBHead = await git(worktreeB, "rev-parse", "HEAD");
+      const ticketBRef = `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
+      await git(worktreeB, "update-ref", ticketBRef, ticketBHead);
+      await git(worktreeB, "reset", "-q", "--hard", baseHead);
+
+      await seedRunFixture({
+        agentStatus: "idle",
+        processPid: 999_999_999,
+        contextSnapshot: { paperclipWorkspace: { cwd: worktreeA } },
+      });
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(1);
+
+      expect(await git(worktreeA, "rev-parse", "HEAD")).toBe(baseHead);
+      expect(await git(repo, "rev-parse", ticketBRef)).toBe(ticketBHead);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

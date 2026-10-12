@@ -1,5 +1,5 @@
 import path from "node:path";
-import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
+import { GIT_ARCHIVE_EXCLUDES, sshImportedRefForRun } from "./git-workspace-sync.js";
 import {
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
@@ -134,6 +134,8 @@ export async function prepareRemoteManagedRuntime(input: {
       )
     : baseWorkspaceRemoteDir;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  // Named after the run so a reaper can land this run's import, and only it.
+  const importedRef = sshImportedRefForRun(input.runId) ?? undefined;
 
   const preparedWorkspace = syncWorkspace
     ? await prepareWorkspaceForSshExecution({
@@ -178,6 +180,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        importedRef,
         onProgress: input.onProgress,
       });
     }
@@ -245,6 +248,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          importedRef,
           onProgress,
         });
       }

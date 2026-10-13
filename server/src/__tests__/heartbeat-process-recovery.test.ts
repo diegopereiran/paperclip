@@ -7609,7 +7609,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         expect(wakes.map((wake) => wake.status), JSON.stringify(wakes)).not.toContain("deferred_issue_execution");
         expect(wakes.some((wake) => wake.runId)).toBe(true);
       });
-      expect(agentId).not.toBe(nextAgentId);
+      // Finishing normally schedules no follow-up for the agent that handed off.
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
     } finally {
       await heartbeat.drainActiveRunExecutions();
     }

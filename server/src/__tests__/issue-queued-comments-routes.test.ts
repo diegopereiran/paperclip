@@ -276,6 +276,54 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       .rejects.toMatchObject({ status: 403, details: { code: "agent_run_cancelled" } });
   });
 
+  async function seedReassignmentFixture() {
+    const seeded = await seedQueue();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({ id: otherAgentId, companyId: seeded.companyId, name: "Reviewer", role: "qa",
+      status: "idle", adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, seeded.runId));
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    testProcesses.set(seeded.runId, child);
+    runningProcesses.set(seeded.runId, { child, graceSec: 1, processGroupId: null });
+    return { ...seeded, otherAgentId };
+  }
+
+  it("lets a run that reassigns its own issue finish instead of cancelling it", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ assigneeAgentId: otherAgentId, status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true,
+      selfHandoffReason: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("issueMutationStopId");
+    // The new assignee's wake is kept (parked behind the finishing run); the
+    // heartbeat-level test in heartbeat-process-recovery.test.ts shows it starts
+    // when that run ends.
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0].status).toBe("deferred_issue_execution");
+    });
+  });
+
+  it("still cancels the active run when a different run reassigns the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner");
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`)
+      .send({ assigneeAgentId: otherAgentId, status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
+  });
+
   it.each(["questions", "verdicts"] as const)("rejects admitted %s responses after Stop revokes the run", async kind => {
     const seeded = await seedQueue();
     const service = issueThreadInteractionService(db);

@@ -976,7 +976,9 @@ describeEmbeddedPostgres(
         .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user", comment: "Ready for human review" });
       expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
       const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
-      expect(stopped).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+      // The caller is that run, so the hand-off lets it finish instead of cancelling it.
+      expect(stopped).toMatchObject({ status: "running", errorCode: null, resultJson: { selfHandoff: true } });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, directRun.id));
       const returned = await request(board).patch(`/api/issues/${created.body.id}`)
         .send({ status: "backlog", assigneeAgentId: fixture.agents.lowTrust.id, assigneeUserId: null });
       expect(returned.status, JSON.stringify(returned.body)).toBe(200);

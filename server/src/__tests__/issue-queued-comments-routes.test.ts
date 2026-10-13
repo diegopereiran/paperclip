@@ -44,6 +44,37 @@ vi.mock("../services/native-runtime/native-session-executor.js", async (importOr
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
 
+// When set, the runner-goal service reports an active, pausable goal on the
+// issue so the terminalization stop path is reachable without a live runner.
+const runnerGoalStub = vi.hoisted(() => ({ active: false, paused: false }));
+vi.mock("../services/runner-goals.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/runner-goals.js")>();
+  return {
+    ...actual,
+    runnerGoalService: (...args: Parameters<typeof actual.runnerGoalService>) => {
+      const real = actual.runnerGoalService(...args);
+      if (!runnerGoalStub.active) return real;
+      return {
+        ...real,
+        projection: async (...p: Parameters<typeof real.projection>) => {
+          const base = await real.projection(...p);
+          if (!base) return base;
+          return {
+            ...base,
+            pendingAction: null,
+            revision: 1,
+            capability: { ...base.capability, actions: ["pause"] },
+            goal: { objective: "ship", status: runnerGoalStub.paused ? "paused" : "active", tokenBudget: null,
+              tokensUsed: 0, elapsedSeconds: 0, iterations: 0, lastReason: null, createdAt: null, updatedAt: null,
+              completedAt: null, workingNow: false },
+          };
+        },
+        act: async () => { runnerGoalStub.paused = true; return {} as any; },
+      };
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -65,6 +96,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   const testProcesses = new Map<string, ChildProcess>();
 
   afterEach(async () => {
+    runnerGoalStub.active = false;
+    runnerGoalStub.paused = false;
     for (const [id, child] of testProcesses) {
       runningProcesses.delete(id);
       child.kill();
@@ -310,6 +343,40 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(wakes).toHaveLength(1);
       expect(wakes[0].status).toBe("deferred_issue_execution");
     });
+    // A run that handed off keeps write authority until it exits (decision on
+    // the parent ticket): its closing comment posts and the wake stays parked.
+    const commented = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Handing this to the reviewer." });
+    expect(commented.status, JSON.stringify(commented.body)).toBeGreaterThanOrEqual(200);
+    expect(commented.status).toBeLessThan(300);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(after.status).toBe("running");
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+    expect(parked.map(w => w.status)).toEqual(["deferred_issue_execution"]);
+  });
+
+  it("lets a run that closes its own issue finish instead of cancelling it", async () => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = true;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true, selfHandoffReason: "issue_terminalized" });
+    expect(run.resultJson).not.toHaveProperty("issueMutationStopId");
+  });
+
+  it("still cancels the active run when a different actor closes the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = true;
+    const res = await request(app(seeded.companyId, "queue-owner")).patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_terminalized" });
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
   });
 
   it("still cancels the active run when a different run reassigns the issue", async () => {

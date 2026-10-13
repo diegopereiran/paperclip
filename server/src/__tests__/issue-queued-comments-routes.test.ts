@@ -391,6 +391,46 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(run.resultJson).not.toHaveProperty("selfHandoff");
   });
 
+  it.each([false, true])("lets a run that cancels its own issue finish (runner goal %s)", async goal => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = goal;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true });
+    expect(run.resultJson).not.toHaveProperty("executionCancellation");
+  });
+
+  it("lets a run that reassigns and cancels its own issue finish", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`)
+      .send({ assigneeAgentId: otherAgentId, status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true, selfHandoffReason: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("executionCancellation");
+    // The issue ends cancelled, so the new assignee gets no wake to park.
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+    expect(wakes).toHaveLength(0);
+  });
+
+  it("still cancels the active run when a different actor cancels the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    const res = await request(app(seeded.companyId, "queue-owner")).patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("cancelled");
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
+  });
+
   it.each(["questions", "verdicts"] as const)("rejects admitted %s responses after Stop revokes the run", async kind => {
     const seeded = await seedQueue();
     const service = issueThreadInteractionService(db);

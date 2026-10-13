@@ -6903,7 +6903,8 @@ export function issueRoutes(
     const [marked] = await db
       .update(heartbeatRuns)
       .set({
-        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${marker}::jsonb`,
+        // Existing keys win, so a second guard on the same request keeps the first reason.
+        resultJson: sql`${marker}::jsonb || coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`,
       })
       .where(
         and(
@@ -13891,7 +13892,8 @@ export function issueRoutes(
       let cancelledStatusRunId: string | null = null;
       if (
         runToCancelForCancelledStatus &&
-        runToCancelForCancelledStatus.id !== interruptedRunId
+        runToCancelForCancelledStatus.id !== interruptedRunId &&
+        !(await markSelfHandoffRun(runToCancelForCancelledStatus, actor, "issue_terminalized"))
       ) {
         try {
           const cancelled = await heartbeat.cancelRun(

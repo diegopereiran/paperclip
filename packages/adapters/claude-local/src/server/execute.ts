@@ -1053,7 +1053,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               sessionDisplayId: parsedStream.sessionId,
             }
           : {}),
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !parsedStream.sessionId),
       };
     }
 
@@ -1147,7 +1147,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !parsedStream.sessionId),
       };
     }
 

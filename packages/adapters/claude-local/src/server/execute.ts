@@ -1,4 +1,5 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import path from "node:path";
@@ -65,7 +66,8 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   claudeModelUsageTotals,
-  parseClaudeStreamJson,
+  claudeModelReceipts,
+  parseClaudeStreamJson, createClaudeStreamParser,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeLoginUrl,
@@ -955,6 +957,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    const consumeAccounting = createClaudeStreamParser();
+    const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+      const parsed = consumeAccounting(stdout);
+      return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
+        provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
+          usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
+    });
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -964,7 +974,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
+      onLog: accountingLog,
       runLogTail: paperclipBridge?.runLogTail,
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
@@ -973,6 +983,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       localProcessSandbox,
     });
+    await accountingLog.flush();
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
@@ -1005,6 +1016,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
+        usageComplete: parsedStream.resultJson !== null,
+        usage: parsedStream.usage ?? undefined,
+        usageBasis: "per_run",
+        provider: "anthropic",
+        biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
+        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        billingType,
+        costUsd: parsedStream.costUsd,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
@@ -1066,6 +1086,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
+        usageComplete: parsedStream.resultJson !== null,
+        usage: parsedStream.usage ?? undefined,
+        usageBasis: "per_run",
+        provider: "anthropic",
+        biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
+        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        billingType,
+        costUsd: parsedStream.costUsd,
         errorMessage: fallbackErrorMessage,
         errorCode,
         errorFamily,
@@ -1235,19 +1264,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
+      usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,
+      usageByModel: claudeModelReceipts(parsed.modelUsage),
       ...(usageBasis ? { usageBasis } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
       biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
-      model: parsedStream.model || asString(parsed.model, model),
+      model: Object.keys(parseObject(parsed.modelUsage)).length > 1 ? "mixed" : parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd,
       resultJson: mergedResultJson,

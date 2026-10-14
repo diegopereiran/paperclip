@@ -2,11 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveLedgerCostStatus } from "../services/heartbeat.js";
 import { execute } from "@paperclipai/adapter-claude-local/server";
 
 const SESSION_ID = "55555555-5555-4555-8555-555555555555";
 
-async function writeStreamClaudeCommand(commandPath: string, options: { withResult: boolean }): Promise<void> {
+async function writeStreamClaudeCommand(commandPath: string, options: { withResult: boolean; hang?: boolean }): Promise<void> {
   const script = `#!/usr/bin/env node
 require("node:fs").readFileSync(0, "utf8");
 const emit = (event) => console.log(JSON.stringify(event));
@@ -16,19 +17,21 @@ emit({ type: "assistant", session_id: ${JSON.stringify(SESSION_ID)}, message: { 
 ${options.withResult
     ? `emit({ type: "result", subtype: "success", session_id: ${JSON.stringify(SESSION_ID)}, result: "done", usage: { input_tokens: 30, cache_read_input_tokens: 0, output_tokens: 12 } });
 process.exit(0);`
-    : "process.exit(143);"}
+    : options.hang
+      ? "setInterval(() => {}, 1000);"
+      : "process.exit(143);"}
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
 }
 
-async function runStream(withResult: boolean) {
+async function runStream(withResult: boolean, options: { hang?: boolean } = {}) {
   const onUsage = vi.fn();
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-cut-stream-"));
   const workspace = path.join(root, "workspace");
   const commandPath = path.join(root, "claude");
   await fs.mkdir(workspace, { recursive: true });
-  await writeStreamClaudeCommand(commandPath, { withResult });
+  await writeStreamClaudeCommand(commandPath, { withResult, hang: options.hang });
   const previousHome = process.env.HOME;
   process.env.HOME = root;
   try {
@@ -36,7 +39,7 @@ async function runStream(withResult: boolean) {
       runId: "run-cut-stream",
       agent: { id: "agent-1", companyId: "company-1", name: "Claude", adapterType: "claude_local", adapterConfig: {} },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-      config: { engine: "cli", command: commandPath, cwd: workspace },
+      config: { engine: "cli", command: commandPath, cwd: workspace, ...(options.hang ? { timeoutSec: 2, graceSec: 1 } : {}) },
       context: {},
       onLog: async () => {},
       onUsage,
@@ -57,8 +60,21 @@ describe("claude execute stream accounting", () => {
     expect(result.usage).toEqual({ inputTokens: 30, cachedInputTokens: 0, outputTokens: 12 });
     expect(result.usageComplete).toBe(false);
     expect(onUsage.mock.calls.at(-1)![0]).toMatchObject({ complete: false, costUsd: null });
-    expect(onUsage.mock.calls.at(-1)![0].costStatus).not.toBe("estimated");
+    // The adapter reports no price; the ledger turns that into "unpriced".
     expect(result.costUsd ?? null).toBeNull();
+    expect(result.clearSession).toBeFalsy();
+    expect(resolveLedgerCostStatus({ costUsd: result.costUsd, inputTokens: 30, cachedInputTokens: 0, outputTokens: 12 })).toBe("unpriced");
+  });
+
+  it("keeps the session id and partial usage when the run times out before result", async () => {
+    const { result } = await runStream(false, { hang: true });
+    expect(result.timedOut).toBe(true);
+    expect(result.sessionId).toBe(SESSION_ID);
+    expect(result.sessionParams).toMatchObject({ sessionId: SESSION_ID });
+    expect(result.sessionDisplayId).toBe(SESSION_ID);
+    expect(result.usage).toEqual({ inputTokens: 30, cachedInputTokens: 0, outputTokens: 12 });
+    expect(result.usageComplete).toBe(false);
+    expect(result.clearSession).toBeFalsy();
   });
 
   it("keeps the session id and complete usage when the stream ends with result", async () => {

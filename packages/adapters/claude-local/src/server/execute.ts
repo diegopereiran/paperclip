@@ -999,6 +999,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return { proc, parsedStream, parsed };
   };
 
+  const buildSessionParams = (sessionId: string | null): Record<string, unknown> | null =>
+    sessionId
+      ? ({
+        sessionId,
+        cwd,
+        promptBundleKey: promptBundle.bundleKey,
+        mcpServerIdentity: runtimeMcpIdentity,
+        ...(executionTargetIsRemote
+          ? {
+              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+            }
+          : {}),
+        ...(workspaceId ? { workspaceId } : {}),
+        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+      } as Record<string, unknown>)
+      : null;
+
   const toAdapterResult = (
     attempt: {
       proc: RunProcessResult;
@@ -1037,6 +1055,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
+        ...(parsedStream.sessionId
+          ? {
+              sessionId: parsedStream.sessionId,
+              sessionParams: buildSessionParams(parsedStream.sessionId),
+              sessionDisplayId: parsedStream.sessionId,
+            }
+          : {}),
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
     }
@@ -1107,6 +1132,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: fallbackErrorMessage,
         errorCode,
         errorFamily,
+        ...(parsedStream.sessionId
+          ? {
+              sessionId: parsedStream.sessionId,
+              sessionParams: buildSessionParams(parsedStream.sessionId),
+              sessionDisplayId: parsedStream.sessionId,
+            }
+          : {}),
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
         resultJson: {
@@ -1168,22 +1200,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // calls clearTaskSessions on the next heartbeat. See RED-978 / RED-976.
     const shouldDropSessionForPoison = poisonedPreviousMessageId;
     const resolvedSessionId = shouldDropSessionForPoison ? null : rawResolvedSessionId;
-    const resolvedSessionParams = resolvedSessionId
-      ? ({
-        sessionId: resolvedSessionId,
-        cwd,
-        promptBundleKey: promptBundle.bundleKey,
-        mcpServerIdentity: runtimeMcpIdentity,
-        ...(executionTargetIsRemote
-          ? {
-              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-            }
-          : {}),
-        ...(workspaceId ? { workspaceId } : {}),
-        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-      } as Record<string, unknown>)
-      : null;
+    const resolvedSessionParams = buildSessionParams(resolvedSessionId);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;

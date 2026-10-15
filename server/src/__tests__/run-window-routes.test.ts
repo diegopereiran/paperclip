@@ -199,7 +199,9 @@ describeEmbeddedPostgres("run window export route", () => {
     expect(res.body.window.from).toBe("2026-09-30T11:00:00.000Z");
     expect(res.body.window.to).toBe("2026-10-01T11:00:00.000Z");
     expect(res.body.rows.map((r: { runId: string }) => r.runId)).toEqual([s.o1]);
-    for (const bad of ["", "month=2026-13", "from=2026-10-02&to=2026-10-01", "month=2026-10&tz=Not/AZone", "month=2026-10&cursor=junk", "month=2026-10&limit=0"]) {
+    for (const bad of ["", "month=2026-13", "from=2026-10-02&to=2026-10-01", "month=2026-10&tz=Not/AZone", "month=2026-10&cursor=junk", "month=2026-10&limit=0",
+      "month=2026-10&tz=%2B05:00", "month=2026-10&tz=-03:00", "month=2026-10&tz=5", "month=0000-01", "from=0000-01-01&to=2026-01-01",
+      `month=2026-10&cursor=${Buffer.from(JSON.stringify({ c: "1", i: randomUUID() })).toString("base64url")}`]) {
       expect((await get(app, s.companyId, bad)).status, bad).toBe(400);
     }
   });

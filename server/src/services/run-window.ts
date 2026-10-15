@@ -63,19 +63,25 @@ export type RunWindowResponse = {
 
 type ResolvedWindow = { tz: string; fromDate: string; toDate: string };
 
+// Postgres rejects year 0000 and years past 9999.
+const MIN_YEAR = 1;
+const MAX_MONTH_YEAR = 9998;
+
+const CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}(:\d{2})?)$/;
+
 function isValidDate(value: string) {
   if (!DATE_RE.test(value)) return false;
+  if (Number(value.slice(0, 4)) < MIN_YEAR) return false;
   const d = new Date(`${value}T00:00:00Z`);
   return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(value);
 }
 
+// IANA region names only. Intl also accepts offsets such as "+05:00", which Postgres reads as POSIX
+// (a positive offset is west of UTC), so an offset would silently shift the window.
+const IANA_TIME_ZONES = new Set<string>([...Intl.supportedValuesOf("timeZone"), "UTC", "Etc/UTC"]);
+
 function isValidTz(tz: string) {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
+  return IANA_TIME_ZONES.has(tz);
 }
 
 export function resolveRunWindowQuery(query: RunWindowQuery): ResolvedWindow {
@@ -86,7 +92,7 @@ export function resolveRunWindowQuery(query: RunWindowQuery): ResolvedWindow {
     const m = MONTH_RE.exec(query.month);
     const year = m ? Number(m[1]) : 0;
     const month = m ? Number(m[2]) : 0;
-    if (!m || month < 1 || month > 12) throw badRequest("month must be YYYY-MM");
+    if (!m || month < 1 || month > 12 || year < MIN_YEAR || year > MAX_MONTH_YEAR) throw badRequest("month must be YYYY-MM");
     const nextYear = month === 12 ? year + 1 : year;
     const nextMonth = month === 12 ? 1 : month + 1;
     const pad = (n: number) => String(n).padStart(2, "0");
@@ -119,6 +125,7 @@ function decodeCursor(raw: string): Cursor {
       typeof parsed.c === "string" &&
       typeof parsed.i === "string" &&
       UUID_RE.test(parsed.i) &&
+      CURSOR_TS_RE.test(parsed.c) &&
       !Number.isNaN(Date.parse(parsed.c))
     ) {
       return { c: parsed.c, i: parsed.i };

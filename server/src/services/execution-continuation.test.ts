@@ -168,11 +168,11 @@ const support = await getEmbeddedPostgresTestSupport();
       const oldIds = [randomUUID(), randomUUID()];
       const tailIds = Array.from({ length: 7 }, () => randomUUID());
       const priorRunId = randomUUID();
-      const own = (id: string, minute: number) => ({ id, companyId, issueId, authorType: "agent", authorAgentId: agentId,
+      const own = (id: string, minute: number) => ({ id, companyId, issueId, authorType: "agent" as const, authorAgentId: agentId,
         body: `old status ${id} `.repeat(50), createdAt: new Date(`2026-09-08T10:00:${minute}Z`) });
       await db.insert(issueComments).values([
         ...oldIds.map((id, i) => own(id, 10 + i)),
-        ...tailIds.map((id, i) => ({ id, companyId, issueId, authorType: "user", authorUserId: "local-board",
+        ...tailIds.map((id, i) => ({ id, companyId, issueId, authorType: "user" as const, authorUserId: "local-board",
           body: `tail ${i}`, createdAt: new Date(`2026-09-08T11:0${i}:00Z`) })),
       ]);
       const candidate = (previousContextRunId?: string) => buildExecutionContinuation({

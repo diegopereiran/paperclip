@@ -27,6 +27,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     expect(names).toContain("heartbeat_runs_company_ctx_issue_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_task_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
+    expect(names).toContain("heartbeat_runs_company_ctx_paperclip_issue_idx");
     expect(names).toContain("agent_wakeup_requests_company_payload_issue_idx");
 
     await sql.unsafe("SET enable_seqscan = off");
@@ -52,6 +53,27 @@ d("heartbeat context_snapshot expression index migration", () => {
     const taskKeyText = taskKeyPlan.map((r) => Object.values(r)[0]).join("\n");
     expect(taskKeyText).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
 
+    // Run secret redaction for an issue (valuesForIssue) ORs issueId with
+    // paperclipIssue.id. Without an index on the second arm the planner
+    // detoasts every run snapshot of the company on each issue read. An empty
+    // table plans any company_id index, so seed rows and use real planning.
+    await sql.unsafe("RESET enable_seqscan");
+    await sql.unsafe("INSERT INTO companies (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'redaction')");
+    await sql.unsafe("INSERT INTO agents (id, company_id, name) VALUES ('00000000-0000-0000-0000-0000000000a2', '00000000-0000-0000-0000-000000000002', 'redaction')");
+    await sql.unsafe(
+      "INSERT INTO heartbeat_runs (company_id, agent_id, context_snapshot) SELECT '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-0000000000a2', jsonb_build_object('issueId', 'issue-' || g, 'paperclipIssue', jsonb_build_object('id', 'issue-' || g)) FROM generate_series(1, 2000) g",
+    );
+    await sql.unsafe("ANALYZE heartbeat_runs");
+    const redactionPlan = await sql.unsafe(
+      "EXPLAIN SELECT context_snapshot -> 'paperclipSecretRedactions' FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000002' AND (context_snapshot ->> 'issueId' = 'issue-7' OR context_snapshot -> 'paperclipIssue' ->> 'id' = 'issue-7')",
+    );
+    const redactionText = redactionPlan.map((r) => Object.values(r)[0]).join("\n");
+    expect(redactionText).toContain("BitmapOr");
+    expect(redactionText).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+    expect(redactionText).toContain("heartbeat_runs_company_ctx_paperclip_issue_idx");
+    expect(redactionText).not.toContain("Seq Scan");
+    await sql.unsafe("SET enable_seqscan = off");
+
     const wakePlan = await sql.unsafe(
       "EXPLAIN SELECT id FROM agent_wakeup_requests WHERE company_id = '00000000-0000-0000-0000-000000000001' AND status = 'deferred_issue_execution' AND payload ->> 'issueId' = 'x' LIMIT 1",
     );
@@ -63,6 +85,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     for (const migration of [
       "./migrations/0209_heartbeat_context_snapshot_indexes.sql",
       "./migrations/0210_heartbeat_context_taskkey_index.sql",
+      "./migrations/0334_heartbeat_context_paperclip_issue_index.sql",
     ]) {
       const migrationSql = await readFile(
         fileURLToPath(new URL(migration, import.meta.url)),

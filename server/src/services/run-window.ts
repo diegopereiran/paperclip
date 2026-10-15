@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { sql } from "drizzle-orm";
 import { badRequest } from "../errors.js";
+import { costService } from "./costs.js";
 
 export const RUN_WINDOW_DEFAULT_TZ = "Pacific/Auckland";
 export const RUN_WINDOW_DEFAULT_LIMIT = 500;
@@ -35,6 +36,34 @@ export type RunWindowRow = {
 
 export type RunWindowPercentiles = { p50: number | null; p95: number | null };
 
+export type RunWindowClassCounts = { runCount: number; costCents: number; acceptedOutcomeCount: number };
+
+export type RunWindowClassRow = RunWindowClassCounts & {
+  /** `P1`..`P5`; the most severe when an issue has several; null when none. */
+  priority: string | null;
+  enhancement: boolean;
+  /** `XXS`..`XXL`; the largest when an issue has several; null when none. */
+  size: string | null;
+};
+
+export type RunWindowOutcomes = {
+  /** Issues whose accepted_outcome_at falls in the window. */
+  acceptedOutcomeCount: number;
+  /** Every cost event whose occurred_at falls in the window, in cents as stored. */
+  costCents: number;
+  /** costCents / acceptedOutcomeCount; null when the count is 0. */
+  costCentsPerAcceptedOutcome: number | null;
+  /** Exclusive attribution (costs.ts byProject); projectId null is Unattributed. Sums to costCents. */
+  costByProject: Array<{ projectId: string | null; costCents: number }>;
+  classes: {
+    definition: string;
+    /** One row per (priority, enhancement, size) combination that has any run, cost or accepted outcome. */
+    rows: RunWindowClassRow[];
+    /** Runs, cost and accepted outcomes with no issue or no P, enhancement or size label. */
+    unclassified: RunWindowClassCounts;
+  };
+};
+
 export type RunWindowResponse = {
   window: {
     tz: string;
@@ -57,6 +86,7 @@ export type RunWindowResponse = {
     durationSeconds: RunWindowPercentiles;
     wakeToFinishSeconds: RunWindowPercentiles;
   };
+  outcomes: RunWindowOutcomes;
   rows: RunWindowRow[];
   nextCursor: string | null;
 };
@@ -143,6 +173,118 @@ function num(value: unknown): number | null {
 }
 
 const iso = (value: unknown): string | null => (value === null || value === undefined ? null : new Date(value as string).toISOString());
+
+const SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL"];
+const PRIORITY_LABEL_RE = /^p([1-5])$/i;
+const SIZE_LABEL_RE = /^size\s*[:/-]?\s*(xxs|xs|s|m|l|xl|xxl)$/i;
+const ENHANCEMENT_LABEL_RE = /^enhancement$/i;
+
+type TicketClass = { priority: number | null; enhancement: boolean; size: number | null };
+
+/** Labels are matched by name, so the table works for every company without label ids. */
+function classifyLabels(names: string[]): TicketClass | null {
+  let priority: number | null = null;
+  let size: number | null = null;
+  let enhancement = false;
+  for (const raw of names) {
+    const name = raw.trim();
+    const p = PRIORITY_LABEL_RE.exec(name);
+    if (p) priority = priority === null ? Number(p[1]) : Math.min(priority, Number(p[1]));
+    const z = SIZE_LABEL_RE.exec(name);
+    if (z) size = Math.max(size ?? -1, SIZE_ORDER.indexOf(z[1]!.toUpperCase()));
+    if (ENHANCEMENT_LABEL_RE.test(name)) enhancement = true;
+  }
+  return priority === null && size === null && !enhancement ? null : { priority, enhancement, size };
+}
+
+async function getOutcomes(
+  db: Db,
+  companyId: string,
+  fromTs: string,
+  toTs: string,
+  inWindow: ReturnType<typeof sql>,
+  runIssueId: ReturnType<typeof sql>,
+): Promise<RunWindowOutcomes> {
+  const costRange = { from: new Date(fromTs), to: new Date(toTs), toExclusive: true };
+  const projectRows = await costService(db).byProject(companyId, costRange);
+  const costByProject = projectRows.map((r) => ({ projectId: r.projectId ?? null, costCents: Number(r.costCents) }));
+  const costCents = costByProject.reduce((a, r) => a + r.costCents, 0);
+
+  const runRes = await db.execute(sql`
+    SELECT ${runIssueId} AS issue_id, count(*)::int AS n FROM heartbeat_runs r WHERE ${inWindow} GROUP BY 1
+  `);
+  // Class cost: the event's own issue, else the issue of its run. Each event resolves to at most one issue.
+  const costRes = await db.execute(sql`
+    SELECT coalesce(ce.issue_id, ${runIssueId}) AS issue_id, sum(ce.cost_cents)::double precision AS cents
+    FROM cost_events ce
+    LEFT JOIN heartbeat_runs r ON r.id = ce.heartbeat_run_id AND r.company_id = ce.company_id
+    WHERE ce.company_id = ${companyId}::uuid AND ce.occurred_at >= ${fromTs}::timestamptz AND ce.occurred_at < ${toTs}::timestamptz
+    GROUP BY 1
+  `);
+  const acceptedRes = await db.execute(sql`
+    SELECT i.id AS issue_id FROM issues i
+    WHERE i.company_id = ${companyId}::uuid AND i.accepted_outcome_at >= ${fromTs}::timestamptz AND i.accepted_outcome_at < ${toTs}::timestamptz
+  `);
+  const labelRes = await db.execute(sql`
+    SELECT il.issue_id AS issue_id, l.name AS name
+    FROM issue_labels il JOIN labels l ON l.id = il.label_id
+    WHERE il.company_id = ${companyId}::uuid AND l.company_id = ${companyId}::uuid
+      AND btrim(l.name) ~* '^(p[1-5]|enhancement|size[[:space:]]*[:/-]?[[:space:]]*(xxs|xs|s|m|l|xl|xxl))$'
+  `);
+
+  const namesByIssue = new Map<string, string[]>();
+  for (const row of labelRes as unknown as Array<{ issue_id: string; name: string }>) {
+    const list = namesByIssue.get(row.issue_id) ?? [];
+    list.push(row.name);
+    namesByIssue.set(row.issue_id, list);
+  }
+
+  const unclassified: RunWindowClassCounts = { runCount: 0, costCents: 0, acceptedOutcomeCount: 0 };
+  const classes = new Map<string, { cls: TicketClass; counts: RunWindowClassCounts }>();
+  const add = (issueId: string | null, field: keyof RunWindowClassCounts, amount: number) => {
+    const cls = issueId ? classifyLabels(namesByIssue.get(issueId) ?? []) : null;
+    if (!cls) {
+      unclassified[field] += amount;
+      return;
+    }
+    const key = `${cls.priority}|${cls.enhancement}|${cls.size}`;
+    let entry = classes.get(key);
+    if (!entry) {
+      entry = { cls, counts: { runCount: 0, costCents: 0, acceptedOutcomeCount: 0 } };
+      classes.set(key, entry);
+    }
+    entry.counts[field] += amount;
+  };
+  for (const row of runRes as unknown as Array<{ issue_id: string | null; n: number }>) add(row.issue_id, "runCount", Number(row.n));
+  for (const row of costRes as unknown as Array<{ issue_id: string | null; cents: number }>) add(row.issue_id, "costCents", Number(row.cents));
+  const accepted = acceptedRes as unknown as Array<{ issue_id: string }>;
+  for (const row of accepted) add(row.issue_id, "acceptedOutcomeCount", 1);
+
+  const rows: RunWindowClassRow[] = [...classes.values()]
+    .sort((a, b) =>
+      (a.cls.priority ?? 9) - (b.cls.priority ?? 9) ||
+      Number(b.cls.enhancement) - Number(a.cls.enhancement) ||
+      (a.cls.size ?? 99) - (b.cls.size ?? 99))
+    .map(({ cls, counts }) => ({
+      priority: cls.priority === null ? null : `P${cls.priority}`,
+      enhancement: cls.enhancement,
+      size: cls.size === null ? null : SIZE_ORDER[cls.size]!,
+      ...counts,
+    }));
+
+  return {
+    acceptedOutcomeCount: accepted.length,
+    costCents,
+    costCentsPerAcceptedOutcome: accepted.length > 0 ? costCents / accepted.length : null,
+    costByProject,
+    classes: {
+      definition:
+        "one row per (P label, enhancement label, size label) found by label name; several P labels count as the most severe, several size labels as the largest; cost is attributed through the event's issue, else its run's issue",
+      rows,
+      unclassified,
+    },
+  };
+}
 
 /** Read-only, calendar-window export of run telemetry. No prompts, logs, results or context. */
 export async function getRunWindow(db: Db, companyId: string, query: RunWindowQuery): Promise<RunWindowResponse> {
@@ -240,6 +382,7 @@ export async function getRunWindow(db: Db, companyId: string, query: RunWindowQu
       finishedAt: iso(r.finished_at),
     };
   });
+  const outcomes = await getOutcomes(db, companyId, fromTs, toTs, inWindow, runIssueId);
   const last = page[page.length - 1];
   return {
     window: {
@@ -260,6 +403,7 @@ export async function getRunWindow(db: Db, companyId: string, query: RunWindowQu
       durationSeconds: { p50: num(agg.dur_p50), p95: num(agg.dur_p95) },
       wakeToFinishSeconds: { p50: num(agg.w2f_p50), p95: num(agg.w2f_p95) },
     },
+    outcomes,
     rows,
     nextCursor: hasMore && last ? encodeCursor({ c: last.created_at_text as string, i: last.id as string }) : null,
   };

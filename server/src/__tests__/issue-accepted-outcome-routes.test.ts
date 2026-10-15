@@ -65,4 +65,15 @@ describePostgres("issue accepted-outcome fields", () => {
     const bad = await request(app()).patch(`/api/issues/${issueId}`).send({ acceptedOutcomeAt: "yesterday" });
     expect(bad.status).toBe(400);
   });
+
+  it("bounds accepted_outcome_ref: rejects blank and 501 characters, accepts 500", async () => {
+    for (const bad of ["   ", "\t\n ", "", "x".repeat(501), ` ${"x".repeat(501)} `]) {
+      const res = await request(app()).patch(`/api/issues/${issueId}`).send({ acceptedOutcomeRef: bad });
+      expect(res.status, JSON.stringify(bad.slice(0, 20))).toBe(400);
+    }
+    const ok = await request(app()).patch(`/api/issues/${issueId}`).send({ acceptedOutcomeRef: `  ${"x".repeat(500)}  ` });
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    expect(ok.body.acceptedOutcomeRef).toBe("x".repeat(500));
+    await request(app()).patch(`/api/issues/${issueId}`).send({ acceptedOutcomeRef: null });
+  });
 });

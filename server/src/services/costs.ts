@@ -684,7 +684,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       range = resolveCostDateRange(range);
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
-      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+      if (range?.to) conditions.push((range.toExclusive ? lt : lte)(costEvents.occurredAt, range.to));
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
 

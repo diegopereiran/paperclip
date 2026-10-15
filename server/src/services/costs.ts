@@ -472,10 +472,12 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
 
     byProject: async (companyId: string, range?: CostDateRange) => {
       const issueIdAsText = sql<string>`${issues.id}::text`;
+      // Only runs linked to exactly one distinct project attribute their events;
+      // multi-project and unlinked runs fall into the unattributed row so no event is counted twice.
       const runProjectLinks = db
-        .selectDistinctOn([activityLog.runId, issues.projectId], {
-          runId: activityLog.runId,
-          projectId: issues.projectId,
+        .select({
+          runId: sql<string>`${activityLog.runId}`.as("link_run_id"),
+          projectId: sql<string>`(array_agg(${issues.projectId}))[1]`.as("link_project_id"),
         })
         .from(activityLog)
         .innerJoin(
@@ -493,7 +495,8 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             isNotNull(issues.projectId),
           ),
         )
-        .orderBy(activityLog.runId, issues.projectId, desc(activityLog.createdAt))
+        .groupBy(activityLog.runId)
+        .having(sql`count(distinct ${issues.projectId}) = 1`)
         .as("run_project_links");
 
       const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
@@ -506,7 +509,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       return db
         .select({
           projectId: effectiveProjectId,
-          projectName: projects.name,
+          projectName: sql<string | null>`coalesce(${projects.name}, 'Unattributed')`,
           costCents: costCentsExpr,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
@@ -514,8 +517,8 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         })
         .from(costEvents)
         .leftJoin(runProjectLinks, eq(costEvents.heartbeatRunId, runProjectLinks.runId))
-        .innerJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
-        .where(and(...conditions, sql`${effectiveProjectId} is not null`))
+        .leftJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
+        .where(and(...conditions))
         .groupBy(effectiveProjectId, projects.name)
         .orderBy(desc(costCentsExpr));
     },

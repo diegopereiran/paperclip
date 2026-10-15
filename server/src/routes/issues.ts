@@ -12906,6 +12906,7 @@ export function issueRoutes(
         interrupt: interruptRequested,
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
+        acceptedOutcomeAt: acceptedOutcomeAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -13108,7 +13109,8 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         (Object.keys(updateFields).length > 0 ||
           reviewRequest !== undefined ||
-          hiddenAtRaw !== undefined);
+          hiddenAtRaw !== undefined ||
+          acceptedOutcomeAtRaw !== undefined);
 
       if (
         isAgentWorkUpdate &&
@@ -13185,6 +13187,9 @@ export function issueRoutes(
 
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+      }
+      if (acceptedOutcomeAtRaw !== undefined) {
+        updateFields.acceptedOutcomeAt = acceptedOutcomeAtRaw ? new Date(acceptedOutcomeAtRaw) : null;
       }
       if (
         commentBody &&

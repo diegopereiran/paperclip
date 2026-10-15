@@ -933,6 +933,8 @@ export interface Issue {
   completedAt: Date | null;
   cancelledAt: Date | null;
   hiddenAt: Date | null;
+  acceptedOutcomeAt?: Date | null;
+  acceptedOutcomeRef?: string | null;
   sourceTrust?: SourceTrustMetadata | null;
   labelIds?: string[];
   labels?: IssueLabel[];

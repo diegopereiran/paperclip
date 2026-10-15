@@ -59,8 +59,23 @@ export interface ExecutionContinuationEnvelope {
     result: unknown;
   }>;
   unresolvedInteractionIds: string[];
+  /**
+   * Present only when the opt-in wake-context candidate trimmed `messages`.
+   * Elided messages stay readable through the task comments API by id.
+   */
+  contextCandidate?: {
+    version: string;
+    elidedMessages: Array<{
+      id: string;
+      authorType: string;
+      authorId: string | null;
+      createdAt: string;
+      bodyBytes: number;
+    }>;
+    fetchHint: string;
+  };
   coverage: {
-    kind: "full_task_history" | "task_history_delta";
+    kind: "full_task_history" | "task_history_delta" | "task_history_trimmed";
     baseRunId?: string;
     throughCommentId: string | null;
     summaryThroughCommentId: null;

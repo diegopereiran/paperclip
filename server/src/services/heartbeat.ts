@@ -65,6 +65,7 @@ import { executionFailureRetryCount, executionRetryAttemptCount, accountingForSc
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import { isWakeContextCandidateEnabled } from "./wake-context-candidate.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { normalizeAgentEnvPatterns, runWithAgentEnvPolicy } from "@paperclipai/adapter-utils/agent-env-policy";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot, fastForwardStrandedSshImport } from "@paperclipai/adapter-utils/git-workspace-sync";
@@ -21337,6 +21338,7 @@ export function heartbeatService(
               previousContextRunId: taskSession?.lastRunId,
               summary: safeContinuationSummary?.body ?? null,
               exposeLowTrustRaw,
+              wakeContextCandidate: isWakeContextCandidateEnabled(agent.runtimeConfig),
             })
           : null;
       context.executionContinuation = executionContinuation;

@@ -15,6 +15,7 @@ import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
+import { applyWakeContextCandidate } from "./wake-context-candidate.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 
 export class StaleExecutionContinuationError extends Error {
@@ -152,6 +153,8 @@ export async function buildExecutionContinuation(input: {
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
+  /** Opt-in wake-context candidate; false or absent keeps the baseline envelope. */
+  wakeContextCandidate?: boolean;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -420,7 +423,7 @@ export async function buildExecutionContinuation(input: {
     (hasConversationContinuationPolicy(lastTerminal.result) ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);
-  return {
+  const envelope: ExecutionContinuationEnvelope = {
     ...(interruptedRunId ? { interruptedRunId } : {}),
     ...(resumeDelta ? { resumeDelta } : {}),
     recoveryOutcomes: reconciliations
@@ -469,4 +472,5 @@ export async function buildExecutionContinuation(input: {
       summaryThroughCommentId: null,
     },
   };
+  return input.wakeContextCandidate ? applyWakeContextCandidate(envelope, { ownAgentId: input.agentId }) : envelope;
 }

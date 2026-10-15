@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
+import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -210,6 +211,8 @@ describeEmbeddedPostgres("run window export route", () => {
     await db.insert(heartbeatRuns).values(
       Array.from({ length: 25 }, () => ({ companyId: s.companyId, agentId: s.agentId, status: "succeeded", createdAt: same })),
     );
+    // Production rows come from now() with microsecond precision; the cursor must round-trip it.
+    await db.execute(sql`UPDATE heartbeat_runs SET created_at = created_at + (random() * 999)::int * interval '1 microsecond' WHERE created_at = ${same.toISOString()}::timestamptz`);
     const app = createApp(db, boardActor([s.companyId]));
     const ids: string[] = [];
     let cursor: string | null = null;
@@ -269,6 +272,8 @@ describeEmbeddedPostgres("run window export route", () => {
     const app = createApp(db, { type: "board", userId: "mallory", companyIds: [other], source: "session", isInstanceAdmin: false });
     expect((await get(app, s.companyId, "month=2026-09")).status).toBe(403);
     const noMembership = createApp(db, { type: "board", userId: "mallory", companyIds: [s.companyId], source: "session", isInstanceAdmin: false });
-    expect((await get(noMembership, s.companyId, "month=2026-09")).status).toBe(403);
+    const denied = await get(noMembership, s.companyId, "month=2026-09");
+    expect(denied.status).toBe(403);
+    expect(denied.body.error).toBe("Run telemetry is outside this actor's authorization boundary");
   });
 });

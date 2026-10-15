@@ -10,6 +10,8 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 export interface CostDateRange {
   from?: Date;
   to?: Date;
+  /** Treat `to` as an exclusive bound (occurred_at < to) instead of inclusive. */
+  toExclusive?: boolean;
 }
 
 const METERED_BILLING_TYPE = "metered_api";
@@ -502,7 +504,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
-      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+      if (range?.to) conditions.push((range.toExclusive ? lt : lte)(costEvents.occurredAt, range.to));
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
 

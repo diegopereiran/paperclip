@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Fork: pinned to the upstream workflow commit this queue's tree last passed on
+    # (fork PR #54, run 38719078069). Upstream master's pr-trusted.yml moves ahead of the
+    # release and calls scripts this tree does not have (docker-compose-secrets.test.mjs,
+    # 95692b778). Move the pin at the next rebase onto a release.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@72ae60074269a2bde9c91d1b7a28f4cd0ae5264b

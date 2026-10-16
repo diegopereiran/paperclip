@@ -304,6 +304,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
+  carryOverEchoedMonitorPullRequests,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
@@ -3944,7 +3945,7 @@ export function issueRoutes(
     projectId: string | null,
     requestedPolicy: unknown,
   ) {
-    const policy = normalizeIssueExecutionPolicy(requestedPolicy);
+    const policy = normalizeIssueExecutionPolicy(requestedPolicy, { source: "client" });
     if (req.actor.type !== "agent") return policy;
     const trust = await resolveAgentTrustForIssue(
       { agentId: req.actor.agentId, runId: req.actor.runId },
@@ -6883,6 +6884,38 @@ export function issueRoutes(
     }
 
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
+  }
+
+  /**
+   * When the caller is the run being stopped (an agent handing off or closing
+   * its own issue), cancelling would kill the adapter before it reports usage
+   * and session. Record the hand-off on the run and let it exit normally.
+   * Returns false for every other run, which keeps the stop.
+   */
+  async function markSelfHandoffRun(
+    run: { id: string; companyId: string; agentId: string },
+    actor: { agentId?: string | null; runId?: string | null },
+    reason: "issue_reassigned" | "issue_terminalized",
+  ) {
+    if (!actor.agentId || !actor.runId) return false;
+    if (run.id !== actor.runId || run.agentId !== actor.agentId) return false;
+    const marker = JSON.stringify({ selfHandoff: true, selfHandoffReason: reason });
+    const [marked] = await db
+      .update(heartbeatRuns)
+      .set({
+        // Existing keys win, so a second guard on the same request keeps the first reason.
+        resultJson: sql`${marker}::jsonb || coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+    return Boolean(marked);
   }
 
   type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -12393,7 +12426,7 @@ export function issueRoutes(
       const normalizedChildren = [];
       for (const child of requestedChildren) {
         const executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(child.executionPolicy),
+          normalizeIssueExecutionPolicy(child.executionPolicy, { source: "client" }),
           actor.actorType,
         );
         await assertCanManageIssueMonitor(
@@ -12873,6 +12906,7 @@ export function issueRoutes(
         interrupt: interruptRequested,
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
+        acceptedOutcomeAt: acceptedOutcomeAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -13075,7 +13109,8 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         (Object.keys(updateFields).length > 0 ||
           reviewRequest !== undefined ||
-          hiddenAtRaw !== undefined);
+          hiddenAtRaw !== undefined ||
+          acceptedOutcomeAtRaw !== undefined);
 
       if (
         isAgentWorkUpdate &&
@@ -13153,6 +13188,9 @@ export function issueRoutes(
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
       }
+      if (acceptedOutcomeAtRaw !== undefined) {
+        updateFields.acceptedOutcomeAt = acceptedOutcomeAtRaw ? new Date(acceptedOutcomeAtRaw) : null;
+      }
       if (
         commentBody &&
         effectiveMoveToTodoRequested &&
@@ -13178,7 +13216,11 @@ export function issueRoutes(
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          carryOverEchoedMonitorPullRequests({
+            requested: req.body.executionPolicy,
+            normalized: normalizeIssueExecutionPolicy(req.body.executionPolicy, { source: "client" }),
+            stored: existing.executionPolicy ?? null,
+          }),
           actor.actorType,
         );
       }
@@ -13464,7 +13506,13 @@ export function issueRoutes(
           agentId: existing.assigneeAgentId,
         });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        if (runToStopForReassignment) {
+        if (
+          runToStopForReassignment &&
+          (await markSelfHandoffRun(runToStopForReassignment, actor, "issue_reassigned"))
+        ) {
+          // The caller is handing off its own run: it finishes normally and
+          // reports usage and session instead of being cancelled mid-turn.
+        } else if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -13505,7 +13553,13 @@ export function issueRoutes(
         const runToStopForTerminalization = goalStopAction
           ? await resolveActiveIssueRun(existing)
           : null;
-        if (goalStopAction && runToStopForTerminalization) {
+        if (
+          goalStopAction &&
+          runToStopForTerminalization &&
+          (await markSelfHandoffRun(runToStopForTerminalization, actor, "issue_terminalized"))
+        ) {
+          // Same as reassignment: a run closing its own issue ends normally.
+        } else if (goalStopAction && runToStopForTerminalization) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
@@ -13843,7 +13897,8 @@ export function issueRoutes(
       let cancelledStatusRunId: string | null = null;
       if (
         runToCancelForCancelledStatus &&
-        runToCancelForCancelledStatus.id !== interruptedRunId
+        runToCancelForCancelledStatus.id !== interruptedRunId &&
+        !(await markSelfHandoffRun(runToCancelForCancelledStatus, actor, "issue_terminalized"))
       ) {
         try {
           const cancelled = await heartbeat.cancelRun(

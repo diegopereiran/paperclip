@@ -244,7 +244,7 @@ test("release verify workflow covers the same split test surface as stable PR ve
   assert.match(buildJob, /persist-credentials: false/);
   assert.doesNotMatch(buildJob, /cache: pnpm/);
 
-  for (const group of ["general-server-without-chat", "general-chat", "general-workspaces-a", "general-workspaces-b"]) {
+  for (const group of ["general-server-without-chat", "general-chat", "general-workspaces-a", "general-workspaces-b", "general-workspaces-c"]) {
     assert.match(verifyWorkflow, new RegExp(`group: ${group}`));
   }
   for (const [group, count] of [["general-server-without-chat", 10], ["general-chat", 3]]) {

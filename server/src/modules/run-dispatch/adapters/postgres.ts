@@ -536,6 +536,23 @@ export function createPostgresRunDispatchAdapter(
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
+    // A card addressed to a non-assignee wakes its addressee once; without this
+    // bypass that run is cancelled as reassigned and the card is never handled.
+    const pendingInteractionId =
+      issue && wakeReason === "interaction_pending" ? readNonEmptyString(context.interactionId) : null;
+    const isPendingInteractionAddressee = pendingInteractionId
+      ? await dbOrTx
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.id, pendingInteractionId),
+          eq(issueThreadInteractions.companyId, input.companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.status, "pending"),
+          eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+        ))
+        .then((rows) => rows.length > 0)
+      : false;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence =
       interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
@@ -605,6 +622,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isPendingInteractionAddressee,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,

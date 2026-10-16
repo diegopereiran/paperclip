@@ -2085,3 +2085,91 @@ describe("review round circuit breaker", () => {
     });
   });
 });
+
+describe("normalizeIssueExecutionPolicy monitor pull requests", () => {
+  const nextCheckAt = "2026-04-11T12:30:00.000Z";
+  const monitorPolicy = (monitor: Record<string, unknown>) => ({ monitor: { nextCheckAt, ...monitor } });
+
+  it("derives lower-cased coordinates from externalRef and notes before redaction", () => {
+    const policy = normalizeIssueExecutionPolicy(
+      monitorPolicy({
+        externalRef: "https://github.com/Open/Repo/pull/12?token=secret",
+        notes: "Also waiting on Other/Thing#7",
+      }),
+    );
+    expect(policy?.monitor?.externalRef).toBe("[redacted]");
+    expect(policy?.monitor?.pullRequests).toEqual([
+      { owner: "open", repo: "repo", number: 12 },
+      { owner: "other", repo: "thing", number: 7 },
+    ]);
+  });
+
+  it("never stores the URL or its query string", () => {
+    const policy = normalizeIssueExecutionPolicy(
+      monitorPolicy({ externalRef: "https://github.com/o/r/pull/3?token=secret-value" }),
+    );
+    expect(JSON.stringify(policy)).not.toContain("secret-value");
+    expect(JSON.stringify(policy)).not.toContain("github.com");
+  });
+
+  it("omits the field when nothing references a pull request", () => {
+    const policy = normalizeIssueExecutionPolicy(
+      monitorPolicy({ externalRef: "https://github.com/o/r/issues/3", notes: "check the deploy" }),
+    );
+    expect(policy?.monitor).not.toHaveProperty("pullRequests");
+  });
+
+  it("ignores client-supplied pullRequests when the input comes from a client", () => {
+    const policy = normalizeIssueExecutionPolicy(
+      monitorPolicy({ pullRequests: [{ owner: "evil", repo: "repo", number: 1 }], externalRef: "o/r#2" }),
+      { source: "client" },
+    );
+    expect(policy?.monitor?.pullRequests).toEqual([{ owner: "o", repo: "r", number: 2 }]);
+  });
+
+  it("keeps stored pullRequests when a stored policy is normalized again", () => {
+    const stored = normalizeIssueExecutionPolicy(monitorPolicy({ externalRef: "o/r#2" }));
+    const reread = normalizeIssueExecutionPolicy(JSON.parse(JSON.stringify(stored)));
+    expect(reread?.monitor?.pullRequests).toEqual([{ owner: "o", repo: "r", number: 2 }]);
+    expect(JSON.stringify(reread?.monitor)).toBe(JSON.stringify(stored?.monitor));
+  });
+
+  it("drops malformed stored pullRequests", () => {
+    const reread = normalizeIssueExecutionPolicy(
+      monitorPolicy({
+        externalRef: "[redacted]",
+        pullRequests: [{ owner: "o", repo: "r", number: -1 }, { owner: "o", repo: "r", number: 4, url: "https://x" }],
+      }),
+    );
+    expect(reread?.monitor?.pullRequests).toEqual([{ owner: "o", repo: "r", number: 4 }]);
+  });
+
+  describe("pullRequestState", () => {
+    const fingerprint = {
+      headSha: "abc",
+      checkConclusion: "success",
+      latestCommentId: 5,
+      latestReviewId: null,
+      state: "open",
+      mergeableState: "clean",
+    };
+
+    it("keeps a stored fingerprint and drops malformed entries", () => {
+      const reread = normalizeIssueExecutionPolicy(
+        monitorPolicy({
+          externalRef: "o/r#2",
+          pullRequestState: { "o/r#2": fingerprint, "bad key": fingerprint, "o/r#3": { state: "nope" } },
+        }),
+      );
+      expect(reread?.monitor?.pullRequestState).toEqual({ "o/r#2": fingerprint });
+    });
+
+    it("ignores a client-supplied fingerprint so a rescheduled monitor takes a new baseline", () => {
+      const policy = normalizeIssueExecutionPolicy(
+        monitorPolicy({ externalRef: "o/r#2", pullRequestState: { "o/r#2": fingerprint } }),
+        { source: "client" },
+      );
+      expect(policy?.monitor).not.toHaveProperty("pullRequestState");
+    });
+  });
+});

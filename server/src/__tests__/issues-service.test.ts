@@ -4139,6 +4139,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(workspaceOperations);
+    await db.delete(heartbeatRuns);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -4748,6 +4749,119 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("keeps a blocker pending after another issue's finalize while the blocker's run is alive", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+    const childRunId = randomUUID();
+    await db
+      .insert(heartbeatRuns)
+      .values({ id: childRunId, companyId, agentId: assigneeAgentId, status: "running" });
+    const parentRunId = randomUUID();
+    await db
+      .insert(heartbeatRuns)
+      .values({ id: parentRunId, companyId, agentId: assigneeAgentId, status: "running" });
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      heartbeatRunId: childRunId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: dependentId,
+      heartbeatRunId: parentRunId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:05.000Z"),
+    });
+
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      heartbeatRunId: childRunId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({ id: dependentId, blockerIssueIds: [blockerId] }),
+    ]);
+  });
+
+  it.each(["failed", "succeeded"] as const)(
+    "releases a blocker on another issue's finalize once the blocker's run is %s",
+    async (runStatus) => {
+      const {
+        companyId,
+        executionWorkspaceId,
+        blockerId,
+        dependentId,
+        assigneeAgentId,
+      } = await seedSharedWorkspaceDependency();
+      const childRunId = randomUUID();
+      const parentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values([
+        { id: childRunId, companyId, agentId: assigneeAgentId, status: runStatus },
+        { id: parentRunId, companyId, agentId: assigneeAgentId, status: "running" },
+      ]);
+
+      await db.insert(workspaceOperations).values([
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerId,
+          heartbeatRunId: childRunId,
+          phase: "worktree_prepare",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:00:00.000Z"),
+        },
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerId,
+          heartbeatRunId: childRunId,
+          phase: "workspace_finalize",
+          status: "failed",
+          startedAt: new Date("2026-05-23T22:05:00.000Z"),
+        },
+        {
+          companyId,
+          executionWorkspaceId,
+          issueId: dependentId,
+          heartbeatRunId: parentRunId,
+          phase: "workspace_finalize",
+          status: "succeeded",
+          startedAt: new Date("2026-05-23T22:10:00.000Z"),
+        },
+      ]);
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, blockerIssueIds: [blockerId] }),
+      ]);
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+      });
+    },
+  );
+
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -4933,6 +5047,112 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
           reason: "not_done",
         }],
       },
+    });
+  });
+
+  it("defers the parent wake while a done child's workspace run has not finalized", async () => {
+    const { companyId, executionWorkspaceId, blockerId: childId, dependentId: parentId, assigneeAgentId } =
+      await seedSharedWorkspaceDependency();
+    await db.update(issues).set({ parentId }).where(eq(issues.id, childId));
+
+    // The child's run prepared the workspace and set the issue done mid-run;
+    // sync-back has not landed, so the parent must not be woken yet.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+
+    // A failed finalize keeps the barrier closed.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+
+    // Once sync-back lands the same call returns the parent.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
+      id: parentId,
+      assigneeAgentId,
+      childIssueIds: [childId],
+    });
+  });
+
+  it("defers the parent wake while the child's run has not finalized, even after the parent's own finalize on the shared workspace", async () => {
+    const { companyId, executionWorkspaceId, blockerId: childId, dependentId: parentId, assigneeAgentId } =
+      await seedSharedWorkspaceDependency();
+    await db.update(issues).set({ parentId }).where(eq(issues.id, childId));
+
+    // The reopened child's run starts on the shared workspace and sets the
+    // child done mid-run; its sync-back has not landed yet.
+    const childRunId = randomUUID();
+    await db
+      .insert(heartbeatRuns)
+      .values({ id: childRunId, companyId, agentId: assigneeAgentId, status: "running" });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      heartbeatRunId: childRunId,
+      phase: "workspace_config_freshness",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:30:00.000Z"),
+    });
+    // Meanwhile a run on the parent finalizes the same workspace. That
+    // sync-back does not carry the child's commits.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: parentId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:31:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+
+    // Once the child's own sync-back lands, the parent is wakeable.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: childId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:35:00.000Z"),
+    });
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
+      id: parentId,
+      assigneeAgentId,
+      childIssueIds: [childId],
+    });
+  });
+
+  it("wakes the parent at once when the done child's workspace has nothing to finalize", async () => {
+    const { blockerId: childId, dependentId: parentId, assigneeAgentId } =
+      await seedSharedWorkspaceDependency();
+    await db.update(issues).set({ parentId }).where(eq(issues.id, childId));
+
+    // No workspace operations recorded for the child's workspace: a local run
+    // without a pending sync-back is not delayed.
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
+      id: parentId,
+      assigneeAgentId,
+      childIssueIds: [childId],
     });
   });
 

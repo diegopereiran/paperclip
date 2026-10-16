@@ -98,10 +98,12 @@ test("a route/authz suite never leaks into the general-server shards", () => {
   }
 });
 
-test("shard flags are rejected for the workspaces-b group", () => {
-  const result = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "3"]);
-  assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
-});
+for (const group of ["general-workspaces-b", "general-workspaces-c"]) {
+  test(`shard flags are rejected for the ${group} group`, () => {
+    const result = dryRun(["--mode", "general", "--group", group, "--shard-index", "0", "--shard-count", "3"]);
+    assert.notEqual(result.status, 0, `${group} must not accept shard flags`);
+  });
+}
 
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
   const shards = [0, 1].map((index) =>

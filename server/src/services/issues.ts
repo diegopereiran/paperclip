@@ -2437,6 +2437,7 @@ async function listPendingFinalizeBlockerIssueIds(
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
     })
     .from(workspaceOperations)
     .where(
@@ -2451,13 +2452,14 @@ async function listPendingFinalizeBlockerIssueIds(
 
   const latestAttributedByBlockerWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    { phase: string; status: string; startedAt: Date; heartbeatRunId: string | null }
   >();
   const latestUnattributedByWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    { phase: string; status: string; startedAt: Date; heartbeatRunId: string | null }
   >();
   const latestSuccessfulFinalizeByWorkspace = new Map<string, Date>();
+  const latestUnattributedSuccessfulFinalizeByWorkspace = new Map<string, Date>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
     if (row.phase === "workspace_finalize" && row.status === "succeeded") {
@@ -2470,6 +2472,18 @@ async function listPendingFinalizeBlockerIssueIds(
           row.startedAt,
         );
       }
+      if (!row.issueId) {
+        const currentUnattributed =
+          latestUnattributedSuccessfulFinalizeByWorkspace.get(
+            row.executionWorkspaceId,
+          );
+        if (!currentUnattributed || row.startedAt > currentUnattributed) {
+          latestUnattributedSuccessfulFinalizeByWorkspace.set(
+            row.executionWorkspaceId,
+            row.startedAt,
+          );
+        }
+      }
     }
     if (row.issueId) {
       const key = `${row.issueId}:${row.executionWorkspaceId}`;
@@ -2480,6 +2494,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -2491,6 +2506,7 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
   }
@@ -2503,11 +2519,25 @@ async function listPendingFinalizeBlockerIssueIds(
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded")
       continue;
-    const laterSuccessfulFinalize = latestSuccessfulFinalizeByWorkspace.get(
+    const unattributedFinalize =
+      latestUnattributedSuccessfulFinalizeByWorkspace.get(
+        pair.executionWorkspaceId,
+      );
+    if (unattributedFinalize && unattributedFinalize > latest.startedAt)
+      continue;
+    // Another issue's finalize on a shared workspace does not carry this
+    // blocker's sync-back while the blocker's run is alive; it releases the
+    // blocker only once that run is terminal or missing and cannot finalize.
+    const laterFinalize = latestSuccessfulFinalizeByWorkspace.get(
       pair.executionWorkspaceId,
     );
-    if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
-      continue;
+    if (laterFinalize && laterFinalize > latest.startedAt) {
+      if (
+        !latest.heartbeatRunId ||
+        (await heartbeatRunIsTerminalOrMissing(dbOrTx, latest.heartbeatRunId))
+      )
+        continue;
+    }
     pending.add(pair.blockerIssueId);
   }
 
@@ -4921,6 +4951,8 @@ const issueListSelect = {
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
   hiddenAt: issues.hiddenAt,
+  acceptedOutcomeAt: issues.acceptedOutcomeAt,
+  acceptedOutcomeRef: issues.acceptedOutcomeRef,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
 };
@@ -9206,6 +9238,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
           updatedAt: issues.updatedAt,
+          executionWorkspaceId: issues.executionWorkspaceId,
         })
         .from(issues)
         .where(
@@ -9223,6 +9256,28 @@ export function issueService(db: Db) {
       ) {
         return null;
       }
+
+      // Workspace-finalize barrier, same check as the dependency readiness
+      // gate: a done child whose run has not recorded a successful
+      // workspace_finalize may still have commits that only reach the local
+      // worktree at sync-back, so the parent must not read the workspace yet.
+      // The post-finalize reconciler sends the deferred wake.
+      const pendingFinalizeChildIssueIds =
+        await listPendingFinalizeBlockerIssueIds(
+          db,
+          parent.companyId,
+          children.flatMap((child) =>
+            child.status === "done" && child.executionWorkspaceId
+              ? [
+                  {
+                    blockerIssueId: child.id,
+                    executionWorkspaceId: child.executionWorkspaceId,
+                  },
+                ]
+              : [],
+          ),
+        );
+      if (pendingFinalizeChildIssueIds.size > 0) return null;
 
       const childIdsForSummaries = children
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
@@ -9253,7 +9308,7 @@ export function issueService(db: Db) {
       }
       const childIssueSummaries: ChildIssueCompletionSummary[] = children
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
-        .map((child) => ({
+        .map(({ executionWorkspaceId: _executionWorkspaceId, ...child }) => ({
           ...child,
           summary: truncateInlineSummary(
             child.id === completedChildResult?.issueId

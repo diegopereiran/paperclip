@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -1027,6 +1027,66 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 
+  it("hides a failed run only after a newer run of the same agent on the same issue or task", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATK");
+    const taskIssueId = await insertIssue({ companyId, identifier: "ATK-1", title: "Task-keyed", status: "in_progress" });
+    const issueKeyedId = await insertIssue({ companyId, identifier: "ATK-2", title: "Issue-keyed", status: "in_progress" });
+    const otherIssueId = await insertIssue({ companyId, identifier: "ATK-3", title: "Other work", status: "in_progress" });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const laterAt = new Date("2026-07-09T12:01:00.000Z");
+    const taskKeyedFailureId = randomUUID();
+    const issueKeyedFailureId = randomUUID();
+    const unkeyedHiddenFailureId = randomUUID();
+    const unkeyedKeptFailureId = randomUUID();
+    const failureIds = [taskKeyedFailureId, issueKeyedFailureId, unkeyedHiddenFailureId, unkeyedKeptFailureId];
+    const sameMillisecondRunId = randomUUID();
+    const run = (id: string, agentId: string, status: string, contextSnapshot: Record<string, unknown>, at: Date) => ({
+      id, companyId, agentId, invocationSource: "automation", status, contextSnapshot,
+      createdAt: at, updatedAt: at, finishedAt: at, ...(status === "failed" ? { error: "adapter failed" } : {}),
+    });
+
+    await db.insert(heartbeatRuns).values([
+      run(taskKeyedFailureId, workerId, "failed", { taskId: taskIssueId }, failedAt),
+      run(issueKeyedFailureId, workerId, "failed", { issueId: issueKeyedId }, failedAt),
+      run(unkeyedHiddenFailureId, workerId, "failed", {}, failedAt),
+      run(unkeyedKeptFailureId, reviewerId, "failed", {}, failedAt),
+      // Hides the task-keyed failure: same agent, same task.
+      run(randomUUID(), workerId, "succeeded", { taskId: taskIssueId }, laterAt),
+      // Hides the worker's key-less failure: same agent, no issue.
+      run(randomUUID(), workerId, "succeeded", { wakeReason: "timer" }, laterAt),
+      // None of these hide the issue-keyed failure or the reviewer's key-less one.
+      run(randomUUID(), reviewerId, "succeeded", { issueId: issueKeyedId }, laterAt),
+      run(randomUUID(), reviewerId, "succeeded", { issueId: otherIssueId }, laterAt),
+      run(randomUUID(), workerId, "succeeded", { issueId: otherIssueId }, laterAt),
+      run(randomUUID(), workerId, "succeeded", { issueId: otherIssueId, taskId: issueKeyedId }, laterAt),
+      run(randomUUID(), workerId, "succeeded", { issueId: "", taskId: issueKeyedId }, laterAt),
+      run(sameMillisecondRunId, workerId, "succeeded", { issueId: issueKeyedId }, failedAt),
+      run(randomUUID(), workerId, "succeeded", { issueId: issueKeyedId }, new Date("2026-07-09T11:59:00.000Z")),
+    ]);
+    // Stored times carry microseconds and a Date only milliseconds: a failed run is not its own newer run, and a run
+    // later within the same millisecond is not newer either.
+    await db.execute(sql`update heartbeat_runs set created_at = created_at + interval '400 microseconds'
+      where id in (${sql.join(failureIds.map((id) => sql`${id}::uuid`), sql`, `)})`);
+    await db.execute(sql`update heartbeat_runs set created_at = created_at + interval '600 microseconds'
+      where id = ${sameMillisecondRunId}::uuid`);
+    await db.insert(heartbeatRunEvents).values(
+      failureIds.map((runId) => ({
+        companyId,
+        runId,
+        agentId: runId === unkeyedKeptFailureId ? reviewerId : workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date("2026-07-09T12:00:01.000Z"),
+      })),
+    );
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort())
+      .toEqual([issueKeyedFailureId, unkeyedKeptFailureId].sort());
+  });
+
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
     const { companyId, workerId } = await seedCompany("ATE");
     const projectId = randomUUID();
@@ -1585,6 +1645,32 @@ describeEmbeddedPostgres("attention service", () => {
     expect(approvalItems[0]?.subject.metadata?.issueId).toBe(firstIssueId);
   });
 
+  it("does not add a review row when a linked pending approval is the only review path", async () => {
+    const { companyId, reviewerId } = await seedCompany("ATL");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATL-1",
+      title: "Merge the PR",
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+      executionState: pendingAgentExecutionState(reviewerId),
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Merge open-astro/AlpacaBridge#1" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.dedupKey === `approval:${approvalId}`)).toHaveLength(1);
+    expect(feed.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(0);
+  });
+
   it("hides snoozed attention rows until snoozedUntil passes, then returns them unconditionally", async () => {
     const { companyId } = await seedCompany("ATS");
     const approvalId = randomUUID();
@@ -1994,6 +2080,51 @@ describeEmbeddedPostgres("attention service", () => {
       decideBy: "2026-08-03",
       expiresAt: "2026-08-03T12:00:00.000Z",
     });
+  });
+
+  it("keeps non-decidable rows off the board route but in the full service feed", async () => {
+    const { companyId } = await seedCompany("ATX");
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      payload: { title: "Hire Writer" },
+    });
+    await insertIssue({
+      companyId,
+      identifier: "ATX-1",
+      title: "Needs board action",
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Approve the exception" },
+      blockedTransitionAt: new Date("2026-07-23T18:30:00.000Z"),
+    });
+    const board = {
+      type: "board",
+      source: "local_implicit",
+      userId: "board-user",
+      companyIds: [companyId],
+      isInstanceAdmin: false,
+    };
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = board;
+      next();
+    });
+    testApp.use("/api", attentionRoutes(db));
+    testApp.use(errorHandler);
+
+    const fullFeed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect([...new Set(fullFeed.items.map((item) => item.sourceKind))].sort())
+      .toEqual(["agent_error_alert", "approval", "blocker_attention"]);
+
+    const boardFeed = await request(testApp).get(`/api/companies/${companyId}/attention`).expect(200);
+    expect(boardFeed.body.items.map((item: { sourceKind: string }) => item.sourceKind)).toEqual(["approval"]);
+    expect(boardFeed.body.totalCount).toBe(1);
+    expect(boardFeed.body.countsBySourceKind.blocker_attention ?? 0).toBe(0);
+    expect(boardFeed.body.countsBySourceKind.agent_error_alert ?? 0).toBe(0);
   });
 
   it("serves the route for board users and rejects agent callers", async () => {

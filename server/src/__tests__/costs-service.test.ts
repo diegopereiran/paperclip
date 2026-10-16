@@ -548,6 +548,118 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byAgentModelRow?.costCents).toBe(4_000_000_000);
   });
 
+  it("attributes each cost event once so project rows plus unattributed reconcile to the company total", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const [projectA, projectB, projectC] = [randomUUID(), randomUUID(), randomUUID()];
+    const [issueA, issueB, issueC] = [randomUUID(), randomUUID(), randomUUID()];
+    const [singleRun, multiRun, unlinkedRun, ownProjectRun] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: projectA, companyId, name: "Project A", status: "active" },
+      { id: projectB, companyId, name: "Project B", status: "active" },
+      { id: projectC, companyId, name: "Project C", status: "active" },
+    ]);
+    await db.insert(issues).values(
+      [issueA, issueB, issueC].map((id, i) => ({
+        id,
+        companyId,
+        projectId: [projectA, projectB, projectC][i],
+        title: `Issue ${i}`,
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: i + 1,
+        identifier: `TST-${i + 1}`,
+      })),
+    );
+    await db.insert(heartbeatRuns).values(
+      [singleRun, multiRun, unlinkedRun, ownProjectRun].map((id) => ({
+        id,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+      })),
+    );
+    const link = (runId: string, issueId: string) => ({
+      companyId,
+      runId,
+      actorType: "agent" as const,
+      actorId: agentId,
+      agentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: {},
+    });
+    await db.insert(activityLog).values([
+      link(singleRun, issueA),
+      link(singleRun, issueA),
+      link(multiRun, issueB),
+      link(multiRun, issueC),
+      link(ownProjectRun, issueB),
+    ]);
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api" as const,
+      model: "gpt-5",
+      cachedInputTokens: 0,
+    };
+    const inWindow = new Date("2026-09-10T00:00:00.000Z");
+    await db.insert(costEvents).values([
+      { ...base, heartbeatRunId: singleRun, inputTokens: 100, outputTokens: 10, costCents: 5, occurredAt: inWindow },
+      { ...base, heartbeatRunId: multiRun, inputTokens: 200, outputTokens: 20, costCents: 7, occurredAt: inWindow },
+      { ...base, heartbeatRunId: unlinkedRun, inputTokens: 400, outputTokens: 40, costCents: 11, occurredAt: inWindow },
+      // own projectId wins over the run link (run is linked to project B)
+      { ...base, heartbeatRunId: ownProjectRun, projectId: projectC, inputTokens: 800, outputTokens: 80, costCents: 13, occurredAt: inWindow },
+      // outside the window: must not appear anywhere
+      { ...base, heartbeatRunId: multiRun, inputTokens: 1600, outputTokens: 160, costCents: 17, occurredAt: new Date("2026-10-01T00:00:00.000Z") },
+    ]);
+
+    const range = {
+      from: new Date("2026-09-01T00:00:00.000Z"),
+      to: new Date("2026-09-30T23:59:59.999Z"),
+    };
+    const rows = await costs.byProject(companyId, range);
+    const summary = await costs.summary(companyId, range);
+    const byId = new Map(rows.map((row) => [row.projectId, row]));
+
+    expect(byId.get(projectA)).toMatchObject({ costCents: 5, inputTokens: 100, outputTokens: 10 });
+    expect(byId.get(projectB)).toBeUndefined();
+    expect(byId.get(projectC)).toMatchObject({ costCents: 13, inputTokens: 800, outputTokens: 80 });
+    // two-project run (7) and unlinked run (11) land once in the unattributed row
+    expect(byId.get(null)).toMatchObject({
+      projectName: "Unattributed",
+      costCents: 18,
+      inputTokens: 600,
+      outputTokens: 60,
+    });
+    expect(rows.reduce((sum, row) => sum + row.costCents, 0)).toBe(summary.spendCents);
+    expect(summary.spendCents).toBe(36);
+    expect(rows.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0)).toBe(100 + 10 + 200 + 20 + 400 + 40 + 800 + 80);
+  });
+
   it("aggregates issue costs across recursive descendants only", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

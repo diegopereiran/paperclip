@@ -6836,6 +6836,25 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/runs/window",
+  tags: ["runs"],
+  summary: "Export heartbeat run telemetry for a calendar window",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      month: z.string().optional(),
+      from: z.string().optional(),
+      to: z.string().optional(),
+      tz: z.string().optional(),
+      cursor: z.string().optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/provider-traces",
   tags: ["runs"],
   summary: "List provider trace metadata for selected runs",

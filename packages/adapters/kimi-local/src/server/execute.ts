@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,7 +140,7 @@ function buildKimiHeadlessEnv(env: Record<string, string>): Record<string, strin
 
 function buildKimiRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildKimiHeadlessEnv(env) })).filter(
+    Object.entries(ensurePathInEnv(buildAgentProcessEnv(buildKimiHeadlessEnv(env)))).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -648,6 +649,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: true,
+        // This stream protocol has no usage receipt to recover after exit.
+        // Close collection with an explicitly unknown price, never a free run.
+        usageComplete: true,
+        costStatus: "unpriced",
+        usageBasis: "per_run",
+        provider: "moonshot",
+        biller: "moonshot",
+        model: model || null,
+        billingType,
+        costUsd: null,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: authMeta.requiresAuth
           ? "kimi_auth_required"
@@ -704,6 +715,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
+      usageComplete: true,
+      costStatus: "unpriced",
+      usageBasis: "per_run",
       errorMessage: failed ? fallbackErrorMessage : null,
       // Forward the transport-level error code from the run-disposition seam
       // first. A lost duplex control channel surfaces the typed

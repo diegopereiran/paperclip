@@ -1,8 +1,10 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
@@ -58,10 +60,11 @@ import {
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
+  resolveRunScratchManagedPath,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
-  parseCodexJsonl,
+  parseCodexJsonl, createCodexJsonlParser,
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
@@ -989,19 +992,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries(buildAgentProcessEnv(env)).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const billingType = resolveCodexBillingType(effectiveEnv);
+    const managedBilling = resolveManagedOpenAiBilling(config.managedAiRouting);
+    const billingType = managedBilling?.billingType ?? resolveCodexBillingType(effectiveEnv);
+    const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScratchPath = filesystemScope ? await resolveRunScratchManagedPath(effectiveEnv) : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [{ path: effectiveCodexHome, access: "rw" }, ...(runScratchPath ? [runScratchPath] : [])],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -1228,6 +1234,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         },
       );
       const args = execArgs.args;
+      const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
       const commandNotesWithFastMode =
         execArgs.fastModeIgnoredReason == null
           ? commandNotes
@@ -1318,6 +1325,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
+      const consumeAccounting = createCodexJsonlParser();
+      const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+        const parsed = consumeAccounting(stdout);
+        return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
+      });
       try {
         const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
           onProcessStopped: providerStop.beginInvocation(),
@@ -1331,7 +1343,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
-              await onLog(stream, chunk);
+              await accountingLog(stream, chunk);
               return;
             }
             const cleaned = stripCodexRolloutNoise(chunk);
@@ -1342,6 +1354,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           settleRunDisposition: paperclipBridge?.settleRunDisposition,
           localProcessSandbox,
         });
+        await accountingLog.flush();
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
           proc: {
@@ -1350,6 +1363,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          pricingContext,
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1378,6 +1392,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        pricingContext?: AdapterExecutionResult["pricingContext"];
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
@@ -1391,19 +1406,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: null,
           signal: attempt.monitor.terminationSignal ?? attempt.proc.signal,
           timedOut: false,
+          usageComplete: attempt.parsed.usageComplete,
+          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
           errorMessage,
           errorCode: "codex_output_inactivity_monitor",
           errorFamily: null,
-          usage: attempt.parsed.usage,
+          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
           usageBasis: attempt.parsed.usageBasis,
           sessionId: null,
           sessionParams: null,
           sessionDisplayId: null,
           provider: "openai",
-          biller: resolveCodexBiller(effectiveEnv, billingType),
+          biller,
           model,
           billingType,
           costUsd: null,
+          pricingContext: attempt.pricingContext,
           resultJson: {
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
@@ -1423,6 +1441,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
+          usageComplete: attempt.parsed.usageComplete,
+          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
+          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
+          usageBasis: "per_run",
+          provider: "openai",
+          biller,
+          model,
+          billingType,
+          costUsd: null,
+          pricingContext: attempt.pricingContext,
           errorMessage: `Timed out after ${timeoutSec}s`,
           clearSession: clearSessionOnMissingSession,
         };
@@ -1502,6 +1530,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: false,
+        usageComplete: attempt.parsed.usageComplete,
+        costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
         errorMessage:
           (attempt.proc.exitCode ?? 0) === 0
             ? null
@@ -1523,16 +1553,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : null,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
-        usage: attempt.parsed.usage,
+        usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
         usageBasis: attempt.parsed.usageBasis,
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,
         provider: "openai",
-        biller: resolveCodexBiller(effectiveEnv, billingType),
+        biller,
         model,
         billingType,
         costUsd: null,
+        pricingContext: attempt.pricingContext,
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,

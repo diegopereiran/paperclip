@@ -742,7 +742,16 @@ export function statusCardService(
         status: "running",
       });
     }
-    return { card: next, generatingIssue: generationIssue!, alreadyGenerating: deduplicated, enqueued: true, kind, changes };
+    // A deduplicated terminal task was just reopened above: that is a fresh run
+    // that needs a wake, not a join of work already in flight.
+    return {
+      card: next,
+      generatingIssue: generationIssue!,
+      alreadyGenerating: deduplicated && !TERMINAL_ISSUE_STATUSES.has(created.status),
+      enqueued: true,
+      kind,
+      changes,
+    };
   }
 
   async function tickDueStatusCards(now = new Date()) {

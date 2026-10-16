@@ -49,7 +49,8 @@ describe("remote managed runtime", () => {
     }));
     await prepared.restoreWorkspace();
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
-      restoreGitHistory: false, baselineSnapshot: expect.objectContaining({
+      restoreGitHistory: false, importedRef: "refs/paperclip/ssh-sync/imported/plain",
+      baselineSnapshot: expect.objectContaining({
         exclude: [".paperclip-runtime", "explicitly-excluded"],
         entries: expect.any(Map),
       }),

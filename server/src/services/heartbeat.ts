@@ -23087,6 +23087,10 @@ export function heartbeatService(
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
             finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
             error: `Disposition repair suppressed: ${repairBlock}`,
+            // The gate runs before the adapter is invoked, so no provider action
+            // happened. Without this evidence the cancel reads as a failed legacy
+            // execution and parks the ticket behind a reconciliation blocker.
+            resultJson: { ...run.resultJson, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
           });
           if (cancelled.updated) {
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });

@@ -1494,6 +1494,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
+  it("keeps a parked in_review ticket unblocked when the disposition repair suppresses itself", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId, issueId, kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Proceed?" },
+    }).returning();
+    const repairRunId = randomUUID(), repairWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: repairWakeId, companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_disposition_repair", payload: { issueId }, status: "queued", runId: repairRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairRunId, companyId, agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "queued", wakeupRequestId: repairWakeId,
+      contextSnapshot: {
+        issueId, taskId: issueId, wakeReason: "issue_disposition_repair",
+        legacyDispositionEpisode: { id: runId, attempt: 1, maxAttempts: 2 },
+        dispositionRepairSourceRunId: runId,
+      },
+    });
+    // The agent parked the ticket on a board card after the repair was queued.
+    await db.update(issues).set({ status: "in_review", executionRunId: repairRunId, checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const repair = await heartbeat.getRun(repairRunId);
+    expect(repair).toMatchObject({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    // The periodic settle sweep is what turned the old hold into a blocked ticket.
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    await settleUnrecoverableExecutions(db, new Date(Date.now() + 3_600_000));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.status).toBe("in_review");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId))).toEqual([]);
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+    expect(card.status).toBe("pending");
+  });
+
   it.each(["timeout", "upstream", "cleanup_pending", "cleanup_pending_edited", "cleanup_pending_exhausted", "edited", "exhausted", "new_message", "no_claim", "reassigned", "superseded", "stopped"])(
     "settles explicit retry admission through real executor cleanup: %s", async scenario => {
       const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();

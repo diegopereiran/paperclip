@@ -7,7 +7,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -5225,6 +5225,31 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  async function assertBoardOrAssigneeManager(
+    req: Request,
+    issue: { companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return;
+    }
+    // The assignee itself cannot attest to its own stopped execution.
+    if (
+      !req.actor.agentId ||
+      !issue.assigneeAgentId ||
+      req.actor.agentId === issue.assigneeAgentId ||
+      !(await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        issue.companyId,
+        issue.assigneeAgentId,
+      ))
+    ) {
+      throw forbidden(
+        "Only the assignee's manager or a board user can reconcile a stopped execution",
+      );
+    }
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -9201,16 +9226,35 @@ export function issueRoutes(
           lockedIssue.id,
           tx,
         );
+        // A settled no-replay hold still blocks dispatch (executionBlockerPredicate),
+        // so a caller that names no action must be able to reach it here.
+        const settledHold = !activeRecoveryAction && !actionId
+          ? await tx
+              .select({ id: issueRecoveryActions.id })
+              .from(issueRecoveryActions)
+              .where(
+                and(
+                  eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+                  eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+                  inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+                  executionBlockerPredicate(),
+                ),
+              )
+              .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id))
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const settledActionId = actionId ?? settledHold?.id;
         if (
-          actionId &&
-          (!activeRecoveryAction || activeRecoveryAction.id !== actionId)
+          settledActionId &&
+          (!activeRecoveryAction || activeRecoveryAction.id !== settledActionId)
         ) {
           const [settled] = await tx
             .select()
             .from(issueRecoveryActions)
             .where(
               and(
-                eq(issueRecoveryActions.id, actionId),
+                eq(issueRecoveryActions.id, settledActionId),
                 eq(issueRecoveryActions.companyId, lockedIssue.companyId),
                 eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
                 inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
@@ -9228,7 +9272,9 @@ export function issueRoutes(
             if (automatic?.replay === "blocked" && executionReconciliation) {
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
-              assertBoard(req);
+              // The assignee's manager agent may lift it too, so a parked ticket
+              // is never stranded when no board user is watching.
+              await assertBoardOrAssigneeManager(req, lockedIssue);
               if (
                 activeRecoveryAction ||
                 sourceIssueStatus !== "todo" ||
@@ -9337,7 +9383,7 @@ export function issueRoutes(
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
-          assertBoard(req);
+          await assertBoardOrAssigneeManager(req, lockedIssue);
           await validateExecutionReconciliation({
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,

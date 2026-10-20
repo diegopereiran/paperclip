@@ -1832,6 +1832,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
   });
 
+  it("does not report a replay when a settled hold is resolved without reconciliation evidence or actionId", async () => {
+    const { sourceIssueId } = await seedSettledBlockedHold();
+    const res = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ outcome: "restored", sourceIssueStatus: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+  });
+
   it("lets the assignee's manager agent clear a settled no-replay hold but not an unrelated agent", async () => {
     const { companyId, managerId, sourceIssueId, action, body } = await seedSettledBlockedHold();
     const strangerId = randomUUID();

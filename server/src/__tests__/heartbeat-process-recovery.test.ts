@@ -1494,7 +1494,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
-  it("keeps a parked in_review ticket unblocked when the disposition repair suppresses itself", async () => {
+  it.each([0, 2])("keeps a parked in_review ticket unblocked when the disposition repair suppresses itself (source failureRetries %i)", async (failureRetries) => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
     const [interaction] = await db.insert(issueThreadInteractions).values({
@@ -1513,6 +1513,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueId, taskId: issueId, wakeReason: "issue_disposition_repair",
         legacyDispositionEpisode: { id: runId, attempt: 1, maxAttempts: 2 },
         dispositionRepairSourceRunId: runId,
+        // A repair copies the retry accounting of the run it repairs.
+        executionRetryAccounting: { version: 1, failureRetries, maxTurnContinuations: 0 },
       },
     });
     // The agent parked the ticket on a board card after the repair was queued.
@@ -1520,8 +1522,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId));
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
-    await heartbeat.drainActiveRunExecutions();
-    const repair = await heartbeat.getRun(repairRunId);
+    const repair = await waitForRunToSettle(heartbeat, repairRunId);
+    await heartbeat.waitForRunExecutionDrain(repairRunId);
     expect(repair).toMatchObject({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed" });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
     // The periodic settle sweep is what turned the old hold into a blocked ticket.

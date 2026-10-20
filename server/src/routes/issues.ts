@@ -9228,7 +9228,7 @@ export function issueRoutes(
         );
         // A settled no-replay hold still blocks dispatch (executionBlockerPredicate),
         // so a caller that names no action must be able to reach it here.
-        const settledHold = !activeRecoveryAction && !actionId
+        const settledHold = !activeRecoveryAction && !actionId && executionReconciliation
           ? await tx
               .select({ id: issueRecoveryActions.id })
               .from(issueRecoveryActions)

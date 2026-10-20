@@ -21,6 +21,16 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
 });
 
+it("does not hold a suppressed disposition repair even when its source run had failure retries", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
+    scheduledRetryReason: "issue_disposition_repair",
+    contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 0 } },
+    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "cancelled" })).toBe(true);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,

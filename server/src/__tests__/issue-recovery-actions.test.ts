@@ -1844,6 +1844,52 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  async function seedSettledBlockedHold() {
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId } = fixture;
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const body = { outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects." } };
+    return { ...fixture, runId, action: action!, body };
+  }
+
+  it("clears a settled no-replay hold without naming the action", async () => {
+    const { sourceIssueId, action, body } = await seedSettledBlockedHold();
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+  });
+
+  it("lets the assignee's manager agent clear a settled no-replay hold but not an unrelated agent", async () => {
+    const { companyId, managerId, sourceIssueId, action, body } = await seedSettledBlockedHold();
+    const strangerId = randomUUID();
+    await db.insert(agents).values({ id: strangerId, companyId, name: "Stranger", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const resolveAs = async (agentId: string) => {
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId, runId, issueId: sourceIssueId });
+      return request(createApp({ type: "agent", agentId, companyId, runId, source: "agent_key" }))
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).set("X-Paperclip-Run-Id", runId).send(body);
+    };
+    const denied = await resolveAs(strangerId);
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(denied.body.error).toContain("another owner's recovery action");
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    const allowed = await resolveAs(managerId);
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("todo");
+    expect(action.id).toBeTruthy();
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;

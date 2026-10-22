@@ -4180,7 +4180,10 @@ export function heartbeatService(
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
     await cancelInvocationsForAgentsInternal(agentIds, reason, options);
-    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+    const runs = await db.select({
+      id: heartbeatRuns.id, status: heartbeatRuns.status, companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+    }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),

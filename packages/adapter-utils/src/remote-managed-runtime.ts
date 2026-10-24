@@ -213,11 +213,12 @@ function remoteRuntimeGuard(baseDir: string, subDir: "workspaces" | "runs"): str
 }
 
 // A materialised skill keeps its source's read-only mode, and `rm -rf` cannot empty a read-only
-// directory. Owner-write first; `chmod -R` (no -L/-H) never follows a symlink inside the tree, and
-// callers only pass paths the guard proved are not symlinks.
+// directory. Owner-write first. `chmod -R` (no -L/-H) does not follow symlinks inside a tree, but it
+// does follow one given as an argument, so each path is skipped when it is itself a symlink
+// (`rm -rf` then removes just the link).
 function makeWritableThenRemove(...quotedPaths: string[]): string {
   const paths = quotedPaths.join(" ");
-  return `chmod -R u+w ${paths} 2>/dev/null; rm -rf ${paths}`;
+  return `for p in ${paths}; do [ -L "$p" ] || chmod -R u+w "$p" 2>/dev/null; done; rm -rf ${paths}`;
 }
 
 // Deletes everything but the lock first, then the lock, so a run starting meanwhile sees it busy.

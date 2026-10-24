@@ -44,6 +44,37 @@ vi.mock("../services/native-runtime/native-session-executor.js", async (importOr
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
 
+// When set, the runner-goal service reports an active, pausable goal on the
+// issue so the terminalization stop path is reachable without a live runner.
+const runnerGoalStub = vi.hoisted(() => ({ active: false, paused: false }));
+vi.mock("../services/runner-goals.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/runner-goals.js")>();
+  return {
+    ...actual,
+    runnerGoalService: (...args: Parameters<typeof actual.runnerGoalService>) => {
+      const real = actual.runnerGoalService(...args);
+      if (!runnerGoalStub.active) return real;
+      return {
+        ...real,
+        projection: async (...p: Parameters<typeof real.projection>) => {
+          const base = await real.projection(...p);
+          if (!base) return base;
+          return {
+            ...base,
+            pendingAction: null,
+            revision: 1,
+            capability: { ...base.capability, actions: ["pause"] },
+            goal: { objective: "ship", status: runnerGoalStub.paused ? "paused" : "active", tokenBudget: null,
+              tokensUsed: 0, elapsedSeconds: 0, iterations: 0, lastReason: null, createdAt: null, updatedAt: null,
+              completedAt: null, workingNow: false },
+          };
+        },
+        act: async () => { runnerGoalStub.paused = true; return {} as any; },
+      };
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -65,6 +96,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   const testProcesses = new Map<string, ChildProcess>();
 
   afterEach(async () => {
+    runnerGoalStub.active = false;
+    runnerGoalStub.paused = false;
     for (const [id, child] of testProcesses) {
       runningProcesses.delete(id);
       child.kill();
@@ -274,6 +307,128 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       .toMatchObject({ status: "todo" });
     await expect(issueService(db).update(seeded.issueId, { ...data, status: "done" }))
       .rejects.toMatchObject({ status: 403, details: { code: "agent_run_cancelled" } });
+  });
+
+  async function seedReassignmentFixture() {
+    const seeded = await seedQueue();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({ id: otherAgentId, companyId: seeded.companyId, name: "Reviewer", role: "qa",
+      status: "idle", adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, seeded.runId));
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    testProcesses.set(seeded.runId, child);
+    runningProcesses.set(seeded.runId, { child, graceSec: 1, processGroupId: null });
+    return { ...seeded, otherAgentId };
+  }
+
+  it("lets a run that reassigns its own issue finish instead of cancelling it", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ assigneeAgentId: otherAgentId, status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true,
+      selfHandoffReason: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("issueMutationStopId");
+    // The new assignee's wake is kept (parked behind the finishing run); the
+    // heartbeat-level test in heartbeat-process-recovery.test.ts shows it starts
+    // when that run ends.
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0].status).toBe("deferred_issue_execution");
+    });
+    // A run that handed off keeps write authority until it exits (decision on
+    // the parent ticket): its closing comment posts and the wake stays parked.
+    const commented = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Handing this to the reviewer." });
+    expect(commented.status, JSON.stringify(commented.body)).toBeGreaterThanOrEqual(200);
+    expect(commented.status).toBeLessThan(300);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(after.status).toBe("running");
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+    expect(parked.map(w => w.status)).toEqual(["deferred_issue_execution"]);
+  });
+
+  it("lets a run that closes its own issue finish instead of cancelling it", async () => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = true;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true, selfHandoffReason: "issue_terminalized" });
+    expect(run.resultJson).not.toHaveProperty("issueMutationStopId");
+  });
+
+  it("still cancels the active run when a different actor closes the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = true;
+    const res = await request(app(seeded.companyId, "queue-owner")).patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_terminalized" });
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
+  });
+
+  it("still cancels the active run when a different run reassigns the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner");
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`)
+      .send({ assigneeAgentId: otherAgentId, status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
+  });
+
+  it.each([false, true])("lets a run that cancels its own issue finish (runner goal %s)", async goal => {
+    const seeded = await seedReassignmentFixture();
+    runnerGoalStub.active = goal;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`).send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true });
+    expect(run.resultJson).not.toHaveProperty("executionCancellation");
+  });
+
+  it("lets a run that reassigns and cancels its own issue finish", async () => {
+    const seeded = await seedReassignmentFixture();
+    const { otherAgentId } = seeded;
+    const client = app(seeded.companyId, "queue-owner", { agentId: seeded.agentId, runId: seeded.runId });
+    const res = await request(client).patch(`/api/issues/${seeded.issueId}`)
+      .send({ assigneeAgentId: otherAgentId, status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(run.resultJson).toMatchObject({ selfHandoff: true, selfHandoffReason: "issue_reassigned" });
+    expect(run.resultJson).not.toHaveProperty("executionCancellation");
+    // The issue ends cancelled, so the new assignee gets no wake to park.
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, otherAgentId));
+    expect(wakes).toHaveLength(0);
+  });
+
+  it("still cancels the active run when a different actor cancels the issue", async () => {
+    const seeded = await seedReassignmentFixture();
+    const res = await request(app(seeded.companyId, "queue-owner")).patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run.status).toBe("cancelled");
+    expect(run.resultJson).not.toHaveProperty("selfHandoff");
   });
 
   it.each(["questions", "verdicts"] as const)("rejects admitted %s responses after Stop revokes the run", async kind => {

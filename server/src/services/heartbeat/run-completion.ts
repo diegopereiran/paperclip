@@ -541,6 +541,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               ? parseObject(latestRun?.resultJson)
               : {}),
             ...parseObject(adapterResult.resultJson),
+            // The issue route marks a run that hands off or closes its own
+            // issue; the adapter's result must not erase that record.
+            ...(latestRun?.resultJson?.selfHandoff === true
+              ? {
+                  selfHandoff: true,
+                  selfHandoffReason: latestRun.resultJson.selfHandoffReason,
+                }
+              : {}),
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
               : {}),

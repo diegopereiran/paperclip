@@ -8311,6 +8311,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(Number((await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)))[0]?.totalCostCents ?? 0)).toBe(0);
   });
 
+  it("finishes a run that handed its own issue to another agent, records its usage and starts the new assignee's wake", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({ runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued" });
+    const nextAgentId = randomUUID();
+    await db.insert(agents).values({ id: nextAgentId, companyId, name: "NextOwner", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const heartbeat = heartbeatService(db);
+    mockAdapterExecute.mockImplementationOnce((async () => {
+      // What PATCH /issues/:id does when the running agent reassigns its own issue.
+      await db.update(heartbeatRuns).set({ resultJson: { selfHandoff: true, selfHandoffReason: "issue_reassigned" } })
+        .where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ assigneeAgentId: nextAgentId, status: "todo", checkoutRunId: null, executionRunId: null })
+        .where(eq(issues.id, issueId));
+      await heartbeat.wakeup(nextAgentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId }, contextSnapshot: { issueId, source: "issue.update" } });
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Handed the task over.",
+        provider: "test", model: "test-model", usage: { inputTokens: 100, outputTokens: 25 }, costUsd: 0.05 };
+    }) as typeof mockAdapterExecute);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      const settled = await heartbeat.getRun(runId);
+      expect(settled).toMatchObject({ status: "succeeded" });
+      expect(settled?.usageJson).toMatchObject({ inputTokens: 100, outputTokens: 25 });
+      expect(settled?.resultJson).toMatchObject({ selfHandoff: true });
+      await vi.waitFor(async () => {
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, nextAgentId));
+        expect(wakes.map((wake) => wake.status), JSON.stringify(wakes)).not.toContain("deferred_issue_execution");
+        expect(wakes.some((wake) => wake.runId)).toBe(true);
+      });
+      // Finishing normally schedules no follow-up for the agent that handed off.
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
   it("stops controller renewal and releases execution controls when teardown deadline cleanup throws", async () => {
     const { runId, issueId } = await seedRunFixture({ runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued" });
     mockAdapterExecute.mockImplementationOnce(async () => {

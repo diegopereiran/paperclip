@@ -617,7 +617,6 @@ vi.mock("@/components/ui/button", () => ({
       {children}
     </button>
   ),
-  buttonVariants: () => "",
 }));
 
 vi.mock("@/components/ui/separator", () => ({

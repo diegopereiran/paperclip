@@ -64,11 +64,11 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
     prepareWorkspaceForSshExecution,
     restoreWorkspaceFromSshExecution,
     syncDirectoryToSsh,
-    // Only the stable-folder lock script is answered here; every other command still reaches the real runner.
-    runSshCommand: vi.fn(async (spec: unknown, command: string, options?: unknown) =>
-      command.includes("/lock")
-        ? { stdout: "ACQUIRED\n", stderr: "" }
-        : (actual.runSshCommand as (...args: unknown[]) => Promise<unknown>)(spec, command, options)),
+    // No real ssh in unit tests: the stable-folder lock script is acquired; the sweep and cleanup commands succeed silently.
+    runSshCommand: vi.fn(async (_spec: unknown, command: string) => ({
+      stdout: command.includes("/lock") ? "ACQUIRED\n" : "",
+      stderr: "",
+    })),
   };
 });
 

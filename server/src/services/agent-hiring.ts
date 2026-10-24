@@ -12,6 +12,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { agentIdentityService } from "./agent-identity.js";
 import { initializePrimaryAgent } from "./primary-agent.js";
+import { normalizeAgentEnvPatterns } from "@paperclipai/adapter-utils/agent-env-policy";
 
 export async function prepareAgentHire(db: Db, companyId: string, data: CreateAgentData, options?: CreateAgentOptions): Promise<CreateAgentData> {
   const { ensureManager, assertBuiltInAgentMetadataMutationAllowed } = agentRecordQueries(db);
@@ -81,6 +82,18 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
 export async function prepareAgentHireApproval(txDb: Db, existing: AgentHireRecord, approvedPayload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch> {
   const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
   const patch = { ...approvedPatch } as AgentConfigurationPatch;
+  if (isPlainRecord(patch.runtimeConfig) && Object.prototype.hasOwnProperty.call(patch.runtimeConfig, "inheritEnv")) {
+    // The approval payload is writable below instance-admin level; only
+    // names the pending row already carried (set through the guarded hire
+    // route) may reach the activated agent.
+    const carried = new Set(normalizeAgentEnvPatterns(
+      isPlainRecord(existing.runtimeConfig) ? existing.runtimeConfig.inheritEnv : undefined,
+    ));
+    patch.runtimeConfig = {
+      ...patch.runtimeConfig,
+      inheritEnv: normalizeAgentEnvPatterns(patch.runtimeConfig.inheritEnv).filter((name) => carried.has(name)),
+    };
+  }
   const hasApprovedAdapterConfig = Object.prototype.hasOwnProperty.call(patch, "adapterConfig") && isPlainRecord(patch.adapterConfig);
   if (
     Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&

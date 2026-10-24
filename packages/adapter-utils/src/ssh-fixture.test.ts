@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,7 @@ import {
   stopSshEnvLabFixture,
   type SshEnvLabFixtureState,
 } from "./ssh.js";
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { prepareRemoteManagedRuntime, removeStableSshWorkspaceFolder } from "./remote-managed-runtime.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 const UNREACHABLE_SSH_SPEC = {
@@ -281,6 +281,49 @@ describe("ssh env-lab fixture", () => {
 
     expect(result.stdout).toBe("hello over ssh stdin\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("stops the remote command when the local ssh client is killed (#14704)", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH remote orphan test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const marker = `pc-orphan-probe-${process.pid}-${Date.now()}`;
+    // Two commands keep the shell alive, so its command line carries the marker.
+    const target = await buildSshSpawnTarget({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      command: "sh",
+      args: ["-c", `sleep 120; echo ${marker}`],
+      env: {},
+    });
+    const remoteRunning = async () => {
+      const result = await new Promise<string>((resolve) => {
+        // Anchor on the remote shell's own command line; the local ssh client's
+        // arguments also contain the marker and must not count as "remote".
+        execFile("pgrep", ["-f", `^sh -c sleep 120; echo ${marker}$`], (_error, stdout) => resolve(stdout.trim()));
+      });
+      return result.length > 0;
+    };
+    const client = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"] });
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!(await remoteRunning()) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      expect(await remoteRunning()).toBe(true);
+
+      client.kill("SIGTERM");
+      const stopDeadline = Date.now() + 20_000;
+      while ((await remoteRunning()) && Date.now() < stopDeadline) await new Promise((r) => setTimeout(r, 250));
+      expect(await remoteRunning()).toBe(false);
+    } finally {
+      client.kill("SIGKILL");
+      // Kill the whole remote process group so no `sleep` child is left behind.
+      await new Promise<void>((resolve) =>
+        execFile("sh", ["-c", `for p in $(pgrep -f '^sh -c sleep 120; echo ${marker}$'); do kill -KILL -$(ps -o pgid= -p $p | tr -d ' ') 2>/dev/null; done; true`], () => resolve()),
+      );
+      await target.cleanup();
+    }
+  }, 45_000);
 
   it("does not treat an unrelated reused pid as the running fixture", async () => {
     const rootDir = await createFixtureRootDir();
@@ -644,6 +687,96 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(restoreDir, "blob-0.bin"))).resolves.toEqual(
       Buffer.alloc(256 * 1024, 1),
     );
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps relative symlink targets when restoring from ssh", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-overlay");
+    const restoreDir = path.join(rootDir, "restore-target");
+
+    await mkdir(localDir, { recursive: true });
+    await writeFile(path.join(localDir, "CLAUDE.md"), "instructions\n", "utf8");
+    await symlink("CLAUDE.md", path.join(localDir, "AGENTS.md"));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH restore symlink test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "restore-symlinks");
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir });
+    await syncDirectoryFromSsh({ spec, remoteDir, localDir: restoreDir });
+
+    await expect(readlink(path.join(restoreDir, "AGENTS.md"))).resolves.toBe("CLAUDE.md");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps committed relative symlinks through the managed runtime restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "CLAUDE.md"), "instructions\n", "utf8");
+    await symlink("CLAUDE.md", path.join(localRepo, "AGENTS.md"));
+    await git(localRepo, ["add", "."]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH managed restore symlink test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      runId: "run-symlink",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+    await prepared.restoreWorkspace();
+
+    await expect(readlink(path.join(localRepo, "AGENTS.md"))).resolves.toBe("CLAUDE.md");
+    expect(await git(localRepo, ["status", "--short"])).toBe("");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps a nested project repository checkout through the managed runtime restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    const nestedRepo = path.join(localRepo, ".paperclip-repositories", "Secondary-abc123");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "README.md"), "primary\n", "utf8");
+    await writeFile(path.join(localRepo, ".git", "info", "exclude"), "/.paperclip-repositories/\n", "utf8");
+    await git(localRepo, ["add", "README.md"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    await mkdir(nestedRepo, { recursive: true });
+    await git(nestedRepo, ["init"]);
+    await git(nestedRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(nestedRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(nestedRepo, "lib.txt"), "secondary\n", "utf8");
+    await git(nestedRepo, ["add", "lib.txt"]);
+    await git(nestedRepo, ["commit", "-m", "secondary"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH managed restore nested repository test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      runId: "run-nested-repo",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+    await prepared.restoreWorkspace();
+
+    await expect(stat(path.join(nestedRepo, ".git"))).resolves.toBeTruthy();
+    expect(await git(nestedRepo, ["status", "--short"])).toBe("");
+    expect(await readFile(path.join(nestedRepo, "lib.txt"), "utf8")).toBe("secondary\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports exact git-history import percentage from the known bundle size", async () => {
@@ -1155,6 +1288,50 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("dirty remote\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("leaves the local git index at the imported head after a managed runtime restore", async () => {
+    // The fast-forward moves the branch with `git update-ref`, which leaves
+    // the index at the old head. Without a refresh, a clean remote commit
+    // shows up locally as staged changes against the new HEAD.
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "managed-runtime SSH git index test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = {
+      ...config,
+      remoteCwd: started.workspaceDir,
+    } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-index",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "committed\\n" > tracked.txt && printf "new\\n" > added.txt && git add tracked.txt added.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+
+    await prepared.restoreWorkspace();
+
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    expect(await git(localRepo, ["status", "--porcelain"])).toBe("");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("propagates remote commits to the local worktree with no git remote configured (no-remote-git contract)", async () => {
     // Locks in the architectural contract documented in
     // packages/adapter-utils/README.md and packages/adapters/AUTHORING.md:
@@ -1275,4 +1452,202 @@ describe("ssh env-lab fixture", () => {
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("reuses one remote workspace folder across runs on an execution workspace and falls back when it is busy", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    const workspaceId = "11111111-2222-4333-8444-555555555555";
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "build-cache/\n", "utf8");
+    await writeFile(path.join(localRepo, "README.md"), "primary\n", "utf8");
+    await git(localRepo, ["add", "."]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH stable workspace folder test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir, remoteWorkspaceKey: "execution_workspace" as const };
+    const base = { spec, adapterKey: "test-adapter", workspaceLocalDir: localRepo, executionWorkspaceId: workspaceId };
+
+    const first = await prepareRemoteManagedRuntime({ ...base, runId: "run-one" });
+    // A build output that bakes in its absolute path, like a compiled cache would.
+    await runSshCommand(
+      spec,
+      `mkdir -p '${first.workspaceRemoteDir}/build-cache' && printf '%s' '${first.workspaceRemoteDir}' > '${first.workspaceRemoteDir}/build-cache/abs-path.txt'`,
+    );
+    await first.restoreWorkspace();
+
+    const second = await prepareRemoteManagedRuntime({ ...base, runId: "run-two" });
+    expect(second.workspaceRemoteDir).toBe(first.workspaceRemoteDir);
+    const kept = await runSshCommand(spec, `cat '${second.workspaceRemoteDir}/build-cache/abs-path.txt'`);
+    expect(kept.stdout).toBe(second.workspaceRemoteDir);
+
+    // run-two still holds the folder: a concurrent third run gets its own.
+    const progress: string[] = [];
+    const third = await prepareRemoteManagedRuntime({
+      ...base,
+      runId: "run-three",
+      spec: { ...spec, isRunActive: async () => true },
+      onProgress: (line) => void progress.push(line),
+    });
+    expect(third.workspaceRemoteDir).not.toBe(second.workspaceRemoteDir);
+    expect(third.workspaceRemoteDir).toContain("/runs/run-three/workspace");
+    expect(progress.join("")).toContain("stable remote folder busy (owner run-two); using per-run folder");
+    await third.restoreWorkspace();
+    await second.restoreWorkspace();
+
+    const fourth = await prepareRemoteManagedRuntime({ ...base, runId: "run-four" });
+    expect(fourth.workspaceRemoteDir).toBe(first.workspaceRemoteDir);
+    await fourth.restoreWorkspace();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  describe("remote folder cleanup", () => {
+    async function makeLocalRepo(rootDir: string) {
+      const localRepo = path.join(rootDir, "local-workspace");
+      await mkdir(localRepo, { recursive: true });
+      await git(localRepo, ["init"]);
+      await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+      await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+      await writeFile(path.join(localRepo, "README.md"), "primary\n", "utf8");
+      await git(localRepo, ["add", "."]);
+      await git(localRepo, ["commit", "-m", "initial"]);
+      return localRepo;
+    }
+    const exists = (target: string) => stat(target).then(() => true, () => false);
+    const WS_ID = "11111111-2222-4333-8444-555555555555";
+
+    it("removes the run folder after every restore and keeps a per-run workspace after a failed restore", async () => {
+      const rootDir = await createFixtureRootDir();
+      const localRepo = await makeLocalRepo(rootDir);
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH run folder cleanup test");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const spec = { ...config, remoteCwd: started.workspaceDir };
+      const runDir = (runId: string) => path.join(started.workspaceDir, ".paperclip-runtime", "runs", runId);
+      const assetDir = path.join(rootDir, "asset");
+      await mkdir(assetDir, { recursive: true });
+      await writeFile(path.join(assetDir, "mcp.json"), '{"token":"secret"}', "utf8");
+      const assets = (restore?: () => Promise<void>) => [{ key: "mcp", localDir: assetDir, ...(restore ? { restore } : {}) }];
+
+      const good = await prepareRemoteManagedRuntime({ spec, runId: "run-good", adapterKey: "a", workspaceLocalDir: localRepo, assets: assets() });
+      expect(await exists(path.join(good.runtimeRootDir, "mcp", "mcp.json"))).toBe(true);
+      await good.restoreWorkspace();
+      expect(await exists(runDir("run-good"))).toBe(false);
+
+      const bad = await prepareRemoteManagedRuntime({
+        spec, runId: "run-bad", adapterKey: "a", workspaceLocalDir: localRepo,
+        assets: assets(async () => { throw new Error("restore failed"); }),
+      });
+      await expect(bad.restoreWorkspace()).rejects.toThrow("restore failed");
+      // Runtime assets (bearer tokens) go; the workspace stays for inspection.
+      expect(await exists(path.join(runDir("run-bad"), "workspace", ".paperclip-runtime", "a", "mcp"))).toBe(false);
+      expect(await exists(path.join(runDir("run-bad"), "workspace"))).toBe(true);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("removes per-run runtime assets next to a stable workspace and marks the restore", async () => {
+      const rootDir = await createFixtureRootDir();
+      const localRepo = await makeLocalRepo(rootDir);
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH stable run cleanup test");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const spec = { ...config, remoteCwd: started.workspaceDir, remoteWorkspaceKey: "execution_workspace" as const };
+      const assetDir = path.join(rootDir, "asset");
+      await mkdir(assetDir, { recursive: true });
+      await writeFile(path.join(assetDir, "mcp.json"), "{}", "utf8");
+      const prepared = await prepareRemoteManagedRuntime({
+        spec, runId: "run-s", adapterKey: "a", workspaceLocalDir: localRepo, executionWorkspaceId: WS_ID,
+        assets: [{ key: "mcp", localDir: assetDir }],
+      });
+      const wsDir = path.join(started.workspaceDir, ".paperclip-runtime", "workspaces", WS_ID);
+      await prepared.restoreWorkspace();
+      expect(await exists(path.join(started.workspaceDir, ".paperclip-runtime", "runs", "run-s"))).toBe(false);
+      expect(await exists(path.join(wsDir, "workspace"))).toBe(true);
+      expect(await readFile(path.join(wsDir, ".paperclip-last-restore"), "utf8")).toMatch(/^ok/);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("removes a workspace folder on close, skips a locked one and refuses unsafe paths", async () => {
+      const rootDir = await createFixtureRootDir();
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH workspace close test");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const spec = { ...config, remoteCwd: started.workspaceDir };
+      const base = started.workspaceDir;
+      const wsRoot = path.join(base, ".paperclip-runtime", "workspaces");
+      await mkdir(path.join(wsRoot, WS_ID, "workspace"), { recursive: true });
+      await mkdir(path.join(wsRoot, WS_ID, "lock"), { recursive: true });
+      await writeFile(path.join(wsRoot, WS_ID, "lock", "owner"), "runId=live\nstartedAt=1\n");
+      expect(await removeStableSshWorkspaceFolder(spec, base, WS_ID)).toBe("locked");
+      expect(await exists(path.join(wsRoot, WS_ID, "workspace"))).toBe(true);
+      await rm(path.join(wsRoot, WS_ID, "lock"), { recursive: true });
+      expect(await removeStableSshWorkspaceFolder(spec, base, WS_ID)).toBe("removed");
+      expect(await exists(path.join(wsRoot, WS_ID))).toBe(false);
+      expect(await removeStableSshWorkspaceFolder(spec, base, WS_ID)).toBe("absent");
+
+      // Guard: id must be a UUID, root absolute without "..", no symlink on the way.
+      const victim = path.join(rootDir, "victim");
+      await mkdir(victim, { recursive: true });
+      await writeFile(path.join(victim, "keep.txt"), "keep");
+      await expect(removeStableSshWorkspaceFolder(spec, base, "../../victim")).rejects.toThrow();
+      await expect(removeStableSshWorkspaceFolder(spec, "relative/dir", WS_ID)).rejects.toThrow();
+      await expect(removeStableSshWorkspaceFolder(spec, `${base}/../x`, WS_ID)).rejects.toThrow();
+      await mkdir(wsRoot, { recursive: true });
+      await symlink(victim, path.join(wsRoot, WS_ID));
+      expect(await removeStableSshWorkspaceFolder(spec, base, WS_ID)).toBe("unsafe");
+      expect(await exists(path.join(victim, "keep.txt"))).toBe(true);
+      await rm(path.join(wsRoot, WS_ID));
+      await rm(wsRoot, { recursive: true });
+      await mkdir(path.join(victim, WS_ID), { recursive: true });
+      await symlink(victim, wsRoot);
+      expect(await removeStableSshWorkspaceFolder(spec, base, WS_ID)).toBe("unsafe");
+      expect(await exists(path.join(victim, "keep.txt"))).toBe(true);
+      expect(await exists(path.join(victim, WS_ID))).toBe(true);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("sweeps only unlocked, long-unused folders whose last restore was ok", async () => {
+      const rootDir = await createFixtureRootDir();
+      const localRepo = await makeLocalRepo(rootDir);
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH workspace sweep test");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const spec = { ...config, remoteCwd: started.workspaceDir, remoteWorkspaceKey: "execution_workspace" as const };
+      const wsRoot = path.join(started.workspaceDir, ".paperclip-runtime", "workspaces");
+      const ids = {
+        old: "bbbbbbbb-2222-4333-8444-555555555555",
+        locked: "cccccccc-2222-4333-8444-555555555555",
+        failed: "dddddddd-2222-4333-8444-555555555555",
+        recent: "eeeeeeee-2222-4333-8444-555555555555",
+        nomarker: "ffffffff-2222-4333-8444-555555555555",
+      };
+      const make = async (id: string, marker: string | null, ageDays: number, lock = false) => {
+        await mkdir(path.join(wsRoot, id, "workspace"), { recursive: true });
+        if (lock) {
+          await mkdir(path.join(wsRoot, id, "lock"));
+          await writeFile(path.join(wsRoot, id, "lock", "owner"), "runId=live\nstartedAt=1\n");
+        }
+        if (marker !== null) {
+          const file = path.join(wsRoot, id, ".paperclip-last-restore");
+          await writeFile(file, `${marker}\n`);
+          const when = new Date(Date.now() - ageDays * 86_400_000);
+          await utimes(file, when, when);
+        }
+      };
+      await make(ids.old, "ok", 15);
+      await make(ids.locked, "ok", 15, true);
+      await make(ids.failed, "failed", 30);
+      await make(ids.recent, "ok", 13);
+      await make(ids.nomarker, null, 0);
+      const prepared = await prepareRemoteManagedRuntime({
+        spec, runId: "run-sweep", adapterKey: "a", workspaceLocalDir: localRepo, executionWorkspaceId: WS_ID,
+      });
+      expect(await exists(path.join(wsRoot, ids.old))).toBe(false);
+      for (const id of [ids.locked, ids.failed, ids.recent, ids.nomarker, WS_ID]) {
+        expect(await exists(path.join(wsRoot, id))).toBe(true);
+      }
+      await prepared.restoreWorkspace();
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
 });

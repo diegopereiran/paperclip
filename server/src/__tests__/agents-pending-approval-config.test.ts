@@ -162,4 +162,50 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       metadata: { source: "hire-form" },
     });
   });
+  it("does not activate inheritEnv names that the pending hire row never carried", async () => {
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const approvalSvc = approvalService(db);
+    const pending = await createAgentLifecycle(db).requestHire(companyId, {
+      name: "Env Coder",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "echo safe" },
+      runtimeConfig: { inheritEnv: ["GH_TOKEN"] },
+      budgetMonthlyCents: 0,
+      metadata: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      permissions: {},
+      lastHeartbeatAt: null,
+    });
+    const approval = await approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: {
+        name: "Env Coder",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: { command: "echo safe" },
+        runtimeConfig: { inheritEnv: ["GH_TOKEN", "DATABASE_URL", "BETTER_AUTH_SECRET"] },
+        budgetMonthlyCents: 0,
+        metadata: {},
+        agentId: pending.id,
+        appearance: pending.appearance,
+      },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    });
+
+    await approvalSvc.approve(approval.id, "board-user", "Approved hire");
+
+    const activated = await agentSvc.getById(pending.id);
+    expect(activated?.status).toBe("paused");
+    expect((activated?.runtimeConfig as Record<string, unknown>).inheritEnv).toEqual(["GH_TOKEN"]);
+  });
+
 });

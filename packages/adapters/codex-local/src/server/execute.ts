@@ -1,6 +1,7 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
+import { buildAgentProcessEnv } from "@paperclipai/adapter-utils/agent-env-policy";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -59,6 +60,7 @@ import {
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
+  resolveRunScratchManagedPath,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -819,6 +821,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             adapterKey: "codex",
             timeoutSec,
             workspaceLocalDir: cwd,
+            executionWorkspaceId: asString(workspaceContext.executionWorkspaceId, "") || null,
             workspaceRemoteDir:
               targetWorkspaceRealization?.mode === "in_place"
                 ? targetWorkspaceRealization.authoritativeRoot
@@ -990,7 +993,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries(buildAgentProcessEnv(env)).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
@@ -999,12 +1002,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScratchPath = filesystemScope ? await resolveRunScratchManagedPath(effectiveEnv) : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [{ path: effectiveCodexHome, access: "rw" }, ...(runScratchPath ? [runScratchPath] : [])],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases

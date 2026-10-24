@@ -311,6 +311,7 @@ const dashboard: DashboardSummary = {
     pausedProjects: 0,
   },
   runActivity: [],
+  timeZone: "UTC",
 };
 
 describe("inbox helpers", () => {

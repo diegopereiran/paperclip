@@ -720,6 +720,8 @@ export type {
   IssueRelation,
   IssueRelationIssueSummary,
   IssueExecutionMonitorPolicy,
+  IssueExecutionMonitorPullRequest,
+  IssueExecutionMonitorPullRequestFingerprint,
   IssueExecutionMonitorState,
   IssueExecutionPolicy,
   IssueExecutionState,

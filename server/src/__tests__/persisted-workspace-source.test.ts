@@ -110,6 +110,24 @@ describe("persisted Git workspace source", () => {
     } } });
   });
 
+  it("accepts a fork clone whose other remote is the recorded repository", async () => {
+    const { original, input } = await fixture();
+    await exec("git", ["-C", original, "remote", "set-url", "origin", "https://example.invalid/fork/original.git"]);
+    await exec("git", ["-C", original, "remote", "add", "upstream", input.workspace.repoUrl]);
+    const workspace = { ...input.workspace, repoUrl: input.workspace.repoUrl.replace(/\.git$/, "") };
+    expect(await resolvePersistedGitWorkspaceSource({ ...input, workspace })).toBe(original);
+  });
+
+  it("rejects a non-origin remote with multiple URLs even if one matches the saved repository", async () => {
+    const { original, input } = await fixture();
+    await exec("git", ["-C", original, "remote", "set-url", "origin", "https://example.invalid/fork/original.git"]);
+    await exec("git", ["-C", original, "remote", "add", "upstream", "https://example.invalid/other.git"]);
+    await exec("git", ["-C", original, "config", "--add", "remote.upstream.url", input.workspace.repoUrl]);
+    await expect(resolvePersistedGitWorkspaceSource(input)).rejects.toMatchObject({ resultJson: { workspaceValidation: {
+      reasonCode: "source_repository_mismatch",
+    } } });
+  });
+
   it("rejects changed origin identity even at the recorded managed path", async () => {
     const { original, input } = await fixture();
     await exec("git", ["-C", original, "remote", "set-url", "origin", "https://example.invalid/other.git"]);

@@ -281,7 +281,7 @@ describe("task watchdog subtree classifier", () => {
   it("excludes task-watchdog issues and their descendants from watched subtree scans", () => {
     const result = classify({
       issues: [
-        issue({ status: "done" }),
+        issue({ status: "blocked" }),
         issue({
           id: watchdogId,
           identifier: "PAP-3",
@@ -366,6 +366,138 @@ describe("task watchdog subtree classifier", () => {
     });
 
     expect(result.state).toBe("stopped");
+  });
+
+  it("defers a stopped verdict for an existing issue updated inside the grace window", () => {
+    // Hand-off write: the issue ran before (completed run) and its next
+    // owner's wake is not yet visible 2s after the update.
+    const result = classify({
+      issues: [issue({
+        status: "in_review",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:43.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("pending_first_run");
+    if (result.state !== "pending_first_run") return;
+    expect(result.pendingIssueIds).toEqual([sourceId]);
+  });
+
+  it("stops an existing issue whose last update is older than the grace window", () => {
+    const result = classify({
+      issues: [issue({
+        status: "in_review",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:20.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
+  it("does not defer a recently updated issue that is already terminal", () => {
+    const result = classify({
+      issues: [issue({
+        status: "done",
+        createdAt: new Date("2026-06-18T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-18T16:32:43.000Z"),
+      })],
+      evaluatedAt: new Date("2026-06-18T16:32:45.000Z"),
+      firstRunGraceMs: 15_000,
+      completedRunIssueIds: [sourceId],
+    });
+
+    expect(result.state).toBe("not_applicable");
+  });
+
+  describe("monitor, terminal and hand-off live paths", () => {
+    const evaluatedAt = new Date("2026-06-18T16:32:45.000Z");
+    const inOneHour = new Date(evaluatedAt.getTime() + 3_600_000);
+    const monitored = (overrides: Partial<TaskWatchdogClassifierIssue> = {}) =>
+      issue({
+        status: "in_review",
+        updatedAt: new Date("2026-06-18T10:00:00.000Z"),
+        monitorNextCheckAt: inOneHour,
+        ...overrides,
+      });
+
+    it.each(["in_progress", "in_review"])(
+      "treats a future monitor on an agent-owned %s issue as live",
+      (status) => {
+        const result = classify({ issues: [monitored({ status })], evaluatedAt });
+        expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+      },
+    );
+
+    it.each(["in_progress", "in_review"])(
+      "treats a monitor 3 s past due on an agent-owned %s issue as live until the scheduler claims it",
+      (status) => {
+        const result = classify({
+          issues: [monitored({ status, monitorNextCheckAt: new Date(evaluatedAt.getTime() - 3_000) })],
+          evaluatedAt,
+        });
+        expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
+      },
+    );
+
+    it("stops once a due monitor is overdue past the scheduler stale-claim window", () => {
+      const justInside = classify({
+        issues: [monitored({ monitorNextCheckAt: new Date(evaluatedAt.getTime() - 5 * 60_000 + 1) })],
+        evaluatedAt,
+      });
+      const atBoundary = classify({
+        issues: [monitored({ monitorNextCheckAt: new Date(evaluatedAt.getTime() - 5 * 60_000) })],
+        evaluatedAt,
+      });
+      expect(justInside.state).toBe("live");
+      expect(atBoundary.state).toBe("stopped");
+    });
+
+    it.each([
+      ["overdue by 6 min", { monitorNextCheckAt: new Date(evaluatedAt.getTime() - 6 * 60_000) }],
+      ["unset", { monitorNextCheckAt: null }],
+      ["user-assigned", { assigneeUserId: "user-1" }],
+      ["unassigned", { assigneeAgentId: null }],
+      ["todo", { status: "todo" }],
+      ["blocked", { status: "blocked" }],
+    ] as const)("stops when the monitor cannot fire: %s", (_label, overrides) => {
+      const result = classify({ issues: [monitored(overrides)], evaluatedAt });
+      expect(result.state).toBe("stopped");
+    });
+
+    it.each(["done", "cancelled"])("is not applicable when every issue is %s", (status) => {
+      const result = classify({
+        issues: [
+          issue({ status, updatedAt: new Date("2026-06-18T10:00:00.000Z") }),
+          issue({ id: childId, parentId: sourceId, status, updatedAt: new Date("2026-06-18T10:00:00.000Z") }),
+        ],
+        evaluatedAt,
+      });
+      expect(result.state).toBe("not_applicable");
+    });
+
+    it("defers a hand-off 30 s old and stops at 60 s", () => {
+      const handoff = (secondsAgo: number) =>
+        classify({
+          issues: [issue({
+            status: "in_review",
+            createdAt: new Date("2026-06-18T10:00:00.000Z"),
+            updatedAt: new Date(evaluatedAt.getTime() - secondsAgo * 1000),
+          })],
+          evaluatedAt,
+          firstRunGraceMs: 45_000,
+          completedRunIssueIds: [sourceId],
+        }).state;
+      expect(handoff(30)).toBe("pending_first_run");
+      expect(handoff(60)).toBe("stopped");
+    });
   });
 
   it("does not evaluate a task-watchdog issue as a watched source", () => {

@@ -193,6 +193,103 @@ async function releaseStableWorkspaceLock(spec: SshRemoteExecutionSpec, lockDir:
   );
 }
 
+/** A stable workspace folder is swept when its last restore was ok and it has been unused this long. */
+export const STABLE_WORKSPACE_SWEEP_AFTER_MS = 14 * 24 * 60 * 60 * 1000;
+const LAST_RESTORE_MARKER = ".paperclip-last-restore";
+const RUN_ID_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function assertSafeRemoteBaseDir(baseDir: string): void {
+  if (!path.posix.isAbsolute(baseDir) || /[\0\n]/.test(baseDir) || baseDir.split("/").includes("..")) {
+    throw new Error(`remote base directory is not a safe absolute path: ${JSON.stringify(baseDir)}`);
+  }
+}
+
+// Shell guard shared by every remote removal: the runtime root and its parent folder must be real
+// directories, so a symlink planted in the workspace never redirects an `rm -rf` outside it.
+function remoteRuntimeGuard(baseDir: string, subDir: "workspaces" | "runs"): string {
+  const runtime = shellQuote(path.posix.join(baseDir, ".paperclip-runtime"));
+  const parent = shellQuote(path.posix.join(baseDir, ".paperclip-runtime", subDir));
+  return `{ [ -d ${runtime} ] && [ ! -L ${runtime} ] && [ -d ${parent} ] && [ ! -L ${parent} ]; }`;
+}
+
+// Deletes everything but the lock first, then the lock, so a run starting meanwhile sees it busy.
+function removeLockedFolderScript(dir: string): string {
+  const quoted = shellQuote(dir);
+  return `find ${quoted} -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf {} + ; rm -rf ${shellQuote(`${dir}/lock`)}; rmdir ${quoted} 2>/dev/null; true`;
+}
+
+export type StableWorkspaceRemoval = "removed" | "absent" | "locked" | "unsafe";
+
+/**
+ * Removes `<baseDir>/.paperclip-runtime/workspaces/<id>` on an SSH host, unless a run holds its lock.
+ * Throws for a non-UUID id or an unsafe base directory; reports "unsafe" for a symlinked folder.
+ */
+export async function removeStableSshWorkspaceFolder(
+  spec: SshRemoteExecutionSpec,
+  baseDir: string,
+  executionWorkspaceId: string,
+): Promise<StableWorkspaceRemoval> {
+  if (!UUID_PATTERN.test(executionWorkspaceId)) {
+    throw new Error(`execution workspace id is not a UUID: ${JSON.stringify(executionWorkspaceId)}`);
+  }
+  assertSafeRemoteBaseDir(baseDir);
+  const dir = path.posix.join(baseDir, ".paperclip-runtime", "workspaces", executionWorkspaceId);
+  const quoted = shellQuote(dir);
+  const result = await runSshCommand(
+    spec,
+    `if ! ${remoteRuntimeGuard(baseDir, "workspaces")}; then ` +
+      `if [ -L ${shellQuote(path.posix.join(baseDir, ".paperclip-runtime"))} ] || [ -L ${shellQuote(path.posix.dirname(dir))} ]; then echo UNSAFE; else echo ABSENT; fi; ` +
+      `elif [ -L ${quoted} ]; then echo UNSAFE; elif [ ! -d ${quoted} ]; then echo ABSENT; ` +
+      `elif mkdir ${shellQuote(`${dir}/lock`)} 2>/dev/null; then ${removeLockedFolderScript(dir)}; echo REMOVED; ` +
+      `else echo LOCKED; fi`,
+  );
+  switch (result.stdout.trim().split("\n").pop()) {
+    case "REMOVED": return "removed";
+    case "LOCKED": return "locked";
+    case "UNSAFE": return "unsafe";
+    default: return "absent";
+  }
+}
+
+// Removes folders other runs left behind: unlocked, last restore ok, marker older than the sweep age.
+async function sweepStaleStableWorkspaces(spec: SshRemoteExecutionSpec, baseDir: string, exceptId: string): Promise<void> {
+  assertSafeRemoteBaseDir(baseDir);
+  const root = path.posix.join(baseDir, ".paperclip-runtime", "workspaces");
+  const minutes = Math.floor(STABLE_WORKSPACE_SWEEP_AFTER_MS / 60_000);
+  await runSshCommand(
+    spec,
+    `if ${remoteRuntimeGuard(baseDir, "workspaces")}; then for d in ${shellQuote(root)}/*/; do d="\${d%/}"; id="\${d##*/}"; ` +
+      `[ "$id" = ${shellQuote(exceptId)} ] && continue; [ -L "$d" ] && continue; ` +
+      `printf '%s' "$id" | grep -Eqi '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || continue; ` +
+      `m="$d/${LAST_RESTORE_MARKER}"; [ -f "$m" ] && [ ! -L "$m" ] && grep -q '^ok' "$m" || continue; ` +
+      `[ -n "$(find "$m" -maxdepth 0 -mmin +${minutes} 2>/dev/null)" ] || continue; ` +
+      `if mkdir "$d/lock" 2>/dev/null; then ${removeLockedFolderScript("$d").replace(/'\$d'/g, '"$d"').replace(/'\$d\/lock'/g, '"$d/lock"')}; fi; done; fi; true`,
+  );
+}
+
+async function markStableWorkspaceRestore(spec: SshRemoteExecutionSpec, workspaceDir: string, ok: boolean): Promise<void> {
+  const marker = shellQuote(path.posix.join(path.posix.dirname(workspaceDir), LAST_RESTORE_MARKER));
+  await runSshCommand(spec, `printf '%s %s\n' ${ok ? "ok" : "failed"} "$(date +%s)" > ${marker}`);
+}
+
+// Removes `runs/<runId>` (or only its runtime assets, which hold bearer tokens) after the restore.
+async function cleanupRemoteRunFolder(
+  spec: SshRemoteExecutionSpec,
+  baseDir: string,
+  runId: string,
+  keep: { dir: string } | null,
+): Promise<void> {
+  if (!RUN_ID_SEGMENT_PATTERN.test(runId)) return;
+  assertSafeRemoteBaseDir(baseDir);
+  const runDir = path.posix.join(baseDir, ".paperclip-runtime", "runs", runId);
+  const quotedRun = shellQuote(runDir);
+  // A kept per-run workspace holds its own runtime assets under `workspace/.paperclip-runtime`.
+  const script = keep
+    ? `rm -rf ${shellQuote(path.posix.join(keep.dir, ".paperclip-runtime"))} ${shellQuote(path.posix.join(runDir, "runtime"))}`
+    : `rm -rf ${quotedRun}`;
+  await runSshCommand(spec, `if ${remoteRuntimeGuard(baseDir, "runs")} && [ ! -L ${quotedRun} ]; then ${script}; fi; true`);
+}
+
 const SSH_COPY_BACK_DEPENDENCY_EXCLUDES = ["node_modules", "node_modules/*", "*/node_modules", "*/node_modules/*"];
 
 export async function prepareRemoteManagedRuntime(input: {
@@ -232,6 +329,15 @@ export async function prepareRemoteManagedRuntime(input: {
         onProgress: input.onProgress,
       })
     : null;
+  const cleanupRun = (keep: { dir: string } | null) =>
+    cleanupRemoteRunFolder(input.spec, baseWorkspaceRemoteDir, input.runId, keep).catch((error) => {
+      console.warn(`[paperclip] Failed to remove remote run folder for ${input.runId}. ${String(error)}`);
+    });
+  if (stableId) {
+    await sweepStaleStableWorkspaces(input.spec, baseWorkspaceRemoteDir, stableId).catch((error) => {
+      console.warn(`[paperclip] Remote workspace sweep failed. ${String(error)}`);
+    });
+  }
   const releaseStableLock = async () => {
     if (stableLock?.acquired) await releaseStableWorkspaceLock(input.spec, stableLock.lockDir, input.runId).catch(() => undefined);
   };
@@ -249,6 +355,8 @@ export async function prepareRemoteManagedRuntime(input: {
   try {
     return await prepareLockedRemoteManagedRuntime();
   } catch (error) {
+    // Keep a per-run workspace: the preparation did not finish, so nothing proves it was restored.
+    await cleanupRun(syncWorkspace && !stableWorkspaceDir ? { dir: workspaceRemoteDir } : null);
     await releaseStableLock();
     throw error;
   }
@@ -381,6 +489,7 @@ export async function prepareRemoteManagedRuntime(input: {
     assetDirs,
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
+      let restored = false;
       try {
       if (preparedWorkspace && baselineSnapshot) {
         await restoreWorkspaceFromSshExecution({
@@ -401,7 +510,13 @@ export async function prepareRemoteManagedRuntime(input: {
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
       }
+      restored = true;
       } finally {
+        if (stableWorkspaceDir) {
+          await markStableWorkspaceRestore(input.spec, stableWorkspaceDir, restored).catch(() => undefined);
+        }
+        // A per-run workspace is removed after a good restore only; assets (bearer tokens) always.
+        await cleanupRun(syncWorkspace && !stableWorkspaceDir && !restored ? { dir: workspaceRemoteDir } : null);
         await releaseStableLock();
       }
     },

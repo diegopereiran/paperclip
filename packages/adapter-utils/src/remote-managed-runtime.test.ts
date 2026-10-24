@@ -407,8 +407,10 @@ describe("stable remote workspace folder", () => {
     expect(prepared.runtimeRootDir).toBe("/app/.paperclip-runtime/runs/run-a/runtime/x");
     expect(lockCommands().some((command) => command.includes(`workspaces/${WS_ID}/lock`))).toBe(true);
     await prepared.restoreWorkspace();
-    expect(lockCommands().at(-1)).toContain("rm -rf");
-    expect(lockCommands().at(-1)).toContain("runId=run-a");
+    const release = lockCommands().find((command) => command.includes("grep -qx") && command.includes("runId=run-a"));
+    expect(release).toContain("rm -rf");
+    // The release is the last step, after the marker write and the run-folder cleanup.
+    expect(lockCommands().at(-1)).toBe(release);
   });
 
   it.each([undefined, null, "", "../etc", "a/b", "not-a-uuid"])("falls back to the per-run folder for id %j", async (id) => {
@@ -429,7 +431,8 @@ describe("stable remote workspace folder", () => {
     expect(prepared.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-b/workspace");
     expect(progress.join("")).toContain("stable remote folder busy (owner run-live); using per-run folder");
     await prepared.restoreWorkspace();
-    expect(lockCommands().some((command) => command.includes("rm -rf"))).toBe(false);
+    // This run never held the lock, so it never releases it.
+    expect(lockCommands().some((command) => command.includes("grep -qx"))).toBe(false);
   });
 
   it("takes over a lock whose owner run is terminal", async () => {

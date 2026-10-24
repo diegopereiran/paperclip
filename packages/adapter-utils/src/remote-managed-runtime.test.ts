@@ -442,4 +442,40 @@ describe("stable remote workspace folder", () => {
     });
     expect(fresh.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-c/workspace");
   });
+
+  it("lets only one of two runs take over the same stale lock", async () => {
+    // Stateful stand-in for the remote lock dir: mkdir fails while it exists, the reap command is
+    // atomic and only replaces the lock while its owner is still the one the caller observed.
+    let owner: string | null = "run-dead";
+    let reapHeld = false;
+    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    let removals = 0;
+    await setup(() => "");
+    runSshCommand.mockImplementation((async (_spec: unknown, command: string) => {
+      await tick();
+      // The second run's unconditional removal lands after the first run has retaken the lock.
+      if (command.startsWith("rm -rf") && removals++ === 1) for (let i = 0; i < 4; i++) await tick();
+      const runId = /printf 'runId=%s[^']*' '([^']+)'/.exec(command)?.[1] ?? "";
+      let stdout = "";
+      if (command.startsWith("rm -rf")) {
+        owner = null;
+      } else if (command.includes(".reap")) {
+        const observed = /grep -qx 'runId=([^']+)'/.exec(command)?.[1] ?? null;
+        if (reapHeld || owner !== observed) stdout = "BUSY\n";
+        else { owner = runId; stdout = "ACQUIRED\n"; }
+      } else if (command.includes("mkdir")) {
+        if (owner === null) { owner = runId; stdout = "ACQUIRED\n"; }
+        else stdout = `BUSY\nrunId=${owner}\nstartedAt=${Date.now()}\n`;
+      }
+      return { stdout, stderr: "" };
+    }) as never);
+    const run = (runId: string) => prepareRemoteManagedRuntime({
+      spec: { ...stable, isRunActive: async (id) => id !== "run-dead" }, runId, adapterKey: "x",
+      workspaceLocalDir: localDir, executionWorkspaceId: WS_ID,
+    });
+    const [a, b] = await Promise.all([run("run-a"), run("run-b")]);
+    const stableDir = `/app/.paperclip-runtime/workspaces/${WS_ID}/workspace`;
+    expect([a.workspaceRemoteDir, b.workspaceRemoteDir].filter((dir) => dir === stableDir)).toHaveLength(1);
+    expect(owner === "run-a" ? a.workspaceRemoteDir : b.workspaceRemoteDir).toBe(stableDir);
+  });
 });

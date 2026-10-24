@@ -128,6 +128,27 @@ async function tryMkdirLock(spec: SshRemoteExecutionSpec, lockDir: string, runId
   return { acquired: false, owner: result.stdout };
 }
 
+// Replaces a stale lock in one remote command, under a short `<lock>.reap` mutex, and only while the owner
+// is still the one we judged stale. A bare `rm -rf` after reading the owner could delete a lock that
+// another run took in between.
+async function takeOverStaleLock(spec: SshRemoteExecutionSpec, lockDir: string, runId: string, observedOwnerRunId: string): Promise<boolean> {
+  const lock = shellQuote(lockDir);
+  const reap = shellQuote(`${lockDir}.reap`);
+  const ownerFile = shellQuote(`${lockDir}/owner`);
+  const stillObserved = observedOwnerRunId
+    ? `grep -qx ${shellQuote(`runId=${observedOwnerRunId}`)} ${ownerFile} 2>/dev/null`
+    : `[ ! -s ${ownerFile} ]`;
+  const result = await runSshCommand(
+    spec,
+    `if [ -n "$(find ${reap} -maxdepth 0 -mmin +5 2>/dev/null)" ]; then rmdir ${reap} 2>/dev/null; fi; ` +
+      `if mkdir ${reap} 2>/dev/null; then ` +
+      `if ${stillObserved} && rm -rf ${lock} && mkdir ${lock} 2>/dev/null; then ` +
+      `printf 'runId=%s\nstartedAt=%s\n' ${shellQuote(runId)} ${Date.now()} > ${ownerFile}; echo ACQUIRED; else echo BUSY; fi; ` +
+      `rmdir ${reap} 2>/dev/null; else echo BUSY; fi`,
+  );
+  return result.stdout.trim().split("\n")[0] === "ACQUIRED";
+}
+
 async function acquireStableWorkspaceLock(input: {
   spec: SshRemoteExecutionSpec;
   baseDir: string;
@@ -156,9 +177,7 @@ async function acquireStableWorkspaceLock(input: {
     stale = ageMs > timeoutMs + STALE_LOCK_GRACE_MS;
   }
   if (stale) {
-    await runSshCommand(input.spec, `rm -rf ${shellQuote(lockDir)}`);
-    const retaken = await tryMkdirLock(input.spec, lockDir, input.runId);
-    if (retaken.acquired) return { lockDir, acquired: true };
+    if (await takeOverStaleLock(input.spec, lockDir, input.runId, ownerRunId)) return { lockDir, acquired: true };
   }
   await input.onProgress?.(
     `[paperclip] stable remote folder busy (owner ${(ownerRunId || "unknown").replace(/[^A-Za-z0-9_-]/g, "?")}); using per-run folder\n`,

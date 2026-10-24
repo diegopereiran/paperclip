@@ -1,4 +1,5 @@
-import type { Db } from "@paperclipai/db";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
 import {
@@ -667,6 +668,16 @@ export async function resolveEnvironmentExecutionTarget(input: {
       knownHosts: parsed.config.knownHosts,
       strictHostKeyChecking: parsed.config.strictHostKeyChecking,
       remoteCwd,
+      remoteWorkspaceKey: parsed.config.remoteWorkspaceKey,
+      // Lets a stable remote folder lock held by a finished run be taken over.
+      isRunActive: async (runId: string) => {
+        const rows = await input.db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, ["queued", "running"])))
+          .limit(1);
+        return rows.length > 0;
+      },
     },
   };
 }

@@ -821,6 +821,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             adapterKey: "codex",
             timeoutSec,
             workspaceLocalDir: cwd,
+            executionWorkspaceId: asString(workspaceContext.executionWorkspaceId, "") || null,
             workspaceRemoteDir:
               targetWorkspaceRealization?.mode === "in_place"
                 ? targetWorkspaceRealization.authoritativeRoot

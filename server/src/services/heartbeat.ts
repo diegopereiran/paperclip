@@ -3780,6 +3780,7 @@ export function heartbeatService(
         strategy: executionWorkspace.strategy,
         projectId: executionWorkspace.projectId,
         workspaceId: executionWorkspace.workspaceId,
+        executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
         repoUrl: executionWorkspace.repoUrl,
         repoRef: executionWorkspace.repoRef,
         branchName: executionWorkspace.branchName,

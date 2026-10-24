@@ -323,6 +323,38 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
   });
 
+  it("passes the SSH remote workspace key and a run-liveness lookup into the target spec", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "ssh",
+      config: {
+        host: "192.0.2.10",
+        port: 22,
+        username: "paperclip",
+        remoteWorkspacePath: "/srv/paperclip",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+        remoteWorkspaceKey: "execution_workspace",
+      },
+    });
+    const limit = vi.fn().mockResolvedValueOnce([{ id: "run-live" }]).mockResolvedValueOnce([]);
+    const db = { select: () => ({ from: () => ({ where: () => ({ limit }) }) }) };
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: db as never,
+      companyId: "company-1",
+      adapterType: "grok_local",
+      environment: { id: "env-ssh-1", driver: "ssh", config: {} },
+      leaseId: "lease-ssh-1",
+      leaseMetadata: {},
+    } as never);
+
+    expect(target).toMatchObject({ kind: "remote", transport: "ssh", spec: { remoteWorkspaceKey: "execution_workspace" } });
+    const isRunActive = (target as { spec: { isRunActive: (id: string) => Promise<boolean> } }).spec.isRunActive;
+    await expect(isRunActive("run-live")).resolves.toBe(true);
+    await expect(isRunActive("run-done")).resolves.toBe(false);
+  });
+
   it("resolves SSH execution targets for grok_local", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "ssh",

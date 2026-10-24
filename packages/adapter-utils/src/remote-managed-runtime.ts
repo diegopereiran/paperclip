@@ -106,12 +106,84 @@ export function remoteExecutionSessionMatches(saved: unknown, current: SshRemote
   );
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const STALE_LOCK_GRACE_MS = 30 * 60 * 1000;
+
+interface StableWorkspaceLock {
+  lockDir: string;
+  acquired: boolean;
+}
+
+// `mkdir` is the atomic lock; the owner file lets another run tell a live holder from a dead one.
+async function tryMkdirLock(spec: SshRemoteExecutionSpec, lockDir: string, runId: string): Promise<{ acquired: boolean; owner: string }> {
+  const result = await runSshCommand(
+    spec,
+    `mkdir -p ${shellQuote(path.posix.dirname(lockDir))} && if mkdir ${shellQuote(lockDir)} 2>/dev/null; then ` +
+      `printf 'runId=%s\nstartedAt=%s\n' ${shellQuote(runId)} ${Date.now()} > ${shellQuote(`${lockDir}/owner`)}; echo ACQUIRED; ` +
+      `else echo BUSY; cat ${shellQuote(`${lockDir}/owner`)} 2>/dev/null; ` +
+      `echo "mtime=$(stat -c %Y ${shellQuote(lockDir)} 2>/dev/null || stat -f %m ${shellQuote(lockDir)} 2>/dev/null)"; echo "now=$(date +%s)"; fi`,
+  );
+  const lines = result.stdout.split("\n").map((line) => line.trim());
+  if (lines[0] === "ACQUIRED") return { acquired: true, owner: "" };
+  return { acquired: false, owner: result.stdout };
+}
+
+async function acquireStableWorkspaceLock(input: {
+  spec: SshRemoteExecutionSpec;
+  baseDir: string;
+  executionWorkspaceId: string;
+  runId: string;
+  timeoutSec?: number;
+  onProgress?: RuntimeProgressSink;
+}): Promise<StableWorkspaceLock> {
+  const lockDir = path.posix.join(input.baseDir, ".paperclip-runtime", "workspaces", input.executionWorkspaceId, "lock");
+  const first = await tryMkdirLock(input.spec, lockDir, input.runId);
+  if (first.acquired) return { lockDir, acquired: true };
+
+  const field = (name: string) => new RegExp(`^${name}=(.*)$`, "m").exec(first.owner)?.[1]?.trim() ?? "";
+  const ownerRunId = field("runId");
+  const startedAt = Number(field("startedAt"));
+  const mtime = Number(field("mtime"));
+  const now = Number(field("now"));
+  let stale: boolean;
+  if (ownerRunId && input.spec.isRunActive) {
+    stale = !(await input.spec.isRunActive(ownerRunId).catch(() => true));
+  } else {
+    const timeoutMs = input.timeoutSec && input.timeoutSec > 0 ? input.timeoutSec * 1000 : 0;
+    const ageMs = Number.isFinite(startedAt) && startedAt > 0
+      ? Date.now() - startedAt
+      : Number.isFinite(mtime) && Number.isFinite(now) && mtime > 0 ? (now - mtime) * 1000 : 0;
+    stale = ageMs > timeoutMs + STALE_LOCK_GRACE_MS;
+  }
+  if (stale) {
+    await runSshCommand(input.spec, `rm -rf ${shellQuote(lockDir)}`);
+    const retaken = await tryMkdirLock(input.spec, lockDir, input.runId);
+    if (retaken.acquired) return { lockDir, acquired: true };
+  }
+  await input.onProgress?.(
+    `[paperclip] stable remote folder busy (owner ${(ownerRunId || "unknown").replace(/[^A-Za-z0-9_-]/g, "?")}); using per-run folder\n`,
+  );
+  return { lockDir, acquired: false };
+}
+
+// Only the owner removes the lock, so a late finally never frees a lock another run took over.
+async function releaseStableWorkspaceLock(spec: SshRemoteExecutionSpec, lockDir: string, runId: string): Promise<void> {
+  await runSshCommand(
+    spec,
+    `grep -qx ${shellQuote(`runId=${runId}`)} ${shellQuote(`${lockDir}/owner`)} 2>/dev/null && rm -rf ${shellQuote(lockDir)}; true`,
+  );
+}
+
 export async function prepareRemoteManagedRuntime(input: {
   spec: SshRemoteExecutionSpec;
   runId: string;
   adapterKey: string;
   workspaceLocalDir: string;
   workspaceRemoteDir?: string;
+  /** Execution workspace id; keys the stable remote folder when `spec.remoteWorkspaceKey` is "execution_workspace". */
+  executionWorkspaceId?: string | null;
+  /** Adapter timeout; a lock older than this plus 30 minutes is stale when no `spec.isRunActive` exists. */
+  timeoutSec?: number;
   syncWorkspace?: boolean;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
@@ -124,16 +196,43 @@ export async function prepareRemoteManagedRuntime(input: {
 }): Promise<PreparedRemoteManagedRuntime> {
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const syncWorkspace = input.syncWorkspace !== false;
-  const workspaceRemoteDir = syncWorkspace
-    ? path.posix.join(
-        baseWorkspaceRemoteDir,
-        ".paperclip-runtime",
-        "runs",
-        input.runId,
-        "workspace",
-      )
-    : baseWorkspaceRemoteDir;
-  const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  const stableId =
+    syncWorkspace && input.spec.remoteWorkspaceKey === "execution_workspace" && input.executionWorkspaceId &&
+    UUID_PATTERN.test(input.executionWorkspaceId)
+      ? input.executionWorkspaceId
+      : null;
+  const stableLock = stableId
+    ? await acquireStableWorkspaceLock({
+        spec: input.spec,
+        baseDir: baseWorkspaceRemoteDir,
+        executionWorkspaceId: stableId,
+        runId: input.runId,
+        timeoutSec: input.timeoutSec,
+        onProgress: input.onProgress,
+      })
+    : null;
+  const releaseStableLock = async () => {
+    if (stableLock?.acquired) await releaseStableWorkspaceLock(input.spec, stableLock.lockDir, input.runId).catch(() => undefined);
+  };
+  const stableWorkspaceDir = stableLock?.acquired
+    ? path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "workspaces", stableId!, "workspace")
+    : null;
+  const workspaceRemoteDir = !syncWorkspace
+    ? baseWorkspaceRemoteDir
+    : stableWorkspaceDir ??
+      path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs", input.runId, "workspace");
+  // A stable workspace folder is shared across runs, so runtime assets stay per run beside it.
+  const runtimeRootDir = stableWorkspaceDir
+    ? path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs", input.runId, "runtime", input.adapterKey)
+    : path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  try {
+    return await prepareLockedRemoteManagedRuntime();
+  } catch (error) {
+    await releaseStableLock();
+    throw error;
+  }
+
+  async function prepareLockedRemoteManagedRuntime(): Promise<PreparedRemoteManagedRuntime> {
   // Named after the run so a reaper can land this run's import, and only it.
   const importedRef = sshImportedRefForRun(input.runId) ?? undefined;
 
@@ -257,6 +356,7 @@ export async function prepareRemoteManagedRuntime(input: {
     assetDirs,
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
+      try {
       if (preparedWorkspace && baselineSnapshot) {
         await restoreWorkspaceFromSshExecution({
           spec: input.spec,
@@ -276,6 +376,10 @@ export async function prepareRemoteManagedRuntime(input: {
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
       }
+      } finally {
+        await releaseStableLock();
+      }
     },
   };
+  }
 }

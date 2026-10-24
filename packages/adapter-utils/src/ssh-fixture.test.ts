@@ -1452,4 +1452,57 @@ describe("ssh env-lab fixture", () => {
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("reuses one remote workspace folder across runs on an execution workspace and falls back when it is busy", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    const workspaceId = "11111111-2222-4333-8444-555555555555";
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "build-cache/\n", "utf8");
+    await writeFile(path.join(localRepo, "README.md"), "primary\n", "utf8");
+    await git(localRepo, ["add", "."]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH stable workspace folder test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir, remoteWorkspaceKey: "execution_workspace" as const };
+    const base = { spec, adapterKey: "test-adapter", workspaceLocalDir: localRepo, executionWorkspaceId: workspaceId };
+
+    const first = await prepareRemoteManagedRuntime({ ...base, runId: "run-one" });
+    // A build output that bakes in its absolute path, like a compiled cache would.
+    await runSshCommand(
+      spec,
+      `mkdir -p '${first.workspaceRemoteDir}/build-cache' && printf '%s' '${first.workspaceRemoteDir}' > '${first.workspaceRemoteDir}/build-cache/abs-path.txt'`,
+    );
+    await first.restoreWorkspace();
+
+    const second = await prepareRemoteManagedRuntime({ ...base, runId: "run-two" });
+    expect(second.workspaceRemoteDir).toBe(first.workspaceRemoteDir);
+    const kept = await runSshCommand(spec, `cat '${second.workspaceRemoteDir}/build-cache/abs-path.txt'`);
+    expect(kept.stdout).toBe(second.workspaceRemoteDir);
+
+    // run-two still holds the folder: a concurrent third run gets its own.
+    const progress: string[] = [];
+    const third = await prepareRemoteManagedRuntime({
+      ...base,
+      runId: "run-three",
+      spec: { ...spec, isRunActive: async () => true },
+      onProgress: (line) => void progress.push(line),
+    });
+    expect(third.workspaceRemoteDir).not.toBe(second.workspaceRemoteDir);
+    expect(third.workspaceRemoteDir).toContain("/runs/run-three/workspace");
+    expect(progress.join("")).toContain("stable remote folder busy (owner run-two); using per-run folder");
+    await third.restoreWorkspace();
+    await second.restoreWorkspace();
+
+    const fourth = await prepareRemoteManagedRuntime({ ...base, runId: "run-four" });
+    expect(fourth.workspaceRemoteDir).toBe(first.workspaceRemoteDir);
+    await fourth.restoreWorkspace();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 });

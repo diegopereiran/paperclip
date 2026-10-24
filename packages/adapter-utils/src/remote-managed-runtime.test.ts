@@ -351,3 +351,95 @@ describe("remote managed runtime", () => {
     }
   });
 });
+
+describe("stable remote workspace folder", () => {
+  const WS_ID = "11111111-2222-4333-8444-555555555555";
+  const spec = {
+    host: "192.0.2.10", port: 22, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+    privateKey: null, knownHosts: null, strictHostKeyChecking: true,
+  };
+  const stable = { ...spec, remoteWorkspaceKey: "execution_workspace" as const };
+  const lockCommands = () => runSshCommand.mock.calls.map((call) => String((call as unknown[])[1]));
+  let localDir = "";
+
+  async function setup(sshImpl: (command: string) => string) {
+    localDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-stable-"));
+    runSshCommand.mockImplementation((async (_spec: unknown, command: string) => ({ stdout: sshImpl(command), stderr: "" })) as never);
+  }
+
+  afterEach(async () => {
+    runSshCommand.mockImplementation((async () => ({ stdout: "", stderr: "" })) as never);
+    vi.clearAllMocks();
+    await rm(localDir, { recursive: true, force: true });
+  });
+
+  it("keeps per-run paths byte-identical by default", async () => {
+    await setup(() => "ACQUIRED\n");
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "run-a", adapterKey: "x", workspaceLocalDir: localDir, executionWorkspaceId: WS_ID,
+    });
+    expect(prepared.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-a/workspace");
+    expect(prepared.runtimeRootDir).toBe("/app/.paperclip-runtime/runs/run-a/workspace/.paperclip-runtime/x");
+    expect(lockCommands().some((command) => command.includes("mkdir"))).toBe(false);
+  });
+
+  it("uses one folder per execution workspace and per-run runtime assets, and releases the lock on restore", async () => {
+    await setup(() => "ACQUIRED\n");
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: stable, runId: "run-a", adapterKey: "x", workspaceLocalDir: localDir, executionWorkspaceId: WS_ID,
+    });
+    expect(prepared.workspaceRemoteDir).toBe(`/app/.paperclip-runtime/workspaces/${WS_ID}/workspace`);
+    expect(prepared.runtimeRootDir).toBe("/app/.paperclip-runtime/runs/run-a/runtime/x");
+    expect(lockCommands().some((command) => command.includes(`workspaces/${WS_ID}/lock`))).toBe(true);
+    await prepared.restoreWorkspace();
+    expect(lockCommands().at(-1)).toContain("rm -rf");
+    expect(lockCommands().at(-1)).toContain("runId=run-a");
+  });
+
+  it.each([undefined, null, "", "../etc", "a/b", "not-a-uuid"])("falls back to the per-run folder for id %j", async (id) => {
+    await setup(() => "ACQUIRED\n");
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: stable, runId: "run-a", adapterKey: "x", workspaceLocalDir: localDir, executionWorkspaceId: id,
+    });
+    expect(prepared.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-a/workspace");
+  });
+
+  it("falls back to the per-run folder and logs when a live run holds the lock", async () => {
+    await setup((command) => (command.includes("mkdir") ? "BUSY\nrunId=run-live\nstartedAt=" + Date.now() + "\n" : ""));
+    const progress: string[] = [];
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...stable, isRunActive: async () => true }, runId: "run-b", adapterKey: "x",
+      workspaceLocalDir: localDir, executionWorkspaceId: WS_ID, onProgress: (line) => void progress.push(line),
+    });
+    expect(prepared.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-b/workspace");
+    expect(progress.join("")).toContain("stable remote folder busy (owner run-live); using per-run folder");
+    await prepared.restoreWorkspace();
+    expect(lockCommands().some((command) => command.includes("rm -rf"))).toBe(false);
+  });
+
+  it("takes over a lock whose owner run is terminal", async () => {
+    let mkdirs = 0;
+    await setup((command) => (command.includes("mkdir") ? (mkdirs++ === 0 ? "BUSY\nrunId=run-dead\nstartedAt=" + Date.now() + "\n" : "ACQUIRED\n") : ""));
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...stable, isRunActive: async (runId) => runId !== "run-dead" }, runId: "run-b", adapterKey: "x",
+      workspaceLocalDir: localDir, executionWorkspaceId: WS_ID,
+    });
+    expect(prepared.workspaceRemoteDir).toBe(`/app/.paperclip-runtime/workspaces/${WS_ID}/workspace`);
+  });
+
+  it("without a run lookup, takes over only a lock older than the timeout plus 30 minutes", async () => {
+    const owner = (ageMs: number) => `BUSY\nrunId=run-old\nstartedAt=${Date.now() - ageMs}\n`;
+    let mkdirs = 0;
+    await setup((command) => (command.includes("mkdir") ? (mkdirs++ === 0 ? owner(31 * 60_000 + 60_000) : "ACQUIRED\n") : ""));
+    const stale = await prepareRemoteManagedRuntime({
+      spec: stable, runId: "run-b", adapterKey: "x", workspaceLocalDir: localDir, executionWorkspaceId: WS_ID, timeoutSec: 60,
+    });
+    expect(stale.workspaceRemoteDir).toContain(`/workspaces/${WS_ID}/`);
+
+    await setup((command) => (command.includes("mkdir") ? owner(10 * 60_000) : ""));
+    const fresh = await prepareRemoteManagedRuntime({
+      spec: stable, runId: "run-c", adapterKey: "x", workspaceLocalDir: localDir, executionWorkspaceId: WS_ID, timeoutSec: 60,
+    });
+    expect(fresh.workspaceRemoteDir).toBe("/app/.paperclip-runtime/runs/run-c/workspace");
+  });
+});

@@ -212,10 +212,18 @@ function remoteRuntimeGuard(baseDir: string, subDir: "workspaces" | "runs"): str
   return `{ [ -d ${runtime} ] && [ ! -L ${runtime} ] && [ -d ${parent} ] && [ ! -L ${parent} ]; }`;
 }
 
+// A materialised skill keeps its source's read-only mode, and `rm -rf` cannot empty a read-only
+// directory. Owner-write first; `chmod -R` (no -L/-H) never follows a symlink inside the tree, and
+// callers only pass paths the guard proved are not symlinks.
+function makeWritableThenRemove(...quotedPaths: string[]): string {
+  const paths = quotedPaths.join(" ");
+  return `chmod -R u+w ${paths} 2>/dev/null; rm -rf ${paths}`;
+}
+
 // Deletes everything but the lock first, then the lock, so a run starting meanwhile sees it busy.
 function removeLockedFolderScript(dir: string): string {
   const quoted = shellQuote(dir);
-  return `find ${quoted} -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf {} + ; rm -rf ${shellQuote(`${dir}/lock`)}; rmdir ${quoted} 2>/dev/null; true`;
+  return `chmod -R u+w ${quoted} 2>/dev/null; find ${quoted} -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf {} + ; rm -rf ${shellQuote(`${dir}/lock`)}; rmdir ${quoted} 2>/dev/null; true`;
 }
 
 export type StableWorkspaceRemoval = "removed" | "absent" | "locked" | "unsafe";
@@ -285,8 +293,8 @@ async function cleanupRemoteRunFolder(
   const quotedRun = shellQuote(runDir);
   // A kept per-run workspace holds its own runtime assets under `workspace/.paperclip-runtime`.
   const script = keep
-    ? `rm -rf ${shellQuote(path.posix.join(keep.dir, ".paperclip-runtime"))} ${shellQuote(path.posix.join(runDir, "runtime"))}`
-    : `rm -rf ${quotedRun}`;
+    ? makeWritableThenRemove(shellQuote(path.posix.join(keep.dir, ".paperclip-runtime")), shellQuote(path.posix.join(runDir, "runtime")))
+    : makeWritableThenRemove(quotedRun);
   await runSshCommand(spec, `if ${remoteRuntimeGuard(baseDir, "runs")} && [ ! -L ${quotedRun} ]; then ${script}; fi; true`);
 }
 

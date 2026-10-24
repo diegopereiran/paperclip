@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +26,7 @@ vi.mock("./ssh.js", () => ({
   syncDirectoryToSsh,
 }));
 
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { prepareRemoteManagedRuntime, removeStableSshWorkspaceFolder } from "./remote-managed-runtime.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 
@@ -495,5 +496,130 @@ describe("stable remote workspace folder", () => {
     const stableDir = `/app/.paperclip-runtime/workspaces/${WS_ID}/workspace`;
     expect([a.workspaceRemoteDir, b.workspaceRemoteDir].filter((dir) => dir === stableDir)).toHaveLength(1);
     expect(owner === "run-a" ? a.workspaceRemoteDir : b.workspaceRemoteDir).toBe(stableDir);
+  });
+});
+
+// Runs the generated remote commands in a real local shell, so a read-only tree behaves as on the host.
+describe.skipIf(process.getuid?.() === 0)("read-only trees on the SSH host", () => {
+  const WS_ID = "11111111-2222-4333-8444-555555555555";
+  const OLD_ID = "99999999-2222-4333-8444-555555555555";
+  let base = "";
+  const spec = (key?: "execution_workspace") => ({
+    host: "192.0.2.10", port: 22, username: "fixture", remoteWorkspacePath: base, remoteCwd: base,
+    privateKey: null, knownHosts: null, strictHostKeyChecking: true, remoteWorkspaceKey: key,
+  });
+
+  // The shape a materialised skill leaves behind: read-only directories holding a read-only file.
+  async function readOnlySkillTree(root: string) {
+    const skill = path.join(root, ".paperclip-runtime", "claude", "skills", ".claude", "skills", "demo");
+    await mkdir(skill, { recursive: true });
+    await writeFile(path.join(skill, "SKILL.md"), "x");
+    for (const dir of [skill, path.dirname(skill), path.join(root, ".paperclip-runtime", "claude", "skills", ".claude"), path.join(root, ".paperclip-runtime", "claude", "skills")]) {
+      await chmod(dir, 0o555);
+    }
+    await chmod(path.join(skill, "SKILL.md"), 0o444);
+  }
+  const exists = (p: string) => lstat(p).then(() => true, () => false);
+
+  async function setup() {
+    base = await mkdtemp(path.join(os.tmpdir(), "paperclip-ro-"));
+    runSshCommand.mockImplementation((async (_spec: unknown, command: string) => ({
+      stdout: await new Promise<string>((resolve) => execFile("sh", ["-c", command], (_e, out) => resolve(out))),
+      stderr: "",
+    })) as never);
+  }
+
+  afterEach(async () => {
+    runSshCommand.mockImplementation((async () => ({ stdout: "", stderr: "" })) as never);
+    vi.clearAllMocks();
+    await execFileP("chmod", ["-R", "u+w", base]);
+    await rm(base, { recursive: true, force: true });
+  });
+  const execFileP = (cmd: string, args: string[]) => new Promise<void>((resolve) => execFile(cmd, args, () => resolve()));
+
+  it("removes a per-run folder holding read-only skill folders after a good restore", async () => {
+    await setup();
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: spec(), runId: "run-a", adapterKey: "claude", workspaceLocalDir: base, executionWorkspaceId: WS_ID,
+    });
+    const runDir = path.join(base, ".paperclip-runtime", "runs", "run-a");
+    await readOnlySkillTree(path.join(runDir, "workspace"));
+    await prepared.restoreWorkspace();
+    expect(await exists(runDir)).toBe(false);
+  });
+
+  it("removes the runtime assets of a kept per-run workspace and of a stable workspace run", async () => {
+    await setup();
+    const runDir = path.join(base, ".paperclip-runtime", "runs", "run-a");
+    const stableRoot = path.join(base, ".paperclip-runtime", "workspaces", WS_ID, "workspace");
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: spec("execution_workspace"), runId: "run-a", adapterKey: "claude", workspaceLocalDir: base, executionWorkspaceId: WS_ID,
+    });
+    await readOnlySkillTree(path.join(runDir, "runtime"));
+    await prepared.restoreWorkspace();
+    expect(await exists(runDir)).toBe(false);
+    // Failed restore keeps the per-run workspace but still drops its runtime assets.
+    await setup();
+    const kept = path.join(base, ".paperclip-runtime", "runs", "run-b", "workspace");
+    const failing = await prepareRemoteManagedRuntime({
+      spec: spec(), runId: "run-b", adapterKey: "claude", workspaceLocalDir: base,
+    });
+    await readOnlySkillTree(kept);
+    restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("restore failed"));
+    await expect(failing.restoreWorkspace()).rejects.toThrow("restore failed");
+    expect(await exists(path.join(kept, ".paperclip-runtime"))).toBe(false);
+    expect(await exists(stableRoot)).toBe(false);
+  });
+
+  it("removes a closed stable workspace folder holding read-only skill folders", async () => {
+    await setup();
+    const dir = path.join(base, ".paperclip-runtime", "workspaces", WS_ID);
+    await mkdir(path.join(dir, "workspace"), { recursive: true });
+    await readOnlySkillTree(path.join(dir, "workspace"));
+    await expect(removeStableSshWorkspaceFolder(spec(), base, WS_ID)).resolves.toBe("removed");
+    expect(await exists(dir)).toBe(false);
+  });
+
+  it("sweeps a stale stable workspace folder holding read-only skill folders", async () => {
+    await setup();
+    const old = path.join(base, ".paperclip-runtime", "workspaces", OLD_ID);
+    await mkdir(path.join(old, "workspace"), { recursive: true });
+    await readOnlySkillTree(path.join(old, "workspace"));
+    const marker = path.join(old, ".paperclip-last-restore");
+    await writeFile(marker, "ok 1\n");
+    const longAgo = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000);
+    await utimes(marker, longAgo, longAgo);
+    await prepareRemoteManagedRuntime({
+      spec: spec("execution_workspace"), runId: "run-a", adapterKey: "claude", workspaceLocalDir: base, executionWorkspaceId: WS_ID,
+    });
+    expect(await exists(old)).toBe(false);
+  });
+
+  it("never follows a symlink planted in the folder when making it writable", async () => {
+    await setup();
+    const outside = path.join(base, "outside");
+    await readOnlySkillTree(outside);
+    const dir = path.join(base, ".paperclip-runtime", "workspaces", WS_ID);
+    await mkdir(path.join(dir, "workspace"), { recursive: true });
+    await symlink(outside, path.join(dir, "workspace", "link"));
+    await symlink(path.join(outside, ".paperclip-runtime"), path.join(dir, "link2"));
+    await removeStableSshWorkspaceFolder(spec(), base, WS_ID);
+    const target = path.join(outside, ".paperclip-runtime", "claude", "skills");
+    expect(await exists(dir)).toBe(false);
+    expect((await lstat(target)).mode & 0o222).toBe(0);
+    expect((await lstat(path.join(target, ".claude", "skills", "demo", "SKILL.md"))).mode & 0o222).toBe(0);
+  });
+
+  it("leaves a symlinked runs folder and its target untouched", async () => {
+    await setup();
+    const outside = path.join(base, "outside");
+    await readOnlySkillTree(outside);
+    await mkdir(path.join(base, ".paperclip-runtime"), { recursive: true });
+    await symlink(outside, path.join(base, ".paperclip-runtime", "runs"));
+    await prepareRemoteManagedRuntime({
+      spec: spec(), runId: "run-a", adapterKey: "claude", workspaceLocalDir: base,
+    }).then((p) => p.restoreWorkspace());
+    expect((await lstat(path.join(outside, ".paperclip-runtime", "claude", "skills"))).mode & 0o222).toBe(0);
+    expect(await exists(path.join(outside, ".paperclip-runtime", "claude", "skills", ".claude", "skills", "demo", "SKILL.md"))).toBe(true);
   });
 });

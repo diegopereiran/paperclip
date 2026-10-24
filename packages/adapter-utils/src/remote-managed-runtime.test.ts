@@ -60,6 +60,21 @@ describe("remote managed runtime", () => {
   });
 
 
+  it("does not copy dependency folders back from a Git-backed SSH workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-git-"));
+    cleanupDirs.push(root);
+    vi.mocked(prepareWorkspaceForSshExecution).mockResolvedValueOnce({ gitBacked: true } as never);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "git", adapterKey: "test", workspaceLocalDir: root,
+    });
+    await prepared.restoreWorkspace();
+    const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { exclude: string[] } }];
+    // A remote `pnpm install` leaves gigabytes here; the copy-back stages through tmpfs /tmp.
+    expect(args[0].baselineSnapshot.exclude).toEqual(expect.arrayContaining(["node_modules", "*/node_modules"]));
+  });
+
   afterEach(async () => {
     vi.clearAllMocks();
     while (cleanupDirs.length > 0) {

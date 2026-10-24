@@ -106,6 +106,8 @@ export function remoteExecutionSessionMatches(saved: unknown, current: SshRemote
   );
 }
 
+const SSH_COPY_BACK_DEPENDENCY_EXCLUDES = ["node_modules", "node_modules/*", "*/node_modules", "*/node_modules/*"];
+
 export async function prepareRemoteManagedRuntime(input: {
   spec: SshRemoteExecutionSpec;
   runId: string;
@@ -157,6 +159,10 @@ export async function prepareRemoteManagedRuntime(input: {
               ...GIT_ARCHIVE_EXCLUDES,
               "*/.git",
               ".paperclip-runtime",
+              // Dependencies a remote install creates (gigabytes for a pnpm
+              // workspace) are never copied back: the copy-back stages through
+              // os.tmpdir(), which is RAM on a tmpfs /tmp.
+              ...SSH_COPY_BACK_DEPENDENCY_EXCLUDES,
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
             ]
           : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],

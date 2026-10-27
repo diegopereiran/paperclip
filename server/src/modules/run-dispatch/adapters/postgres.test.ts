@@ -24,6 +24,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import { terminalizeLegacyExecution } from "../../../services/legacy-execution-recovery.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 
@@ -1011,6 +1012,26 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, previousRunId))).toHaveLength(0);
     // The upgrade does not silently resume historical blocked work.
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("blocked");
+  });
+
+  it("does not regenerate a folded conversation hold when the stranded-work sweep revisits the run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+    const issueId = randomUUID(), runId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "failed", runtimeMode: "legacy",
+      errorCode: "process_lost", finishedAt: new Date(), contextSnapshot: { issueId } }).returning();
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 1, eventType: "adapter.invoke", payload: { adapterType: "claude_local" } });
+    const sweep = () => terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"], reconcileIfNeeded: true });
+    await sweep();
+    await settleUnrecoverableExecutions(db);
+    await sweep();
+    await settleUnrecoverableExecutions(db);
+    await sweep();
+    await settleUnrecoverableExecutions(db);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(1);
+    const audit = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(audit.filter(a => a.action === "issue.execution_recovery_settled")).toHaveLength(1);
   });
 
   it.each(["process", "http", null])("keeps a historical %s hold after switching to a conversation adapter", async historicalAdapter => {

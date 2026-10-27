@@ -367,9 +367,11 @@ export async function settleUnrecoverableExecutions(
         resolutionNote: "Conversation continuation does not replay prior tool calls.",
         wakePolicy: null,
         monitorPolicy: null,
-        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
-          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
-          else ${issueRecoveryActions.evidence} end`,
+        // Always leave a per-run marker: the stranded-work re-check reads it as
+        // this run's decision and stops opening a new hold for the same run.
+        evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('automaticRecovery',
+          coalesce(${issueRecoveryActions.evidence}->'automaticRecovery', '{}'::jsonb)
+          || jsonb_build_object('runId', ${issueRecoveryActions.evidence}->>'runId', 'replay', 'conversation_continuation'))`,
       }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
       if (!action) continue;
       await persistActivity(tx as unknown as Db, {

@@ -25,7 +25,7 @@ import {
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { terminalizeLegacyExecution } from "../../../services/legacy-execution-recovery.js";
-import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
@@ -1012,6 +1012,73 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, previousRunId))).toHaveLength(0);
     // The upgrade does not silently resume historical blocked work.
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("blocked");
+  });
+
+  describe("orphaned run on a work issue with a conversation adapter", () => {
+    async function seedLostRun(opts: { thread?: boolean; continuationOf?: string } = {}) {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+      const issueId = randomUUID(), runId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      if (opts.thread) await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "user", conversationState: "active" })
+        .where(eq(issues.id, issueId));
+      const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "interrupted", runtimeMode: "legacy",
+        errorCode: "orphaned_running_run", finishedAt: new Date(), retryOfRunId: opts.continuationOf ?? null,
+        contextSnapshot: { issueId, ...(opts.continuationOf ? { source: "execution.reconciled" } : {}) } }).returning();
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 1, eventType: "adapter.invoke", payload: { adapterType: "claude_local" } });
+      await terminalizeLegacyExecution({ db, run: run!, status: "interrupted", fromStatuses: ["interrupted"], reconcileIfNeeded: true });
+      return { companyId, agentId, issueId, runId };
+    }
+    const stubWake = (companyId: string) => vi.fn(async (agentId: string, opts: { contextSnapshot: Record<string, unknown> }) => {
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", contextSnapshot: opts.contextSnapshot }).returning();
+      return queued!;
+    });
+
+    it("wakes the assignee once", async () => {
+      const { companyId, agentId, issueId, runId } = await seedLostRun();
+      const wake = stubWake(companyId);
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, wake as never);
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake.mock.calls[0]![0]).toBe(agentId);
+      expect(wake.mock.calls[0]![1].contextSnapshot).toMatchObject({ issueId, previousRunId: runId });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("in_progress");
+    });
+
+    it("blocks the issue and sends no wake when the continuation is lost too", async () => {
+      const first = await seedLostRun();
+      const wake = stubWake(first.companyId);
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, wake as never);
+      const [continuation] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, first.runId));
+      expect(continuation).toBeDefined();
+      await db.update(heartbeatRuns).set({ status: "interrupted", runtimeMode: "legacy", errorCode: "orphaned_running_run",
+        finishedAt: new Date(), contextSnapshot: { ...continuation!.contextSnapshot, source: "execution.reconciled" } })
+        .where(eq(heartbeatRuns.id, continuation!.id));
+      await db.insert(heartbeatRunEvents).values({ companyId: first.companyId, agentId: first.agentId, runId: continuation!.id, seq: 100,
+        eventType: "adapter.invoke", payload: { adapterType: "claude_local" } });
+      const [lost] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, continuation!.id));
+      await terminalizeLegacyExecution({ db, run: lost!, status: "interrupted", fromStatuses: ["interrupted"], reconcileIfNeeded: true });
+      await settleUnrecoverableExecutions(db, new Date());
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect((await db.select().from(issues).where(eq(issues.id, first.issueId)))[0].status).toBe("blocked");
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.fingerprint, `legacy-execution:${continuation!.id}`));
+      expect(hold).toMatchObject({ status: "resolved", outcome: "blocked", ownerType: "board" });
+    });
+
+    it("keeps the fold for a conversation thread: cancelled, no wake", async () => {
+      const { companyId, issueId, runId } = await seedLostRun({ thread: true });
+      const wake = stubWake(companyId);
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).not.toHaveBeenCalled();
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(hold).toMatchObject({ status: "resolved", outcome: "cancelled", evidence: { runId } });
+      expect(hold!.evidence.automaticRecovery).toMatchObject({ replay: "conversation_continuation" });
+    });
   });
 
   it("does not regenerate a folded conversation hold when the stranded-work sweep revisits the run", async () => {

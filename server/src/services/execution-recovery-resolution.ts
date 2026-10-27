@@ -358,12 +358,21 @@ export async function settleUnrecoverableExecutions(
       .limit(25).for("update", { skipLocked: true });
     for (const candidate of foldable) {
       if (await getConversationOwnershipBlocker(tx as unknown as Db, candidate.companyId, candidate.sourceIssueId)) continue;
+      const [task] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.sourceIssueId))).for("update");
+      // A work issue (not a conversation thread) has nobody to send a message:
+      // deliverReconciledExecutions sends the one continuation wake to its assignee.
+      const wakeAssignee = !!task && !task.conversationAgentId && task.status === "in_progress" &&
+        candidate.returnOwnerAgentId !== null && task.assigneeAgentId === candidate.returnOwnerAgentId &&
+        typeof candidate.evidence.runId === "string";
       const [action] = await tx.update(issueRecoveryActions).set({
         status: "resolved",
         outcome: "cancelled",
         resolvedAt: now,
         updatedAt: now,
-        nextAction: "Automatic attempts stopped. Send a new message to continue the conversation.",
+        nextAction: wakeAssignee
+          ? "Automatic attempts stopped. One continuation wake goes to the assignee."
+          : "Automatic attempts stopped. Send a new message to continue the conversation.",
         resolutionNote: "Conversation continuation does not replay prior tool calls.",
         wakePolicy: null,
         monitorPolicy: null,
@@ -371,7 +380,13 @@ export async function settleUnrecoverableExecutions(
         // this run's decision and stops opening a new hold for the same run.
         evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('automaticRecovery',
           coalesce(${issueRecoveryActions.evidence}->'automaticRecovery', '{}'::jsonb)
-          || jsonb_build_object('runId', ${issueRecoveryActions.evidence}->>'runId', 'replay', 'conversation_continuation'))`,
+          || jsonb_build_object('runId', ${issueRecoveryActions.evidence}->>'runId', 'replay', 'conversation_continuation'))
+          || ${JSON.stringify(wakeAssignee ? {
+            executionReconciliation: { runId: candidate.evidence.runId, providerStopped: true, actionOutcome: "mixed",
+              outcomeEvidence: "Run lost; the continuation does not replay prior tool calls.", actorId: "execution-recovery",
+              recordedAt: now.toISOString() },
+            continuationDelivery: "pending",
+          } : {})}::jsonb`,
       }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
       if (!action) continue;
       await persistActivity(tx as unknown as Db, {

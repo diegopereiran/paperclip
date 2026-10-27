@@ -238,6 +238,10 @@ export async function terminalizeLegacyExecution(input: {
                 sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'conversation_continuation'`,
+            ),
           ),
         )).limit(1);
       if (reconciled) return updated;
@@ -304,7 +308,7 @@ export async function settleInterruptedNativeBootstrap(
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]), and(
         eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"),
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
-        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' in ('blocked', 'conversation_continuation')`,
       )),
     )).for("update");
     const ownedBlock = holds.map(hold => hold.evidence.nativeBootstrapFailureBlock as Record<string, unknown> | undefined)

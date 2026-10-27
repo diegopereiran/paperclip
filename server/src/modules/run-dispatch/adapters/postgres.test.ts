@@ -1015,16 +1015,19 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   describe("orphaned run on a work issue with a conversation adapter", () => {
-    async function seedLostRun(opts: { thread?: boolean; continuationOf?: string } = {}) {
+    async function seedLostRun(opts: { thread?: boolean; continuation?: boolean } = {}) {
       const { companyId, agentId } = await seedCompanyAndAgent();
+      const continuationOf = opts.continuation
+        ? (await db.insert(heartbeatRuns).values({ companyId, agentId, status: "interrupted" }).returning())[0]!.id
+        : null;
       await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
       const issueId = randomUUID(), runId = randomUUID();
       await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
       if (opts.thread) await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "user", conversationState: "active" })
         .where(eq(issues.id, issueId));
       const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "interrupted", runtimeMode: "legacy",
-        errorCode: "orphaned_running_run", finishedAt: new Date(), retryOfRunId: opts.continuationOf ?? null,
-        contextSnapshot: { issueId, ...(opts.continuationOf ? { source: "execution.reconciled" } : {}) } }).returning();
+        errorCode: "orphaned_running_run", finishedAt: new Date(), retryOfRunId: continuationOf,
+        contextSnapshot: { issueId, ...(continuationOf ? { source: "execution.reconciled" } : {}) } }).returning();
       await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 1, eventType: "adapter.invoke", payload: { adapterType: "claude_local" } });
       await terminalizeLegacyExecution({ db, run: run!, status: "interrupted", fromStatuses: ["interrupted"], reconcileIfNeeded: true });
       return { companyId, agentId, issueId, runId };
@@ -1081,9 +1084,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
 
     it("keeps the fold for a thread whose reconciled continuation is lost: cancelled, no wake, no blocker", async () => {
-      const { companyId, agentId } = await seedCompanyAndAgent();
-      const [earlier] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "interrupted" }).returning();
-      const { issueId } = await seedLostRun({ thread: true, continuationOf: earlier!.id });
+      const { companyId, issueId } = await seedLostRun({ thread: true, continuation: true });
       const wake = stubWake(companyId);
       await settleUnrecoverableExecutions(db);
       await deliverReconciledExecutions(db, wake as never);

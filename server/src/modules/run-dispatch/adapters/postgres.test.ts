@@ -1079,6 +1079,21 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(hold).toMatchObject({ status: "resolved", outcome: "cancelled", evidence: { runId } });
       expect(hold!.evidence.automaticRecovery).toMatchObject({ replay: "conversation_continuation" });
     });
+
+    it("keeps the fold for a thread whose reconciled continuation is lost: cancelled, no wake, no blocker", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const [earlier] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "interrupted" }).returning();
+      const { issueId } = await seedLostRun({ thread: true, continuationOf: earlier!.id });
+      const wake = stubWake(companyId);
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).not.toHaveBeenCalled();
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(hold).toMatchObject({ status: "resolved", outcome: "cancelled" });
+      expect(hold!.evidence.automaticRecovery).toMatchObject({ replay: "conversation_continuation" });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("in_progress");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    });
   });
 
   it("does not regenerate a folded conversation hold when the stranded-work sweep revisits the run", async () => {

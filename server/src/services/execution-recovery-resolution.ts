@@ -344,7 +344,8 @@ export async function settleUnrecoverableExecutions(
   now = new Date(),
   options: { failpoint?: (phase: "persisted") => void } = {},
 ) {
-  // Fold obsolete conversation holds without waking historical work on upgrade.
+  // Fold obsolete conversation holds. A conversation thread is folded without a wake
+  // (the user sends the next message). An in_progress work issue gets one continuation wake.
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),

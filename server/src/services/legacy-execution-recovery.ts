@@ -279,7 +279,7 @@ export async function settleInterruptedNativeBootstrap(
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]), and(
         eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"),
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
-        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' in ('blocked', 'conversation_continuation')`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
       )),
     )).for("update");
     const ownedBlock = holds.map(hold => hold.evidence.nativeBootstrapFailureBlock as Record<string, unknown> | undefined)

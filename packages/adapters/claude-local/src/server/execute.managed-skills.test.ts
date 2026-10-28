@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile, readdir } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +46,7 @@ describe("claude_local mounted skills under a managed AI connection", () => {
 
   afterEach(async () => {
     vi.unstubAllEnvs();
+    await chmod(path.join(rootDir, "sources"), 0o755).catch(() => undefined);
     await rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
   });
 
@@ -53,6 +54,9 @@ describe("claude_local mounted skills under a managed AI connection", () => {
     const source = path.join(rootDir, "sources", name);
     await mkdir(source, { recursive: true });
     await writeFile(path.join(source, "SKILL.md"), `# ${name}\n`);
+    // Same modes as the server's runtime skill cache: files 0o444, folders 0o555.
+    await chmod(path.join(source, "SKILL.md"), 0o444);
+    await chmod(source, 0o555);
     return { key: name, runtimeName: name, source };
   }
 
@@ -103,5 +107,15 @@ describe("claude_local mounted skills under a managed AI connection", () => {
     await run({ managed: true, configDir: dirB, skills: [await makeSkill("only-for-b")] });
     expect(await readdir(path.join(dirB, "skills"))).toEqual(["only-for-b"]);
     expect(await readdir(path.join(dirA, "skills"))).toEqual(["only-for-a"]);
+  });
+
+  it("leaves a config dir that can be removed and re-run when the sources are read-only", async () => {
+    const configDir = path.join(rootDir, "ro-home", "provider");
+    const first = await makeSkill("first-skill");
+    await run({ managed: true, configDir, skills: [first] });
+    const second = await makeSkill("second-skill");
+    await run({ managed: true, configDir, skills: [second] });
+    expect(await readdir(path.join(configDir, "skills"))).toEqual(["second-skill"]);
+    await expect(rm(path.dirname(configDir), { recursive: true, force: true })).resolves.toBeUndefined();
   });
 });

@@ -99,7 +99,7 @@ import {
 import { prepareCompatibleClaudeCommand } from "./sandbox-cli-version.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
-import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import { materializeClaudeUserScopeSkills, prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -580,6 +580,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
+  if (config.managedAiConnection && sharedClaudeConfigDir) {
+    await materializeClaudeUserScopeSkills(sharedClaudeConfigDir, mountableSkillEntries, onLog);
+  }
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
   const runScratchPath = filesystemScope ? await resolveRunScratchManagedPath(env) : null;

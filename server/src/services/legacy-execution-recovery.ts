@@ -50,6 +50,10 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // The repair gate runs before the adapter, so a suppressed repair never ran
+  // provider work, whatever failure retries its source run carried over.
+  if (run.errorCode === "legacy_disposition_repair_suppressed" &&
+      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
@@ -192,9 +196,9 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       (!["done", "cancelled"].includes(task.status) || retainedLeaseIds.length > 0)
     ) {
-      // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision
-      // and an existing unsafe-workspace hold instead of creating another one.
+      // Periodic stranded-work checks may revisit this terminal run after an
+      // automatic no-replay disposition or operator reconciliation. Preserve
+      // either recorded decision instead of regenerating a hold for the same run.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
@@ -207,9 +211,7 @@ export async function terminalizeLegacyExecution(input: {
             sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
-                sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
-              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' in ('blocked', 'conversation_continuation')`,
             ),
           ),
         )).limit(1);

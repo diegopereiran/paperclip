@@ -7,6 +7,7 @@ import {
   ensurePaperclipSkillSymlink,
   resolvePaperclipInstanceRootForAdapter,
   type PaperclipSkillEntry,
+  materializePaperclipSkillCopy,
 } from "@paperclipai/adapter-utils/server-utils";
 
 type SkillEntry = PaperclipSkillEntry;
@@ -171,4 +172,34 @@ export async function prepareClaudePromptBundle(input: {
     addDir: rootDir,
     instructionsFilePath,
   };
+}
+
+/**
+ * Managed-connection runs pass `--setting-sources user`, which drops the
+ * project-scope `<add-dir>/.claude/skills`. Copy the mounted skills into the
+ * user-scope config dir (the dir is mounted rw in the sandbox; the skill
+ * sources may not be). The copy keeps folders owner-writable, though the
+ * runtime skill cache is read-only, so removing the managed home and rebuilding
+ * `skills/` both work, and it skips nested symlinks instead of following them. The dir is per run (mkdtemp in ai-connection-runtime), and the skills
+ * folder is rebuilt each time so a skill taken off an agent never lingers.
+ */
+export async function materializeClaudeUserScopeSkills(
+  configDir: string,
+  skills: SkillEntry[],
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  const skillsHome = path.join(configDir, "skills");
+  await fs.rm(skillsHome, { recursive: true, force: true });
+  if (skills.length === 0) return;
+  await fs.mkdir(skillsHome, { recursive: true });
+  for (const entry of skills) {
+    try {
+      await materializePaperclipSkillCopy(entry.source, path.join(skillsHome, entry.runtimeName));
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[paperclip] Failed to copy Claude skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
 }

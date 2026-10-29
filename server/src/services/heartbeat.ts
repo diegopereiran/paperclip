@@ -12,6 +12,7 @@ export {
 import {
   createHeartbeatScheduling,
   formatIssueIdentifierLink,
+  type HeartbeatSchedulingDependencies,
 } from "./heartbeat/scheduling.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
@@ -103,6 +104,7 @@ export {
   describeSessionResetReason,
   normalizeSessionParams,
   resolveNextSessionState,
+  selectSessionFingerprintAgentConfigRevision,
 } from "./heartbeat/run-state.js";
 
 import {
@@ -301,6 +303,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import { isWakeContextCandidateEnabled } from "./wake-context-candidate.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -792,6 +795,10 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
+  // A parked backlog issue stays parked unless it is explicitly assigned.
+  // Continuation, timer and comment wakes used to flip it back to
+  // in_progress, which let a parked issue loop.
+  if (issueStatus === "backlog" && wakeReason !== "issue_assigned") return false;
 
   return true;
 }
@@ -829,6 +836,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
 >;
 
 export interface HeartbeatServiceOptions {
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: HeartbeatSchedulingDependencies["pullRequestPoll"];
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -1264,13 +1273,17 @@ export function heartbeatService(
   }
 
   const wakeQueue = createWakeQueue(db, {
-    resolveResponsibleUserId: async (input) => {
+    // All three callbacks run inside the wake-queue release transaction, which
+    // already holds a pooled connection. Every read goes through `tx`; a read
+    // on the global pool would wait for a second connection, and enough
+    // concurrent releases would exhaust the pool and deadlock the server.
+    resolveResponsibleUserId: async (tx, input) => {
       // `input.issue` is the wake-queue module's own transaction-scoped
       // snapshot; using it here, instead of re-reading the issue through
-      // `getIssueExecutionContext`, keeps this read off a second connection
-      // while the module's transaction is open, and keeps it seeing the
-      // in-transaction issue status rather than a stale one.
+      // `getIssueExecutionContext`, keeps it seeing the in-transaction issue
+      // status rather than a stale one.
       return resolveResponsibleUserIdForRunSeed({
+        executor: tx,
         companyId: input.companyId,
         contextSnapshot: input.contextSnapshot,
         issueContext: input.issue,
@@ -1287,23 +1300,23 @@ export function heartbeatService(
         existingRunResponsibleUserId: input.existingRunResponsibleUserId,
       });
     },
-    getRoutineEnv: async (input) => {
+    getRoutineEnv: async (tx, input) => {
       // Same reason as `resolveResponsibleUserId` above: use the passed-in
       // transaction-scoped issue snapshot instead of reading the issue again.
-      return getRoutineEnvForExecutionIssue(input.companyId, input.issue);
+      return getRoutineEnvForExecutionIssue(input.companyId, input.issue, tx);
     },
-    resolveSessionBeforeForWakeup: async (input) => {
+    resolveSessionBeforeForWakeup: async (tx, input) => {
       // Scoped to this port only, so a wake-queue agent id can never resolve
       // a session against another company's agent row. The shared `getAgent`
       // helper below has no company predicate, so this reads the agent
       // directly with the company named in its own `WHERE` clause.
-      const agent = await db
+      const agent = await tx
         .select()
         .from(agents)
         .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!agent) return null;
-      return resolveSessionBeforeForWakeup(agent, input.taskKey);
+      return resolveSessionBeforeForWakeup(agent, input.taskKey, tx);
     },
     // These four helpers stay in this file today; the wake-queue module
     // receives them here so it never imports this file, the service it is
@@ -1647,6 +1660,7 @@ export function heartbeatService(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    pullRequestPoll: options.pullRequestPoll,
   });
 
   const {
@@ -1821,7 +1835,15 @@ export function heartbeatService(
     runId?: string | null;
     companyId?: string | null;
   }) {
-    return recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const dependencyWakes =
+      await recovery.reconcileResolvedDependencyWakeBackstop(opts);
+    const childrenCompletedWakes =
+      await recovery.reconcileDeferredChildrenCompletedWakes(opts);
+    return {
+      ...dependencyWakes,
+      healed: dependencyWakes.healed + childrenCompletedWakes.healed,
+      childrenCompletedHealed: childrenCompletedWakes.healed,
+    };
   }
 
   // Await every background heartbeat execution that is currently in flight. A
@@ -2752,6 +2774,7 @@ export function heartbeatService(
               previousContextRunId: taskSession?.lastRunId,
               summary: safeContinuationSummary?.body ?? null,
               exposeLowTrustRaw,
+              wakeContextCandidate: isWakeContextCandidateEnabled(agent.runtimeConfig),
             })
           : null;
       context.executionContinuation = executionContinuation;
@@ -3533,6 +3556,10 @@ export function heartbeatService(
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
             finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
             error: `Disposition repair suppressed: ${repairBlock}`,
+            // The gate runs before the adapter is invoked, so no provider action
+            // happened. Without this evidence the cancel reads as a failed legacy
+            // execution and parks the ticket behind a reconciliation blocker.
+            resultJson: { ...run.resultJson, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
           });
           if (cancelled.updated) {
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });
@@ -3753,6 +3780,7 @@ export function heartbeatService(
         strategy: executionWorkspace.strategy,
         projectId: executionWorkspace.projectId,
         workspaceId: executionWorkspace.workspaceId,
+        executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
         repoUrl: executionWorkspace.repoUrl,
         repoRef: executionWorkspace.repoRef,
         branchName: executionWorkspace.branchName,

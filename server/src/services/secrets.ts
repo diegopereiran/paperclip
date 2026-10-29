@@ -759,12 +759,17 @@ function isSensitiveEnvKey(key: string) {
 }
 
 export function normalizeSecretKey(input: string) {
-  return input
+  const dashed = input
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9_.-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 120);
+    .replace(/[^a-z0-9_.-]+/g, "-");
+  // A character loop, not /^-+|-+$/g: that regex backtracks quadratically on
+  // a long dash run inside the key (code-scanning alert 38).
+  let start = 0;
+  let end = dashed.length;
+  while (start < end && dashed[start] === "-") start += 1;
+  while (end > start && dashed[end - 1] === "-") end -= 1;
+  return dashed.slice(start, end).slice(0, 120);
 }
 
 function deriveSecretNameFromExternalRef(externalRef: string) {

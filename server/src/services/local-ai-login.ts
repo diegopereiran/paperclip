@@ -9,6 +9,7 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { notFound, unprocessable } from "../errors.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { readVerifiedLocalAiCredential } from "./local-ai-credentials.js";
+import { localAiLoginCommand } from "./local-ai-login-command.js";
 import { logActivity } from "./activity-log.js";
 import { startLocalBrowserLogin, type LocalBrowserLoginState } from "./local-ai-browser-login.js";
 
@@ -24,12 +25,11 @@ function loginHome(id: string) {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   return path.join(canonicalRoot, "ai-local-logins", id);
 }
-const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 function presentAttempt(id: string, expiresAt: Date, provider: string): LocalAiLoginAttempt {
   const directory = loginHome(id);
   return {
     sessionId: id, expiresAt: expiresAt.toISOString(),
-    ...(provider === "xai" ? { command: `(export GROK_HOME=${shellQuote(directory)} && mkdir -p "$GROK_HOME" && grok login --device-auth)` } : {}),
+    ...(provider === "xai" ? { command: localAiLoginCommand(directory) } : {}),
   };
 }
 async function prepareHome(id: string, provider: string) {

@@ -177,6 +177,7 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const STRANDED_DEFERRED_WAKE_CANDIDATE_LIMIT = 200;
 /** A deferred issue wake with no execution run this old has lost its promoter. */
 const STRANDED_DEFERRED_WAKE_MIN_AGE_MS = 10 * 60 * 1000;
 const DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
@@ -4154,7 +4155,7 @@ export function recoveryService(
   async function promoteStrandedDeferredWakes() {
     if (!deps.releaseIssueExecutionAndPromote) return;
     const stranded = await db
-      .selectDistinct({ companyId: issues.companyId, issueId: issues.id })
+      .select({ companyId: issues.companyId, issueId: issues.id })
       .from(agentWakeupRequests)
       .innerJoin(
         issues,
@@ -4167,7 +4168,11 @@ export function recoveryService(
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         lt(agentWakeupRequests.requestedAt, new Date(Date.now() - STRANDED_DEFERRED_WAKE_MIN_AGE_MS)),
         isNull(issues.executionRunId),
-      ));
+      ))
+      // Unpromotable rows (no run, held run) recur every tick: bound the read.
+      .groupBy(issues.companyId, issues.id)
+      .orderBy(sql`min(${agentWakeupRequests.requestedAt})`)
+      .limit(STRANDED_DEFERRED_WAKE_CANDIDATE_LIMIT);
     for (const { companyId, issueId } of stranded) {
       const latestRun = await getLatestIssueRun(companyId, issueId);
       if (!latestRun) continue;

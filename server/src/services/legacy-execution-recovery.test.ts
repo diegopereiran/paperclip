@@ -117,3 +117,20 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+
+it("exempts an issue_assignee_changed stale-gate receipt only with every dispatch field null", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "issue_assignee_changed",
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "stale_queued_run_gate" } };
+  expect(isPreDispatchReviewWait(run)).toBe(true);
+  for (const patch of [
+    { startedAt: new Date() }, { processPid: 123 }, { processGroupId: 123 },
+    { processStartedAt: new Date() }, { nativeSessionId: "provider-session" }, { nativeIssueId: "native-task" },
+    { sessionIdAfter: "provider-session" }, { runtimeModeResolvedAt: new Date() },
+    { controllerBootId: "live-controller" }, { controllerLeaseExpiresAt: new Date() }, { executionStage: "preparing" },
+    { resultJson: {} },
+  ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});

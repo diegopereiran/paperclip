@@ -934,6 +934,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  // The `issue_assignee_changed` reason promises that the new owner is woken
+  // instead. Keep that promise when no wake for the current assignee is pending.
+  async function ensureAssigneeWake(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    const [issue] = await db.select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+      .from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    if (!issue?.assigneeAgentId || issue.assigneeAgentId === run.agentId) return;
+    const [pending] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, run.companyId),
+      eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+      inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+    )).limit(1);
+    if (pending) return;
+    await enqueueWakeup(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      requestedByActorType: "system",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+  }
+
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
@@ -1109,6 +1132,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled") {
+          // The cancel released the issue lock; hand it to the next deferred
+          // wake as a normal run completion does. A promoted wake that is stale
+          // too re-enters this gate, so the chain ends with the deferred queue.
+          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, deferredPostCommitEffects });
+          if (staleness.errorCode === "issue_assignee_changed") await ensureAssigneeWake(run, issueId);
+        }
         logger.info(
           {
             runId: run.id,

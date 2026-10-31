@@ -19,13 +19,15 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // The stale-run gate cancelled it while queued: no provider work ever ran.
+  if (run.status === "cancelled" && !run.startedAt && run.resultJson?.timeoutSource === "stale_queued_run_gate") return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry

@@ -953,6 +953,7 @@ export function heartbeatService(
     enqueueWakeup,
     liveRunExecutions,
     settleExplicitContinuationRetry: releaseIssueExecutionAndPromote,
+    releaseIssueExecutionAndPromote: (run) => releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }),
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()

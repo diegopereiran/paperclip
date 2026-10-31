@@ -28,6 +28,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lt,
   ne,
   not,
   notExists,
@@ -190,6 +191,8 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+/** A deferred issue wake with no execution run this old has lost its promoter. */
+const STRANDED_DEFERRED_WAKE_MIN_AGE_MS = 10 * 60 * 1000;
 const DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const DEFERRED_CHILDREN_COMPLETED_WAKE_CANDIDATE_LIMIT = 200;
 
@@ -934,6 +937,8 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** Promote the next deferred wake of the run's issue (the run-completion path). */
+    releaseIssueExecutionAndPromote?: (run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) => Promise<unknown>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -4471,6 +4476,34 @@ export function recoveryService(
     );
   }
 
+  // A deferred wake waits for the issue's execution run to release. When the run
+  // is gone and nothing promoted the wake, it would wait forever.
+  async function promoteStrandedDeferredWakes() {
+    if (!deps.releaseIssueExecutionAndPromote) return;
+    const stranded = await db
+      .selectDistinct({ companyId: issues.companyId, issueId: issues.id })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload} ->> 'issueId'`,
+        ),
+      )
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        lt(agentWakeupRequests.requestedAt, new Date(Date.now() - STRANDED_DEFERRED_WAKE_MIN_AGE_MS)),
+        isNull(issues.executionRunId),
+      ));
+    for (const { companyId, issueId } of stranded) {
+      const latestRun = await getLatestIssueRun(companyId, issueId);
+      if (!latestRun) continue;
+      await deps.releaseIssueExecutionAndPromote({ id: latestRun.id, companyId }).catch((err) => {
+        logger.warn({ err, issueId }, "Stranded deferred wake promotion failed");
+      });
+    }
+  }
+
   async function reconcileStrandedAssignedIssues(opts?: {
     issueCreatedAtGte?: Date | null;
   }) {
@@ -4498,6 +4531,8 @@ export function recoveryService(
           ))),
         ),
       );
+
+    await promoteStrandedDeferredWakes();
 
     const result = {
       assignmentDispatched: 0,

@@ -1,7 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { sql } from "drizzle-orm";
 import { badRequest } from "../errors.js";
-import { costService } from "./costs.js";
+import { costService, ordinaryInputTokens } from "./costs.js";
 
 export const RUN_WINDOW_DEFAULT_TZ = "Pacific/Auckland";
 export const RUN_WINDOW_DEFAULT_LIMIT = 500;
@@ -36,7 +36,17 @@ export type RunWindowRow = {
 
 export type RunWindowPercentiles = { p50: number | null; p95: number | null };
 
-export type RunWindowClassCounts = { runCount: number; costCents: number; acceptedOutcomeCount: number };
+/** cacheWrite is null: cost_events does not record cache-write tokens. total = input + cacheRead + output. */
+export type RunWindowTokens = { input: number; cacheRead: number; cacheWrite: null; output: number; total: number };
+
+export type RunWindowClassCounts = {
+  runCount: number;
+  costCents: number;
+  acceptedOutcomeCount: number;
+  tokens: RunWindowTokens;
+  /** tokens.total / acceptedOutcomeCount; null when the count is 0. */
+  tokensPerAcceptedOutcome: number | null;
+};
 
 export type RunWindowClassRow = RunWindowClassCounts & {
   /** `P1`..`P5`; the most severe when an issue has several; null when none. */
@@ -55,6 +65,12 @@ export type RunWindowOutcomes = {
   costCentsPerAcceptedOutcome: number | null;
   /** Exclusive attribution (costs.ts byProject); projectId null is Unattributed. Sums to costCents. */
   costByProject: Array<{ projectId: string | null; costCents: number }>;
+  /** Tokens of every cost event whose occurred_at falls in the window. Classes + unclassified sum to it. */
+  tokens: RunWindowTokens;
+  /** tokens.total / acceptedOutcomeCount; null when the count is 0. */
+  tokensPerAcceptedOutcome: number | null;
+  /** What counts as an accepted outcome, and how reopen or cancel affects it. */
+  acceptedOutcomeDefinition: string;
   classes: {
     definition: string;
     /** One row per (priority, enhancement, size) combination that has any run, cost or accepted outcome. */
@@ -197,6 +213,27 @@ function classifyLabels(names: string[]): TicketClass | null {
   return priority === null && size === null && !enhancement ? null : { priority, enhancement, size };
 }
 
+const ACCEPTED_OUTCOME_DEFINITION =
+  "issues whose accepted_outcome_at falls in [from, to) of the window in tz, counted by current issue state; the server never clears or moves accepted_outcome_at on reopen or cancel, only an explicit acceptedOutcomeAt update does; tokens.input excludes cache reads, tokens.cacheRead is cached input, tokens.cacheWrite is null because cost events do not record it, total = input + cacheRead + output";
+
+type Acc = { runCount: number; costCents: number; acceptedOutcomeCount: number; input: number; cacheRead: number; output: number };
+const newAcc = (): Acc => ({ runCount: 0, costCents: 0, acceptedOutcomeCount: 0, input: 0, cacheRead: 0, output: 0 });
+
+function tokensOf(a: Acc): RunWindowTokens {
+  return { input: a.input, cacheRead: a.cacheRead, cacheWrite: null, output: a.output, total: a.input + a.cacheRead + a.output };
+}
+
+function countsOf(a: Acc): RunWindowClassCounts {
+  const tokens = tokensOf(a);
+  return {
+    runCount: a.runCount,
+    costCents: a.costCents,
+    acceptedOutcomeCount: a.acceptedOutcomeCount,
+    tokens,
+    tokensPerAcceptedOutcome: a.acceptedOutcomeCount > 0 ? tokens.total / a.acceptedOutcomeCount : null,
+  };
+}
+
 async function getOutcomes(
   db: Db,
   companyId: string,
@@ -213,12 +250,17 @@ async function getOutcomes(
   const runRes = await db.execute(sql`
     SELECT ${runIssueId} AS issue_id, count(*)::int AS n FROM heartbeat_runs r WHERE ${inWindow} GROUP BY 1
   `);
-  // Class cost: the event's own issue, else the issue of its run. Each event resolves to at most one issue.
+  // Class cost and tokens: the event's own issue, else the issue of its run. Each event resolves to at most one
+  // issue. cost_events is not aliased because ordinaryInputTokens renders "cost_events"."col".
   const costRes = await db.execute(sql`
-    SELECT coalesce(ce.issue_id, ${runIssueId}) AS issue_id, sum(ce.cost_cents)::double precision AS cents
-    FROM cost_events ce
-    LEFT JOIN heartbeat_runs r ON r.id = ce.heartbeat_run_id AND r.company_id = ce.company_id
-    WHERE ce.company_id = ${companyId}::uuid AND ce.occurred_at >= ${fromTs}::timestamptz AND ce.occurred_at < ${toTs}::timestamptz
+    SELECT coalesce(cost_events.issue_id, ${runIssueId}) AS issue_id,
+      sum(cost_events.cost_cents)::double precision AS cents,
+      coalesce(sum(${ordinaryInputTokens}), 0)::double precision AS input_tokens,
+      coalesce(sum(cost_events.cached_input_tokens), 0)::double precision AS cache_read_tokens,
+      coalesce(sum(cost_events.output_tokens), 0)::double precision AS output_tokens
+    FROM cost_events
+    LEFT JOIN heartbeat_runs r ON r.id = cost_events.heartbeat_run_id AND r.company_id = cost_events.company_id
+    WHERE cost_events.company_id = ${companyId}::uuid AND cost_events.occurred_at >= ${fromTs}::timestamptz AND cost_events.occurred_at < ${toTs}::timestamptz
     GROUP BY 1
   `);
   const acceptedRes = await db.execute(sql`
@@ -239,9 +281,11 @@ async function getOutcomes(
     namesByIssue.set(row.issue_id, list);
   }
 
-  const unclassified: RunWindowClassCounts = { runCount: 0, costCents: 0, acceptedOutcomeCount: 0 };
-  const classes = new Map<string, { cls: TicketClass; counts: RunWindowClassCounts }>();
-  const add = (issueId: string | null, field: keyof RunWindowClassCounts, amount: number) => {
+  const unclassified = newAcc();
+  const total = newAcc();
+  const classes = new Map<string, { cls: TicketClass; counts: Acc }>();
+  const add = (issueId: string | null, field: keyof Acc, amount: number) => {
+    total[field] += amount;
     const cls = issueId ? classifyLabels(namesByIssue.get(issueId) ?? []) : null;
     if (!cls) {
       unclassified[field] += amount;
@@ -250,13 +294,18 @@ async function getOutcomes(
     const key = `${cls.priority}|${cls.enhancement}|${cls.size}`;
     let entry = classes.get(key);
     if (!entry) {
-      entry = { cls, counts: { runCount: 0, costCents: 0, acceptedOutcomeCount: 0 } };
+      entry = { cls, counts: newAcc() };
       classes.set(key, entry);
     }
     entry.counts[field] += amount;
   };
   for (const row of runRes as unknown as Array<{ issue_id: string | null; n: number }>) add(row.issue_id, "runCount", Number(row.n));
-  for (const row of costRes as unknown as Array<{ issue_id: string | null; cents: number }>) add(row.issue_id, "costCents", Number(row.cents));
+  for (const row of costRes as unknown as Array<{ issue_id: string | null; cents: number; input_tokens: number; cache_read_tokens: number; output_tokens: number }>) {
+    add(row.issue_id, "costCents", Number(row.cents));
+    add(row.issue_id, "input", Number(row.input_tokens));
+    add(row.issue_id, "cacheRead", Number(row.cache_read_tokens));
+    add(row.issue_id, "output", Number(row.output_tokens));
+  }
   const accepted = acceptedRes as unknown as Array<{ issue_id: string }>;
   for (const row of accepted) add(row.issue_id, "acceptedOutcomeCount", 1);
 
@@ -269,20 +318,117 @@ async function getOutcomes(
       priority: cls.priority === null ? null : `P${cls.priority}`,
       enhancement: cls.enhancement,
       size: cls.size === null ? null : SIZE_ORDER[cls.size]!,
-      ...counts,
+      ...countsOf(counts),
     }));
+  const windowTokens = tokensOf(total);
 
   return {
     acceptedOutcomeCount: accepted.length,
     costCents,
     costCentsPerAcceptedOutcome: accepted.length > 0 ? costCents / accepted.length : null,
     costByProject,
+    tokens: windowTokens,
+    tokensPerAcceptedOutcome: accepted.length > 0 ? windowTokens.total / accepted.length : null,
+    acceptedOutcomeDefinition: ACCEPTED_OUTCOME_DEFINITION,
     classes: {
       definition:
         "one row per (P label, enhancement label, size label) found by label name; several P labels count as the most severe, several size labels as the largest; cost is attributed through the event's issue, else its run's issue",
       rows,
-      unclassified,
+      unclassified: countsOf(unclassified),
     },
+  };
+}
+
+async function windowBounds(db: Db, tz: string, fromDate: string, toDate: string) {
+  const boundsRes = await db.execute(sql`
+    SELECT (${fromDate}::timestamp AT TIME ZONE ${tz}) AS from_ts, (${toDate}::timestamp AT TIME ZONE ${tz}) AS to_ts
+  `);
+  const bounds = (boundsRes as unknown as Array<{ from_ts: unknown; to_ts: unknown }>)[0]!;
+  return { fromTs: iso(bounds.from_ts)!, toTs: iso(bounds.to_ts)! };
+}
+
+export type RunWindowOutcomeRow = {
+  issueId: string;
+  identifier: string | null;
+  acceptedOutcomeAt: string;
+  acceptedOutcomeRef: string | null;
+  status: string;
+  /** null = unclassified (no P, enhancement or size label). */
+  class: { priority: string | null; enhancement: boolean; size: string | null } | null;
+};
+
+export type RunWindowOutcomesResponse = {
+  window: { tz: string; from: string; to: string; windowField: "accepted_outcome_at" };
+  acceptedOutcomeCount: number;
+  acceptedOutcomeDefinition: string;
+  rows: RunWindowOutcomeRow[];
+  nextCursor: string | null;
+};
+
+/** One row per accepted-outcome issue in the window, keyset-paged on (accepted_outcome_at, id). Ids and labels only. */
+export async function getRunWindowOutcomes(db: Db, companyId: string, query: RunWindowQuery): Promise<RunWindowOutcomesResponse> {
+  const { tz, fromDate, toDate } = resolveRunWindowQuery(query);
+  const limit = parseRunWindowLimit(query.limit);
+  const cursor = query.cursor ? decodeCursor(query.cursor) : null;
+  const { fromTs, toTs } = await windowBounds(db, tz, fromDate, toDate);
+  const inWindow = sql`i.company_id = ${companyId}::uuid AND i.accepted_outcome_at >= ${fromTs}::timestamptz AND i.accepted_outcome_at < ${toTs}::timestamptz`;
+
+  const countRes = await db.execute(sql`SELECT count(*)::int AS n FROM issues i WHERE ${inWindow}`);
+  const cursorFilter = cursor
+    ? sql`AND (i.accepted_outcome_at, i.id) > (${cursor.c}::timestamptz, ${cursor.i}::uuid)`
+    : sql``;
+  const pageRes = await db.execute(sql`
+    SELECT i.id AS id, i.identifier AS identifier, i.accepted_outcome_at AS accepted_outcome_at,
+      i.accepted_outcome_at::text AS accepted_outcome_at_text, i.accepted_outcome_ref AS accepted_outcome_ref, i.status AS status
+    FROM issues i
+    WHERE ${inWindow} ${cursorFilter}
+    ORDER BY i.accepted_outcome_at ASC, i.id ASC
+    LIMIT ${limit + 1}
+  `);
+  const pageRows = pageRes as unknown as Array<Record<string, unknown>>;
+  const hasMore = pageRows.length > limit;
+  const page = hasMore ? pageRows.slice(0, limit) : pageRows;
+
+  const namesByIssue = new Map<string, string[]>();
+  if (page.length > 0) {
+    const idList = sql.join(page.map((r) => sql`${r.id as string}::uuid`), sql`, `);
+    const labelRes = await db.execute(sql`
+      SELECT il.issue_id AS issue_id, l.name AS name
+      FROM issue_labels il JOIN labels l ON l.id = il.label_id
+      WHERE il.company_id = ${companyId}::uuid AND l.company_id = ${companyId}::uuid AND il.issue_id IN (${idList})
+        AND btrim(l.name) ~* '^(p[1-5]|enhancement|size[[:space:]]*[:/-]?[[:space:]]*(xxs|xs|s|m|l|xl|xxl))$'
+    `);
+    for (const row of labelRes as unknown as Array<{ issue_id: string; name: string }>) {
+      const list = namesByIssue.get(row.issue_id) ?? [];
+      list.push(row.name);
+      namesByIssue.set(row.issue_id, list);
+    }
+  }
+
+  const rows: RunWindowOutcomeRow[] = page.map((r) => {
+    const cls = classifyLabels(namesByIssue.get(r.id as string) ?? []);
+    return {
+      issueId: r.id as string,
+      identifier: (r.identifier as string | null) ?? null,
+      acceptedOutcomeAt: iso(r.accepted_outcome_at)!,
+      acceptedOutcomeRef: (r.accepted_outcome_ref as string | null) ?? null,
+      status: r.status as string,
+      class: cls
+        ? {
+            priority: cls.priority === null ? null : `P${cls.priority}`,
+            enhancement: cls.enhancement,
+            size: cls.size === null ? null : SIZE_ORDER[cls.size]!,
+          }
+        : null,
+    };
+  });
+  const last = page[page.length - 1];
+  return {
+    window: { tz, from: fromTs, to: toTs, windowField: "accepted_outcome_at" },
+    acceptedOutcomeCount: Number((countRes as unknown as Array<{ n: number }>)[0]!.n),
+    acceptedOutcomeDefinition: ACCEPTED_OUTCOME_DEFINITION,
+    rows,
+    nextCursor: hasMore && last ? encodeCursor({ c: last.accepted_outcome_at_text as string, i: last.id as string }) : null,
   };
 }
 
@@ -292,12 +438,7 @@ export async function getRunWindow(db: Db, companyId: string, query: RunWindowQu
   const limit = parseRunWindowLimit(query.limit);
   const cursor = query.cursor ? decodeCursor(query.cursor) : null;
 
-  const boundsRes = await db.execute(sql`
-    SELECT (${fromDate}::timestamp AT TIME ZONE ${tz}) AS from_ts, (${toDate}::timestamp AT TIME ZONE ${tz}) AS to_ts
-  `);
-  const bounds = (boundsRes as unknown as Array<{ from_ts: unknown; to_ts: unknown }>)[0]!;
-  const fromTs = iso(bounds.from_ts)!;
-  const toTs = iso(bounds.to_ts)!;
+  const { fromTs, toTs } = await windowBounds(db, tz, fromDate, toDate);
 
   // Issue link: the run's context_snapshot issueId, as the run list uses it.
   const runIssueId = sql`(CASE WHEN r.context_snapshot ->> 'issueId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN (r.context_snapshot ->> 'issueId')::uuid END)`;

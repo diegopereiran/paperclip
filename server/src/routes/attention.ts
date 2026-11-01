@@ -51,6 +51,7 @@ export function attentionRoutes(db: Db) {
       cursor,
       sort: sortValue as AttentionSortMode | undefined,
       limit,
+      decidableOnly: true,
     });
     res.json(feed);
   });

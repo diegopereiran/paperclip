@@ -1,6 +1,6 @@
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { readProcessStartedAt } from "./hot-restart.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
@@ -77,6 +77,12 @@ export function conversationRecoveryActionPredicate() {
         and coalesce(${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema', '') <> 'paperclip.workspace-restore-recovery.v1'
         and ${inArray(heartbeatRuns.status, ['failed', 'timed_out', 'interrupted', 'cancelled'])}
         and ${conversationRunPredicate()}
+        and (
+          exists (select 1 from ${issues} where ${issues.companyId} = ${issueRecoveryActions.companyId}
+            and ${issues.id} = ${issueRecoveryActions.sourceIssueId} and ${issues.conversationAgentId} is not null)
+          -- A work issue gets one continuation wake. Its lost continuation falls to the blocking disposition.
+          or coalesce(${heartbeatRuns.contextSnapshot}->>'source', '') <> 'execution.reconciled'
+        )
         and ${or(
           sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
           eq(heartbeatRuns.status, "interrupted"),

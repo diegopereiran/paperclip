@@ -36,6 +36,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { fastForwardStrandedSshImport } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   claimNativeRestartRecoveries,
   closeIdleWarmNativeSessionsForRestart,
@@ -1620,6 +1621,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
 
+      // An ssh lease owns no provider resource (its provider lease id is the
+      // shared remote-runs root), and the ssh driver has no orphan teardown, so
+      // retrying can only fail while a stuck lease defers every wake on its
+      // issue. Release it the way a successful retry does. Local leases need
+      // nothing here: the local driver's retryPendingSandboxTeardown is a no-op.
+      const leaseDriver = typeof metadata.driver === "string" ? metadata.driver : row.provider;
+      const ownsNoProviderResource =
+        leaseDriver === "ssh" && (!row.providerLeaseId || row.providerLeaseId.startsWith("ssh://"));
+      if (ownsNoProviderResource) {
+        await environmentsSvc.releaseLease(row.id, "expired", {
+          cleanupStatus: "success",
+          failureReason: "pending_cleanup_retry",
+        });
+        logger.info({ leaseId: row.id, driver: leaseDriver }, "released pending_cleanup lease with no provider resource");
+        destroyed += 1;
+        continue;
+      }
+
       const environment = row.environmentId
         ? await environmentsSvc.getById(row.environmentId)
         : null;
@@ -1910,6 +1929,53 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .finally(() => drainRetainedRunnerdMaintenanceOperations());
     activeRunExecutionPromises.add(cleanup);
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
+  }
+
+  async function landStrandedSshImport(run: typeof heartbeatRuns.$inferSelect) {
+    const cwd = readNonEmptyString(
+      parseObject(parseObject(run.contextSnapshot).paperclipWorkspace).cwd,
+    );
+    if (!cwd) return;
+    try {
+      // A ticket and its children share one workspace. A live run there took
+      // its baseline from the current tree and merges back against it, so the
+      // branch must not move underneath it. The import then stays under its
+      // ref (logged) and is not retried.
+      const [liveSibling] = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.status, "running"),
+            ne(heartbeatRuns.id, run.id),
+            sql`${heartbeatRuns.contextSnapshot} -> 'paperclipWorkspace' ->> 'cwd' = ${cwd}`,
+          ),
+        )
+        .limit(1);
+      if (liveSibling) {
+        logger.warn(
+          { runId: run.id, liveRunId: liveSibling.id },
+          "kept stranded SSH import under its ref; another run is live in the workspace",
+        );
+        return;
+      }
+      const result = await fastForwardStrandedSshImport({ localDir: cwd, runId: run.id });
+      if (!result || result.outcome === "already_on_branch") return;
+      if (result.outcome === "landed") {
+        logger.warn(
+          { runId: run.id, ref: result.ref, head: result.head },
+          "fast-forwarded workspace branch to stranded SSH import",
+        );
+      } else {
+        logger.warn(
+          { runId: run.id, ref: result.ref, head: result.head, reason: result.outcome },
+          "kept stranded SSH import under its ref; branch not moved",
+        );
+      }
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to land stranded SSH import");
+    }
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -2358,6 +2424,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!failureWrite.updated || !failureWrite.run) continue;
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
+      // A run lost mid sync-back leaves its commit only under its imported
+      // ref; land it on the branch as a clean exit would. Fast-forward only.
+      await landStrandedSshImport(run);
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,

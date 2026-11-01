@@ -48,6 +48,13 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+const MERGED_USR_SYMLINKS: ReadonlyArray<readonly [target: string, link: string]> = [
+  ["usr/bin", "/bin"],
+  ["usr/sbin", "/sbin"],
+  ["usr/lib", "/lib"],
+  ["usr/lib64", "/lib64"],
+];
+
 const SYSTEM_READ_PATHS = [
   "/bin",
   "/sbin",
@@ -81,6 +88,20 @@ function normalizeAbsolutePath(candidate: string, label: string): string {
 
 async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
+}
+
+/**
+ * The workspace scope mounts an empty tmpfs on /tmp, so the host run scratch dir
+ * (TMPDIR and friends point at it) would not exist inside the sandbox. Bind just
+ * that one directory, never /tmp itself.
+ */
+export async function resolveRunScratchManagedPath(
+  env: Record<string, string | undefined>,
+): Promise<LocalProcessSandboxPath | null> {
+  const scratchDir = env.PAPERCLIP_RUN_SCRATCH_DIR?.trim();
+  if (!scratchDir || !path.isAbsolute(scratchDir)) return null;
+  const normalized = path.resolve(scratchDir);
+  return (await pathExists(normalized)) ? { path: normalized, access: "rw" } : null;
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -386,12 +407,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
 
   if (filesystemScope === "workspace") {
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
-    args.push(
-      "--symlink", "usr/bin", "/bin",
-      "--symlink", "usr/sbin", "/sbin",
-      "--symlink", "usr/lib", "/lib",
-      "--symlink", "usr/lib64", "/lib64",
-    );
+    for (const [target, link] of MERGED_USR_SYMLINKS) args.push("--symlink", target, link);
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
     const mount = async (source: string, access: LocalProcessSandboxAccess) => {
@@ -402,7 +418,12 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       mounted.add(normalized);
       created.add(normalized);
     };
-    for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
+    // The merged-/usr links above already provide these paths; binding them as
+    // well makes bwrap refuse to start (paperclipai/paperclip#10684).
+    const symlinkedPaths = new Set(MERGED_USR_SYMLINKS.map(([, link]) => link));
+    for (const systemPath of SYSTEM_READ_PATHS) {
+      if (!symlinkedPaths.has(systemPath)) await mount(systemPath, "ro");
+    }
     for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
     if (networkScope === "allowlist") {
       for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");

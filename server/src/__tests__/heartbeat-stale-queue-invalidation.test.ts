@@ -1785,4 +1785,91 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
+
+  describe("deferred wakes behind a pre-start stale cancel", () => {
+    async function seedSecondAgent(companyId: string, name: string) {
+      const id = randomUUID();
+      await db.insert(agents).values({
+        id, companyId, name, role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+      });
+      return id;
+    }
+
+    async function seedDeferredWake(companyId: string, agentId: string, issueId: string, ageMinutes = 0) {
+      const at = new Date(Date.now() - ageMinutes * 60_000);
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        status: "deferred_issue_execution", requestedAt: at, createdAt: at,
+        payload: { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_assigned" } },
+      });
+    }
+
+    async function wakesFor(issueId: string, agentId: string) {
+      return db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(sql`${agentWakeupRequests.agentId} = ${agentId} and ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`);
+    }
+
+    it("starts the new owner's deferred wake when the old owner's queued run is cancelled as stale", async () => {
+      const { companyId, agentId: oldAgentId } = await seedCompanyAndAgent();
+      const newAgentId = await seedSecondAgent(companyId, "NewOwner");
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Hand-off", status: "in_progress", priority: "medium", assigneeAgentId: oldAgentId });
+      const { runId } = await seedQueuedRun({ companyId, agentId: oldAgentId, issueId, wakeReason: "issue_commented" });
+      await db.update(issues).set({ executionRunId: runId, executionAgentNameKey: "claudecoder", executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+      await db.update(issues).set({ assigneeAgentId: newAgentId }).where(eq(issues.id, issueId));
+      await seedDeferredWake(companyId, newAgentId, issueId);
+      expect((await wakesFor(issueId, newAgentId)).map((w) => w.status)).toEqual(["deferred_issue_execution"]);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => (await wakesFor(issueId, newAgentId)).every((w) => w.runId !== null))).toBe(true);
+      const [oldRun] = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(oldRun).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    });
+
+    it("never leaves the new owner without a wake after an issue_assignee_changed cancel", async () => {
+      const { companyId, agentId: oldAgentId } = await seedCompanyAndAgent();
+      const newAgentId = await seedSecondAgent(companyId, "NewOwner");
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Hand-off, no wake", status: "in_progress", priority: "medium", assigneeAgentId: newAgentId });
+      const { runId } = await seedQueuedRun({ companyId, agentId: oldAgentId, issueId, wakeReason: "issue_commented" });
+      await db.update(issues).set({ executionRunId: runId, executionAgentNameKey: "claudecoder", executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => (await wakesFor(issueId, newAgentId)).length > 0)).toBe(true);
+      expect((await wakesFor(issueId, newAgentId)).map((w) => w.status)).not.toContain("skipped");
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    });
+
+    it("sweeps a deferred wake older than 10 minutes with no execution run, and only that one", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const otherAgentId = await seedSecondAgent(companyId, "LiveOwner");
+      async function deferredCase(title: string, liveRun: boolean, ageMinutes: number) {
+        const issueId = randomUUID();
+        await db.insert(issues).values({ id: issueId, companyId, title, status: "in_progress", priority: "medium", assigneeAgentId: agentId });
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: otherAgentId, invocationSource: "assignment",
+          triggerDetail: "system", status: liveRun ? "running" : "succeeded", startedAt: new Date(), finishedAt: liveRun ? null : new Date(),
+          contextSnapshot: { issueId } });
+        await db.update(issues).set({ executionRunId: runId, executionAgentNameKey: "livemowner", executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+        await seedDeferredWake(companyId, agentId, issueId, ageMinutes);
+        if (!liveRun) await db.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, issueId));
+        return issueId;
+      }
+      const oldFree = await deferredCase("old, no run", false, 11);
+      const young = await deferredCase("young, no run", false, 1);
+      const oldBehindLive = await deferredCase("old, live run", true, 11);
+      for (const id of [oldFree, young, oldBehindLive]) {
+        expect((await wakesFor(id, agentId)).map((w) => w.status)).toEqual(["deferred_issue_execution"]);
+      }
+
+      await heartbeat.reconcileStrandedAssignedIssues();
+      expect((await wakesFor(oldFree, agentId)).map((w) => w.status)).not.toContain("deferred_issue_execution");
+      expect((await wakesFor(young, agentId)).map((w) => w.status)).toEqual(["deferred_issue_execution"]);
+      expect((await wakesFor(oldBehindLive, agentId)).map((w) => w.status)).toEqual(["deferred_issue_execution"]);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    });
+  });
 });

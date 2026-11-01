@@ -193,8 +193,11 @@ async function releaseStableWorkspaceLock(spec: SshRemoteExecutionSpec, lockDir:
   );
 }
 
-/** A stable workspace folder is swept when its last restore was ok and it has been unused this long. */
-export const STABLE_WORKSPACE_SWEEP_AFTER_MS = 14 * 24 * 60 * 60 * 1000;
+/**
+ * A stable workspace folder is swept when its last restore was ok and it has been unused this long.
+ * The host keeps the full worktree, so the copy is only a cache. 14 days filled claude-agent (~7 GB a day).
+ */
+export const STABLE_WORKSPACE_SWEEP_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
 const LAST_RESTORE_MARKER = ".paperclip-last-restore";
 const RUN_ID_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/;
 

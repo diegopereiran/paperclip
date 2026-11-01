@@ -34,7 +34,7 @@ import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaper
 import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
-import { getRunWindow } from "../services/run-window.js";
+import { getRunWindow, getRunWindowOutcomes } from "../services/run-window.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
@@ -6633,6 +6633,25 @@ export function agentRoutes(
     const str = (v: unknown) => (typeof v === "string" ? v : undefined);
     res.json(
       await getRunWindow(db, companyId, {
+        month: str(q.month),
+        from: str(q.from),
+        to: str(q.to),
+        tz: str(q.tz),
+        cursor: str(q.cursor),
+        limit: str(q.limit),
+      }),
+    );
+  });
+
+  // Ids, status, labels and timestamps only.
+  router.get("/companies/:companyId/runs/window/outcomes", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
+    const q = req.query;
+    const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+    res.json(
+      await getRunWindowOutcomes(db, companyId, {
         month: str(q.month),
         from: str(q.from),
         to: str(q.to),

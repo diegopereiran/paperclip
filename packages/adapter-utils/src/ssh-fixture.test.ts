@@ -1635,10 +1635,10 @@ describe("ssh env-lab fixture", () => {
           await utimes(file, when, when);
         }
       };
-      await make(ids.old, "ok", 15);
-      await make(ids.locked, "ok", 15, true);
+      await make(ids.old, "ok", 3);
+      await make(ids.locked, "ok", 3, true);
       await make(ids.failed, "failed", 30);
-      await make(ids.recent, "ok", 13);
+      await make(ids.recent, "ok", 1);
       await make(ids.nomarker, null, 0);
       const prepared = await prepareRemoteManagedRuntime({
         spec, runId: "run-sweep", adapterKey: "a", workspaceLocalDir: localRepo, executionWorkspaceId: WS_ID,

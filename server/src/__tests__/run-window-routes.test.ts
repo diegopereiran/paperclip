@@ -278,4 +278,43 @@ describeEmbeddedPostgres("run window export route", () => {
     expect(denied.status).toBe(403);
     expect(denied.body.error).toBe("Run telemetry is outside this actor's authorization boundary");
   });
+
+  it("keeps every pre-existing runs/window field name and type", async () => {
+    const s = await seed();
+    const app = createApp(db, boardActor([s.companyId]));
+    const res = await get(app, s.companyId, "month=2026-10");
+    const b = res.body;
+    const num = "number";
+    const kinds = (o: Record<string, unknown>) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v === null ? "null" : Array.isArray(v) ? "array" : typeof v]));
+    expect(Object.keys(b).sort()).toEqual(["aggregates", "nextCursor", "outcomes", "rows", "window"]);
+    expect(kinds(b.window)).toEqual({ tz: "string", from: "string", to: "string", windowField: "string", childRunDefinition: "string", timeoutDefinition: "string" });
+    expect(kinds(b.aggregates)).toEqual({
+      runCount: num, byStatus: "object", timeoutCount: num, retryCount: num, continuationCount: num, childRunCount: num,
+      durationSeconds: "object", wakeToFinishSeconds: "object",
+    });
+    expect(Object.keys(b.aggregates.durationSeconds)).toEqual(["p50", "p95"]);
+    expect(kinds(b.rows[0])).toMatchObject({
+      runId: "string", agentId: "string", status: "string", issueId: "null", rootIssueId: "null", retryOfRunId: "null",
+      continuationAttempt: num, createdAt: "string", startedAt: "string", finishedAt: "string",
+    });
+    // Existing outcomes fields keep their names and types; the new ones are additive.
+    expect(kinds(b.outcomes)).toMatchObject({
+      acceptedOutcomeCount: num, costCents: num, costCentsPerAcceptedOutcome: "null", costByProject: "array", classes: "object",
+    });
+    expect(kinds(b.outcomes.classes)).toMatchObject({ definition: "string", rows: "array", unclassified: "object" });
+    expect(kinds(b.outcomes.classes.unclassified)).toMatchObject({ runCount: num, costCents: num, acceptedOutcomeCount: num });
+    expect(Object.keys(b.outcomes).sort()).toEqual([
+      "acceptedOutcomeCount", "acceptedOutcomeDefinition", "classes", "costByProject", "costCents", "costCentsPerAcceptedOutcome",
+      "tokens", "tokensPerAcceptedOutcome",
+    ]);
+  });
+
+  it("serves the outcomes sub-resource under the same access check", async () => {
+    const s = await seed();
+    const mallory = createApp(db, { type: "board", userId: "mallory", companyIds: [s.companyId], source: "session", isInstanceAdmin: false });
+    const denied = await request(mallory).get(`/api/companies/${s.companyId}/runs/window/outcomes?month=2026-10`);
+    expect(denied.status).toBe(403);
+    const other = createApp(db, { type: "board", userId: "mallory", companyIds: [randomUUID()], source: "session", isInstanceAdmin: false });
+    expect((await request(other).get(`/api/companies/${s.companyId}/runs/window/outcomes?month=2026-10`)).status).toBe(403);
+  });
 });

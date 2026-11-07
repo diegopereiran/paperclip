@@ -92,6 +92,9 @@ export default defineConfig({
       PAPERCLIP_BIND: "loopback",
       PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
+      // The live announcement feed renders a fixed card over the sidebar that
+      // intercepts clicks, so keep e2e independent of what the feed serves.
+      PAPERCLIP_ANNOUNCEMENTS_ENABLED: "false",
     },
   },
   outputDir: "./test-results",

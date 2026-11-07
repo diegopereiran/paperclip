@@ -210,6 +210,8 @@ export type ReleaseRecoveryReviewParticipantFacts = {
   applies: boolean;
   /** True when the finishing run was itself a review-participant-recovery retry. */
   isExecutionReviewParticipantRecoveryRun: boolean;
+  /** True when an unresolved `blocks` relation holds the issue; resolving it wakes the assignee. */
+  hasExplicitBlockerPath?: boolean;
 };
 
 export type ReleaseRecoveryImmediateFacts = {
@@ -381,7 +383,8 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
       facts.suppressImmediateRecovery ||
       shared.hasExistingExecutionPath ||
       shared.hasPersistedMonitor ||
-      shared.suppressedByPauseHold
+      shared.suppressedByPauseHold ||
+      reviewParticipant.hasExplicitBlockerPath
     ) {
       return { kind: "released" };
     }

@@ -45,6 +45,15 @@ import {
 } from "../services/workspace-runtime.ts";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
 
+const mockSshRemoval = vi.hoisted(() => ({
+  removeSshWorkspaceFolders: vi.fn(async () => ({ removed: 1, warnings: [] as string[] })),
+}));
+
+vi.mock("../services/environment-execution-target.js", async (importActual) => ({
+  ...await importActual<typeof import("../services/environment-execution-target.js")>(),
+  removeSshWorkspaceFolders: mockSshRemoval.removeSshWorkspaceFolders,
+}));
+
 const execFileAsync = promisify(execFile);
 
 describe("execution workspace delivery state", () => {
@@ -915,6 +924,55 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
     }, 20_000);
 
+    it("removes the SSH folders of a workspace the sweep cleaned and records their warnings", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      mockSshRemoval.removeSshWorkspaceFolders.mockClear();
+      mockSshRemoval.removeSshWorkspaceFolders.mockResolvedValueOnce({
+        removed: 0,
+        warnings: ["SSH folder of environment rig is in use by a run; left for the next sweep."],
+      });
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const sweep = await cooldownService(0).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      expect(mockSshRemoval.removeSshWorkspaceFolders).toHaveBeenCalledWith(
+        expect.objectContaining({ executionWorkspaceId: seeded.executionWorkspaceId }),
+      );
+      const [row] = await db
+        .select({ cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(row?.cleanupReason).toContain("left for the next sweep");
+    }, 20_000);
+
+    it("keeps the SSH folders when the terminal cleanup fails", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      mockSshRemoval.removeSshWorkspaceFolders.mockClear();
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const failing = executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 0,
+        beforeTerminalWorkspaceCleanup: async () => {
+          throw new Error("forced cleanup failure");
+        },
+      });
+
+      const sweep = await failing.sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ cleanupFailed: 1 });
+      expect(mockSshRemoval.removeSshWorkspaceFolders).not.toHaveBeenCalled();
+    }, 20_000);
+
     it("falls back to updatedAt when completedAt is null and gates the archive", async () => {
       const seeded = await seedTerminalWorkspace({ mergedPr: true });
       // The done issue has no completedAt. The anchor falls back to updatedAt.
@@ -1517,6 +1575,47 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     ).toBe(4);
     // The rebuilt worktree is intact.
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("archives a cleanup_failed workspace, so a retried archive can finish it", async () => {
+    // A failed cleanup leaves the row closed but not archived. Treating it as
+    // already closed made every retry return 404, so the row stayed forever
+    // (paperclipai/paperclip#13014).
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const failedAt = new Date("2026-09-28T20:11:05.919Z");
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "cleanup_failed", closedAt: failedAt })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+
+    expect(result?.outcome).toBe("archived");
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("archived");
+  });
+
+  it("still refuses to archive a workspace that is already archived", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "archived", closedAt: new Date() })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+
+    expect(result).toBeNull();
   });
 
   it("does not overwrite a newer archive when a stale cleanup failure lands late", async () => {

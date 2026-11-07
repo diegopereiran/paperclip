@@ -2,6 +2,8 @@ export interface CostDateRange {
   from?: Date;
   to?: Date;
   allTime?: boolean;
+  /** Treat `to` as an exclusive bound (occurred_at < to) instead of inclusive. */
+  toExclusive?: boolean;
 }
 
 /** Default reports match the UTC month used by monetary budgets. Explicit

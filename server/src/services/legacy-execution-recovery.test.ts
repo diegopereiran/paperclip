@@ -21,6 +21,16 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
 });
 
+it("does not hold a suppressed disposition repair even when its source run had failure retries", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
+    scheduledRetryReason: "issue_disposition_repair",
+    contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 0 } },
+    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "cancelled" })).toBe(true);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,
@@ -105,5 +115,22 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { errorCode: "operator_interrupted" }, { resultJson: {} },
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
+  ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+
+it("exempts an issue_assignee_changed stale-gate receipt only with every dispatch field null", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "issue_assignee_changed",
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "stale_queued_run_gate" } };
+  expect(isPreDispatchReviewWait(run)).toBe(true);
+  for (const patch of [
+    { startedAt: new Date() }, { processPid: 123 }, { processGroupId: 123 },
+    { processStartedAt: new Date() }, { nativeSessionId: "provider-session" }, { nativeIssueId: "native-task" },
+    { sessionIdAfter: "provider-session" }, { runtimeModeResolvedAt: new Date() },
+    { controllerBootId: "live-controller" }, { controllerLeaseExpiresAt: new Date() }, { executionStage: "preparing" },
+    { resultJson: {} },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });

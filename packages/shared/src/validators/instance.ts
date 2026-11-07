@@ -22,6 +22,16 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+// An environment variable name, or a `PREFIX_*` prefix. PAPERCLIP_* is the
+// reserved runtime namespace and can never be inherited from the server.
+export const agentEnvPatternSchema = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*(_\*)?$/, "Use a variable name or a PREFIX_* pattern")
+  .refine((value) => !value.toUpperCase().startsWith("PAPERCLIP_"), {
+    message: "PAPERCLIP_* is reserved",
+  });
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
@@ -31,6 +41,10 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Server environment variables an agent process may inherit. Absent = the
+  // built-in default list in adapter-utils, for every company, present and
+  // future. An agent can add to it (runtimeConfig.inheritEnv), never opt out.
+  agentEnvAllowlist: z.array(agentEnvPatternSchema).max(256).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

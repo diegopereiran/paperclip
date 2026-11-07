@@ -434,6 +434,19 @@ describe("decideReleaseRecovery", () => {
       expected: { kind: "blocked", notice: "execution_review_participant" },
     },
     {
+      name: "released: a review-participant recovery retry parked on an explicit blocker path is not escalated",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: {
+          ...baseReleaseRecoveryFacts.reviewParticipant,
+          applies: true,
+          isExecutionReviewParticipantRecoveryRun: true,
+          hasExplicitBlockerPath: true,
+        },
+      },
+      expected: { kind: "released" },
+    },
+    {
       name: "queue_review_participant_recovery: review-participant recovery applies and no suppression or block condition fires",
       facts: {
         ...baseReleaseRecoveryFacts,

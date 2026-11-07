@@ -908,6 +908,8 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    acceptedOutcomeAt: z.string().datetime({ offset: true }).nullable().optional(),
+    acceptedOutcomeRef: z.string().trim().min(1).max(500).nullable().optional(),
   });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

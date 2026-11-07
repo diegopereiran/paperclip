@@ -3565,6 +3565,7 @@ describe("company portability", () => {
       ...agent,
       runtimeConfig: {
         ...((agent.runtimeConfig ?? {}) as Record<string, unknown>),
+        inheritEnv: ["DATABASE_URL"],
         debug: { providerTrace: "raw", retainedDebugSetting: true },
       },
     })));
@@ -3617,6 +3618,7 @@ describe("company portability", () => {
       | Record<string, unknown>
       | undefined;
     expect(createdRuntimeConfig?.debug).not.toHaveProperty("providerTrace");
+    expect(createdRuntimeConfig).not.toHaveProperty("inheritEnv");
   });
 
   it("imports only selected files and leaves unchecked company metadata alone", async () => {

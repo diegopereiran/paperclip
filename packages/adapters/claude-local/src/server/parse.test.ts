@@ -134,6 +134,30 @@ describe("detectClaudeLoginRequired", () => {
     expect(isClaudeTransientUpstreamError(input)).toBe(true);
   });
 
+  it("ignores a login phrase in tool output or assistant text on a failed exit", () => {
+    // A finished turn (success, is_error false) whose stdout holds text the
+    // model read. The raw stdout is untrusted, so the phrase must not classify.
+    const parsed = { is_error: false, subtype: "success", result: "done" };
+    const stdout = [
+      '{"type":"user","message":{"content":[{"type":"tool_result","content":"gh is not logged in on the Pi"}]}}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"The host is not logged in."}]}}',
+    ].join("\n");
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout, stderr: "" }),
+    ).toEqual({ requiresLogin: false, loginUrl: null });
+  });
+
+  it("still classifies a terminal result login prompt and keeps its URL", () => {
+    const parsed = {
+      is_error: true,
+      subtype: "success",
+      result: "Not logged in · Please run /login https://claude.ai/login",
+    };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }),
+    ).toEqual({ requiresLogin: true, loginUrl: "https://claude.ai/login" });
+  });
+
   it("does not treat a bare token phrase in raw stdout with no parsed result as login required", () => {
     // Untrusted stdout alone must not satisfy a token-failure marker. Only the
     // parsed terminal result fields of a failed run can trip the token markers.

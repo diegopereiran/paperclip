@@ -27,9 +27,11 @@ function runShard(args) {
 
 function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
+  // Fork: pr.yml pins pr-trusted.yml to a full upstream commit SHA instead of master, so a
+  // master workflow that needs scripts this release tree lacks cannot break CI. Accept either.
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
+    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@(?:master|[0-9a-f]{40})\s*$/m,
     "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
   );
   // Validate proposed workflow changes locally; CI executes the merged master version.

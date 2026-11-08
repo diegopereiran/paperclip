@@ -146,6 +146,55 @@ const support = await getEmbeddedPostgresTestSupport();
         summary: "Notion read completed.",
         exposeLowTrustRaw: false,
       });
+    it("builds a byte-identical envelope when the wake-context candidate is off or absent", async () => {
+      const baseline = JSON.stringify(await build());
+      const off = JSON.stringify(await buildExecutionContinuation({
+        db, companyId, issueId, agentId, context: { interactionId, wakeReason: "connection_intent.resolved" },
+        summary: "Notion read completed.", exposeLowTrustRaw: false, wakeContextCandidate: false,
+      }));
+      expect(off).toBe(baseline);
+      expect(baseline).not.toContain("contextCandidate");
+    });
+    it("stamps the candidate version and keeps the objective when the candidate is on", async () => {
+      const on = await buildExecutionContinuation({
+        db, companyId, issueId, agentId, context: { interactionId, wakeReason: "connection_intent.resolved" },
+        summary: "Notion read completed.", exposeLowTrustRaw: false, wakeContextCandidate: true,
+      });
+      expect(on.contextCandidate?.version).toBe("wake-context-candidate/v1");
+      expect(on.objectiveSource).toEqual((await build()).objectiveSource);
+      expect(on.messages.map(m => m.id)).toEqual(expect.arrayContaining([notionId, gmailId, laterId]));
+    });
+    it("keeps old own comments elided on the next wake of a resumed session", async () => {
+      const oldIds = [randomUUID(), randomUUID()];
+      const tailIds = Array.from({ length: 7 }, () => randomUUID());
+      const priorRunId = randomUUID();
+      const own = (id: string, minute: number) => ({ id, companyId, issueId, authorType: "agent" as const, authorAgentId: agentId,
+        body: `old status ${id} `.repeat(50), createdAt: new Date(`2026-09-08T10:00:${minute}Z`) });
+      await db.insert(issueComments).values([
+        ...oldIds.map((id, i) => own(id, 10 + i)),
+        ...tailIds.map((id, i) => ({ id, companyId, issueId, authorType: "user" as const, authorUserId: "local-board",
+          body: `tail ${i}`, createdAt: new Date(`2026-09-08T11:0${i}:00Z`) })),
+      ]);
+      const candidate = (previousContextRunId?: string) => buildExecutionContinuation({
+        db, companyId, issueId, agentId, context: { interactionId, wakeReason: "connection_intent.resolved" },
+        summary: null, exposeLowTrustRaw: false, wakeContextCandidate: true, previousContextRunId });
+      try {
+        const first = await candidate();
+        await db.insert(heartbeatRuns).values({ id: priorRunId, companyId, agentId, status: "succeeded",
+          contextSnapshot: { issueId, executionContinuation: first } });
+        const second = await candidate(priorRunId);
+        for (const envelope of [first, second]) {
+          expect(envelope.messages.map(m => m.id)).not.toEqual(expect.arrayContaining(oldIds));
+          expect(envelope.contextCandidate?.elidedMessages.map(m => m.id)).toEqual(expect.arrayContaining(oldIds));
+        }
+        const delta = second.resumeDelta!.messages.map(m => m.id);
+        for (const id of oldIds) expect(delta).not.toContain(id);
+        expect(JSON.stringify(second)).not.toContain("old status");
+      } finally {
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, priorRunId));
+        for (const id of [...oldIds, ...tailIds]) await db.delete(issueComments).where(eq(issueComments.id, id));
+      }
+    });
     it("attests the exact latest user comment selected as the objective", async () => {
       const envelope = await build();
       const latest = await db.select().from(issueComments).where(eq(issueComments.id, laterId)).then(rows => rows[0]!);

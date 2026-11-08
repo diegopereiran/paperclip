@@ -22,7 +22,7 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -52,6 +52,10 @@ export function legacyExecutionNeedsReconciliation(
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
+      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // The repair gate runs before the adapter, so a suppressed repair never ran
+  // provider work, whatever failure retries its source run carried over.
+  if (run.errorCode === "legacy_disposition_repair_suppressed" &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
@@ -233,6 +237,11 @@ export async function terminalizeLegacyExecution(input: {
               or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
                 sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              // Port of the #14234 guard: any automatic no-replay disposition for this run is a decision.
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' in ('blocked', 'conversation_continuation')`,
             ),
           ),
         )).limit(1);

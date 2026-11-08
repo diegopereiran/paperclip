@@ -29,7 +29,7 @@ import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -329,6 +329,7 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
+  carryOverEchoedMonitorPullRequests,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
@@ -3940,7 +3941,7 @@ export function issueRoutes(
     projectId: string | null,
     requestedPolicy: unknown,
   ) {
-    const policy = normalizeIssueExecutionPolicy(requestedPolicy);
+    const policy = normalizeIssueExecutionPolicy(requestedPolicy, { source: "client" });
     if (req.actor.type !== "agent") return policy;
     const trust = await resolveAgentTrustForIssue(
       { agentId: req.actor.agentId, runId: req.actor.runId },
@@ -5575,6 +5576,31 @@ export function issueRoutes(
       resource: { type: "issue", companyId, assigneeAgentId },
     });
     return decision.allowed;
+  }
+
+  async function assertBoardOrAssigneeManager(
+    req: Request,
+    issue: { companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return;
+    }
+    // The assignee itself cannot attest to its own stopped execution.
+    if (
+      !req.actor.agentId ||
+      !issue.assigneeAgentId ||
+      req.actor.agentId === issue.assigneeAgentId ||
+      !(await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        issue.companyId,
+        issue.assigneeAgentId,
+      ))
+    ) {
+      throw forbidden(
+        "Only the assignee's manager or a board user can reconcile a stopped execution",
+      );
+    }
   }
 
   async function assertAgentIssueMutationAllowed(
@@ -7242,6 +7268,49 @@ export function issueRoutes(
     }
 
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
+  }
+
+  /**
+   * When the caller is the run being stopped (an agent handing off or closing
+   * its own issue), cancelling would kill the adapter before it reports usage
+   * and session. Record the hand-off on the run and let it exit normally.
+   * Returns false for every other run, which keeps the stop.
+   */
+  async function markSelfHandoffRun(
+    run: {
+      id: string;
+      companyId: string;
+      agentId: string;
+      runtimeMode?: string | null;
+      contextSnapshot?: Record<string, unknown> | null;
+    },
+    actor: { agentId?: string | null; runId?: string | null },
+    reason: "issue_reassigned" | "issue_terminalized",
+    issue: { id: string; companyId: string },
+    source: string | undefined,
+  ) {
+    if (!actor.agentId || !actor.runId) return false;
+    // Same caller proof as the release's isHumanSelfHandoff.
+    if (source !== "agent_jwt" || run.runtimeMode !== "legacy") return false;
+    if (run.companyId !== issue.companyId || run.contextSnapshot?.issueId !== issue.id) return false;
+    if (run.id !== actor.runId || run.agentId !== actor.agentId) return false;
+    const marker = JSON.stringify({ selfHandoff: true, selfHandoffReason: reason });
+    const [marked] = await db
+      .update(heartbeatRuns)
+      .set({
+        // Existing keys win, so a second guard on the same request keeps the first reason.
+        resultJson: sql`${marker}::jsonb || coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+    return Boolean(marked);
   }
 
   type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -9695,16 +9764,35 @@ export function issueRoutes(
           lockedIssue.id,
           tx,
         );
+        // A settled no-replay hold still blocks dispatch (executionBlockerPredicate),
+        // so a caller that names no action must be able to reach it here.
+        const settledHold = !activeRecoveryAction && !actionId && executionReconciliation
+          ? await tx
+              .select({ id: issueRecoveryActions.id })
+              .from(issueRecoveryActions)
+              .where(
+                and(
+                  eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+                  eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+                  inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+                  executionBlockerPredicate(),
+                ),
+              )
+              .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id))
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const settledActionId = actionId ?? settledHold?.id;
         if (
-          actionId &&
-          (!activeRecoveryAction || activeRecoveryAction.id !== actionId)
+          settledActionId &&
+          (!activeRecoveryAction || activeRecoveryAction.id !== settledActionId)
         ) {
           const [settled] = await tx
             .select()
             .from(issueRecoveryActions)
             .where(
               and(
-                eq(issueRecoveryActions.id, actionId),
+                eq(issueRecoveryActions.id, settledActionId),
                 eq(issueRecoveryActions.companyId, lockedIssue.companyId),
                 eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
                 inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
@@ -9722,7 +9810,9 @@ export function issueRoutes(
             if (automatic?.replay === "blocked" && executionReconciliation) {
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
-              assertBoard(req);
+              // The assignee's manager agent may lift it too, so a parked ticket
+              // is never stranded when no board user is watching.
+              await assertBoardOrAssigneeManager(req, lockedIssue);
               if (
                 activeRecoveryAction ||
                 sourceIssueStatus !== "todo" ||
@@ -9885,7 +9975,7 @@ export function issueRoutes(
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
-          assertBoard(req);
+          await assertBoardOrAssigneeManager(req, lockedIssue);
           await validateExecutionReconciliation({
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
@@ -13048,7 +13138,7 @@ export function issueRoutes(
       const normalizedChildren = [];
       for (const child of requestedChildren) {
         const executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(child.executionPolicy),
+          normalizeIssueExecutionPolicy(child.executionPolicy, { source: "client" }),
           actor.actorType,
         );
         await assertCanManageIssueMonitor(
@@ -13722,6 +13812,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        acceptedOutcomeAt: acceptedOutcomeAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -13954,7 +14045,8 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         (Object.keys(updateFields).length > 0 ||
           reviewRequest !== undefined ||
-          hiddenAtRaw !== undefined);
+          hiddenAtRaw !== undefined ||
+          acceptedOutcomeAtRaw !== undefined);
 
       if (
         isAgentWorkUpdate &&
@@ -14032,6 +14124,9 @@ export function issueRoutes(
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
       }
+      if (acceptedOutcomeAtRaw !== undefined) {
+        updateFields.acceptedOutcomeAt = acceptedOutcomeAtRaw ? new Date(acceptedOutcomeAtRaw) : null;
+      }
       if (
         commentBody &&
         effectiveMoveToTodoRequested &&
@@ -14063,7 +14158,11 @@ export function issueRoutes(
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          carryOverEchoedMonitorPullRequests({
+            requested: req.body.executionPolicy,
+            normalized: normalizeIssueExecutionPolicy(req.body.executionPolicy, { source: "client" }),
+            stored: existing.executionPolicy ?? null,
+          }),
           actor.actorType,
         );
       }
@@ -14359,18 +14458,13 @@ export function issueRoutes(
           agentId: existing.assigneeAgentId,
         });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        const isHumanSelfHandoff =
-          req.actor.type === "agent" &&
-          req.actor.source === "agent_jwt" &&
-          nextAssigneeAgentId === null &&
-          typeof nextAssigneeUserId === "string" &&
-          req.actor.agentId === existing.assigneeAgentId &&
-          runToStopForReassignment?.runtimeMode === "legacy" &&
-          runToStopForReassignment.id === req.actor.runId &&
-          runToStopForReassignment.agentId === req.actor.agentId &&
-          runToStopForReassignment.companyId === existing.companyId &&
-          runToStopForReassignment.contextSnapshot?.issueId === existing.id;
-        if (runToStopForReassignment && !isHumanSelfHandoff) {
+        if (
+          runToStopForReassignment &&
+          (await markSelfHandoffRun(runToStopForReassignment, actor, "issue_reassigned", existing, req.actor.source))
+        ) {
+          // The caller is handing off its own run: it finishes normally and
+          // reports usage and session instead of being cancelled mid-turn.
+        } else if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14411,7 +14505,13 @@ export function issueRoutes(
         const runToStopForTerminalization = goalStopAction
           ? await resolveActiveIssueRun(existing)
           : null;
-        if (goalStopAction && runToStopForTerminalization) {
+        if (
+          goalStopAction &&
+          runToStopForTerminalization &&
+          (await markSelfHandoffRun(runToStopForTerminalization, actor, "issue_terminalized", existing, req.actor.source))
+        ) {
+          // Same as reassignment: a run closing its own issue ends normally.
+        } else if (goalStopAction && runToStopForTerminalization) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
@@ -14757,7 +14857,8 @@ export function issueRoutes(
       let cancelledStatusRunId: string | null = null;
       if (
         runToCancelForCancelledStatus &&
-        runToCancelForCancelledStatus.id !== interruptedRunId
+        runToCancelForCancelledStatus.id !== interruptedRunId &&
+        !(await markSelfHandoffRun(runToCancelForCancelledStatus, actor, "issue_terminalized", existing, req.actor.source))
       ) {
         try {
           const cancelled = await heartbeat.cancelRun(

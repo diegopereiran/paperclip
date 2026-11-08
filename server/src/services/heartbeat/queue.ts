@@ -39,6 +39,7 @@ import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
+import { createStageWakeLeaseRetry } from "../stage-wake-lease-retry.js";
 import {
   getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
@@ -941,6 +942,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  // The `issue_assignee_changed` reason promises that the new owner is woken
+  // instead. Keep that promise when no wake for the current assignee is pending.
+  async function ensureAssigneeWake(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    const [issue] = await db.select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+      .from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    if (!issue?.assigneeAgentId || issue.assigneeAgentId === run.agentId) return;
+    const [pending] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, run.companyId),
+      eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+      inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+    )).limit(1);
+    if (pending) return;
+    await enqueueWakeup(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      requestedByActorType: "system",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+  }
+
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
@@ -1145,6 +1169,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled") {
+          // The cancel released the issue lock; hand it to the next deferred
+          // wake as a normal run completion does. A promoted wake that is stale
+          // too re-enters this gate, so the chain ends with the deferred queue.
+          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, deferredPostCommitEffects });
+          if (staleness.errorCode === "issue_assignee_changed") await ensureAssigneeWake(run, issueId);
+        }
         logger.info(
           {
             runId: run.id,
@@ -2128,6 +2159,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
+  const stageWakeLeaseRetry = createStageWakeLeaseRetry<WakeupOptions>({
+    enqueue: (retryAgentId, retryOpts) => enqueueWakeup(retryAgentId, retryOpts),
+    onGiveUp: (key, attempts) => logger.warn({ key, attempts }, "stage wake still blocked by environment lease; giving up"),
+    onError: (key, err) => logger.warn({ err, key }, "stage wake lease retry failed"),
+  });
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -2534,7 +2571,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
+    // Called from inside the issue wakeup transaction; reads go through `tx`.
+    const resolveHasResolvablePriorSessionWorkspace = async (tx: Db) => {
       if (hasResolvablePriorSessionWorkspace !== null)
         return hasResolvablePriorSessionWorkspace;
       hasResolvablePriorSessionWorkspace = issueId
@@ -2543,6 +2581,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             contextSnapshot: enrichedContextSnapshot,
             taskKey: effectiveTaskKey,
             explicitResumeSession,
+            executor: tx,
           })
         : false;
       return hasResolvablePriorSessionWorkspace;
@@ -2611,18 +2650,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    // Always called from inside a wakeup transaction that already holds a
+    // pooled connection, so every read here must go through `tx`. A read on
+    // the global pool would wait for a second connection, and enough
+    // concurrent wakeups exhaust the pool and deadlock the server.
+    const resolveQueuedResponsibleUserId = (tx: Db) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, tx)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          tx,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
+            executor: tx,
             companyId: agent.companyId,
             contextSnapshot: enrichedContextSnapshot,
             issueContext: queuedIssueContext,
@@ -3304,6 +3349,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
             } else {
+              // Local patch (paperclip#13532): a stage wake blocked only by an
+              // unreleased lease is retried after the lease is released.
+              if (executionBlocker.cause === "execution_owner_active" && !executionBlocker.recoveryActionId &&
+                  (parseObject(payload).executionStage || parseObject(enrichedContextSnapshot).executionStage)) {
+                stageWakeLeaseRetry.schedule(agentId, issue.id, opts);
+              }
               await recordExecutionWait(tx as unknown as Db, {
                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,
                 request: {
@@ -3733,7 +3784,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               existingExecutionWorkspaceStatus,
             });
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await resolveHasResolvablePriorSessionWorkspace(tx as unknown as Db);
 
             if (
               isUnrunnableWorktreeCombo({
@@ -4243,7 +4294,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -4536,7 +4587,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,

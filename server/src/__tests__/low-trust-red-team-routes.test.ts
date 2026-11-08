@@ -979,7 +979,8 @@ describeEmbeddedPostgres(
       expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
       expect(handoff.body).toMatchObject({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user" });
       const [outgoing] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
-      expect(outgoing).toMatchObject({ status: "running", errorCode: null });
+      // The caller is that run, so the hand-off lets it finish instead of cancelling it.
+      expect(outgoing).toMatchObject({ status: "running", errorCode: null, resultJson: { selfHandoff: true } });
       const lateEdit = await request(directedAgent).patch(`/api/issues/${created.body.id}`)
         .send({ description: "Late outgoing edit" });
       expect([403, 404]).toContain(lateEdit.status);

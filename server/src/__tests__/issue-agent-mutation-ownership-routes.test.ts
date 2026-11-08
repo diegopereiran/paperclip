@@ -419,6 +419,7 @@ function createRunContextDb(
       }),
     })),
     insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => [{ id: runId }]) })) })) })),
   };
   return dbStub;
 }
@@ -2966,16 +2967,15 @@ describe("agent issue mutation checkout ownership", () => {
       },
     );
 
-    it.each(["agent", "unassigned"])("still stops the outgoing run before an %s handoff", async target => {
+    // Fork: a run handing off its own issue finishes normally (849fffcef), so it keeps its usage and session.
+    it.each(["agent", "unassigned"])("lets the outgoing run finish on an %s handoff", async target => {
       const res = await request(handoffApp({ ...ownerActor(), source: "agent_jwt" }))
         .patch(`/api/issues/${issueId}`).send({
           assigneeAgentId: target === "agent" ? peerAgentId : null,
           assigneeUserId: null,
         });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
-      expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0])
-        .toBeLessThan(mockIssueService.update.mock.invocationCallOrder[0]!);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
   });
 

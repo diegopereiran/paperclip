@@ -28,6 +28,8 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lt,
+  ne,
   not,
   notExists,
   notInArray,
@@ -189,6 +191,11 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const STRANDED_DEFERRED_WAKE_CANDIDATE_LIMIT = 200;
+/** A deferred issue wake with no execution run this old has lost its promoter. */
+const STRANDED_DEFERRED_WAKE_MIN_AGE_MS = 10 * 60 * 1000;
+const DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const DEFERRED_CHILDREN_COMPLETED_WAKE_CANDIDATE_LIMIT = 200;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -717,6 +724,16 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
+export function shouldHoldRecoveryForPausedAgent(
+  agent: { status: string; companyId: string } | null | undefined,
+  issueCompanyId: string,
+  latestRun?: { status: string; errorCode?: string | null } | null,
+): boolean {
+  // A crash is not part of the pause: the stranded task must stay visible.
+  if (latestRun?.status === "failed" && latestRun.errorCode === "process_lost") return false;
+  return agent?.status === "paused" && agent.companyId === issueCompanyId;
+}
+
 export function classifyContinuationFailure(
   latestRun: LatestIssueRun,
 ): ContinuationRetryClassification {
@@ -931,6 +948,8 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** Promote the next deferred wake of the run's issue (the run-completion path). */
+    releaseIssueExecutionAndPromote?: (run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) => Promise<unknown>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -4468,6 +4487,38 @@ export function recoveryService(
     );
   }
 
+  // A deferred wake waits for the issue's execution run to release. When the run
+  // is gone and nothing promoted the wake, it would wait forever.
+  async function promoteStrandedDeferredWakes() {
+    if (!deps.releaseIssueExecutionAndPromote) return;
+    const stranded = await db
+      .select({ companyId: issues.companyId, issueId: issues.id })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload} ->> 'issueId'`,
+        ),
+      )
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        lt(agentWakeupRequests.requestedAt, new Date(Date.now() - STRANDED_DEFERRED_WAKE_MIN_AGE_MS)),
+        isNull(issues.executionRunId),
+      ))
+      // Unpromotable rows (no run, held run) recur every tick: bound the read.
+      .groupBy(issues.companyId, issues.id)
+      .orderBy(sql`min(${agentWakeupRequests.requestedAt})`)
+      .limit(STRANDED_DEFERRED_WAKE_CANDIDATE_LIMIT);
+    for (const { companyId, issueId } of stranded) {
+      const latestRun = await getLatestIssueRun(companyId, issueId);
+      if (!latestRun) continue;
+      await deps.releaseIssueExecutionAndPromote({ id: latestRun.id, companyId }).catch((err) => {
+        logger.warn({ err, issueId }, "Stranded deferred wake promotion failed");
+      });
+    }
+  }
+
   async function reconcileStrandedAssignedIssues(opts?: {
     issueCreatedAtGte?: Date | null;
   }) {
@@ -4495,6 +4546,8 @@ export function recoveryService(
           ))),
         ),
       );
+
+    await promoteStrandedDeferredWakes();
 
     const result = {
       assignmentDispatched: 0,
@@ -4640,6 +4693,12 @@ export function recoveryService(
 
       const agent = await getAgent(agentId);
       if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
+        result.skipped += 1;
+        continue;
+      }
+      // A deliberate pause holds all assigned and review work. Resume returns
+      // it to the normal sweep.
+      if (shouldHoldRecoveryForPausedAgent(agent, issue.companyId, latestRun)) {
         result.skipped += 1;
         continue;
       }
@@ -5999,6 +6058,210 @@ export function recoveryService(
     return result;
   }
 
+  // Sends the `issue_children_completed` wake that the issue route deferred
+  // because the completed child's execution workspace had not finalized yet
+  // (see `getWakeableParentAfterChildCompletion`). Called after a run records
+  // a successful `workspace_finalize`, when sync-back has landed in the local
+  // worktree. Idempotent: a wake already sent for this completion, by the
+  // route or by an earlier finalize pass, suppresses a second one.
+  async function reconcileDeferredChildrenCompletedWake(opts: {
+    runId?: string | null;
+    companyId: string;
+    completedChildIssueId: string;
+    source?: ResolvedDependencyWakeBackstopSource;
+  }) {
+    const result = {
+      checked: 0,
+      healed: 0,
+      notReady: 0,
+      existingWakeSkipped: 0,
+      enqueueFailed: 0,
+    };
+    const source = opts.source ?? "workspace.finalize";
+
+    const child = await db
+      .select({
+        id: issues.id,
+        parentId: issues.parentId,
+        status: issues.status,
+        completedAt: issues.completedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.id, opts.completedChildIssueId),
+          eq(issues.companyId, opts.companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!child || !child.parentId || child.status !== "done") return result;
+    result.checked = 1;
+
+    // Only the child that completed last owns the parent wake: the route woke
+    // the parent when the last child went terminal, so an earlier child must
+    // not trigger a second one.
+    const laterDoneSibling = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, opts.companyId),
+          eq(issues.parentId, child.parentId),
+          ne(issues.id, child.id),
+          eq(issues.status, "done"),
+          child.completedAt
+            ? gt(issues.completedAt, child.completedAt)
+            : sql`false`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (laterDoneSibling) {
+      result.existingWakeSkipped = 1;
+      return result;
+    }
+
+    const existingWake = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, opts.companyId),
+          eq(agentWakeupRequests.reason, "issue_children_completed"),
+          // Per parent, not per assignee: a reassigned parent (review stage)
+          // must not receive a second wake for a completion already sent.
+          or(
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${child.parentId}`,
+            sql`${agentWakeupRequests.payload} ->> 'completedChildIssueId' = ${child.id}`,
+          ),
+          child.completedAt
+            ? gte(agentWakeupRequests.createdAt, child.completedAt)
+            : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existingWake) {
+      result.existingWakeSkipped = 1;
+      return result;
+    }
+
+    const parent = await issuesSvc.getWakeableParentAfterChildCompletion(
+      child.parentId,
+      { issueId: child.id, summary: null },
+    );
+    if (!parent) {
+      result.notReady = 1;
+      return result;
+    }
+
+    // A paused or budget-blocked assignee cannot take the wake; skip it
+    // instead of writing a skipped wakeup row on every recovery tick.
+    if (!(await isAgentInvokable(await getAgent(parent.assigneeAgentId)))) {
+      result.notReady = 1;
+      return result;
+    }
+
+    const childCompletion = {
+      completedChildIssueId: child.id,
+      childIssueIds: parent.childIssueIds,
+      childIssueSummaries: parent.childIssueSummaries,
+      childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+    };
+    const idempotencyKey = `issue_children_completed:${parent.id}:${child.id}`;
+    try {
+      const wake = await deps.enqueueWakeup(parent.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_children_completed",
+        payload: { issueId: parent.id, ...childCompletion },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat_finalize",
+        contextSnapshot: {
+          issueId: parent.id,
+          taskId: parent.id,
+          wakeReason: "issue_children_completed",
+          source: "issue.children_completed",
+          ...childCompletion,
+        },
+      });
+      if (!wake) return result;
+      result.healed = 1;
+      await logActivity(db, {
+        companyId: opts.companyId,
+        actorType: "system",
+        actorId: "heartbeat_finalize",
+        agentId: parent.assigneeAgentId,
+        runId: opts.runId ?? null,
+        action: "issue.children_completed_wake_emitted",
+        entityType: "issue",
+        entityId: parent.id,
+        details: {
+          source,
+          wakeupRunId: wake.id,
+          idempotencyKey,
+          completedChildIssueId: child.id,
+        },
+      });
+    } catch (err) {
+      result.enqueueFailed = 1;
+      logger.warn(
+        { err, parentIssueId: parent.id, completedChildIssueId: child.id, source },
+        "failed to enqueue deferred children-completed wake after workspace_finalize",
+      );
+    }
+    return result;
+  }
+
+  // Level-triggered companion to the finalize hook: a deferred wake is lost
+  // when the child's own run failed its finalize and a later run on the same
+  // workspace cleared the barrier. Re-check recently completed children on
+  // every recovery tick; the reconciler's dedup keeps this to one wake each.
+  async function reconcileDeferredChildrenCompletedWakes(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+  }) {
+    const total = {
+      checked: 0,
+      healed: 0,
+      notReady: 0,
+      existingWakeSkipped: 0,
+      enqueueFailed: 0,
+    };
+    const since = new Date(
+      Date.now() - DEFERRED_CHILDREN_COMPLETED_WAKE_LOOKBACK_MS,
+    );
+    const candidates = await db
+      .select({ id: issues.id, companyId: issues.companyId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+          sql`${issues.parentId} is not null`,
+          gte(issues.completedAt, since),
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : sql`true`,
+        ),
+      )
+      .orderBy(desc(issues.completedAt))
+      .limit(DEFERRED_CHILDREN_COMPLETED_WAKE_CANDIDATE_LIMIT);
+    for (const candidate of candidates) {
+      const result = await reconcileDeferredChildrenCompletedWake({
+        runId: opts?.runId ?? null,
+        companyId: candidate.companyId,
+        completedChildIssueId: candidate.id,
+        source: "issue_graph_liveness.backstop",
+      });
+      total.checked += result.checked;
+      total.healed += result.healed;
+      total.notReady += result.notReady;
+      total.existingWakeSkipped += result.existingWakeSkipped;
+      total.enqueueFailed += result.enqueueFailed;
+    }
+    return total;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -6451,6 +6714,8 @@ export function recoveryService(
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileDeferredChildrenCompletedWake,
+    reconcileDeferredChildrenCompletedWakes,
     readRecoveryTimerIntervalMs,
   };
 }

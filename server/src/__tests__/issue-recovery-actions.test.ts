@@ -682,23 +682,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     },
   );
 
-  it("escalates an unchanged paused-assignee snapshot and publishes its committed notice", async () => {
+  it("holds an unchanged paused-assignee snapshot instead of escalating it (#14528)", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const observed = (await issueService(db).update(sourceIssue.id, { status: "todo" }))!;
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
     const enqueueWakeup = vi.fn(async () => null);
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
-    expect(result).toMatchObject({ escalated: 1, issueIds: [observed.id] });
+    // Queue port of #14596: a deliberate pause holds assigned work until resume.
+    expect(result).toMatchObject({ escalated: 0, issueIds: [] });
     expect(await db.select().from(issues).where(eq(issues.id, observed.id)))
-      .toMatchObject([{ status: "blocked", assigneeAgentId: coderId }]);
+      .toMatchObject([{ status: "todo", assigneeAgentId: coderId }]);
     expect(await db.select().from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, observed.id)))
-      .toMatchObject([{ status: "active", previousOwnerAgentId: coderId }]);
+      .where(eq(issueRecoveryActions.sourceIssueId, observed.id))).toEqual([]);
     expect(await db.select().from(issueComments)
-      .where(eq(issueComments.issueId, observed.id))).toHaveLength(1);
-    expect(await db.select().from(activityLog)
-      .where(eq(activityLog.entityId, observed.id)))
-      .toMatchObject([{ details: expect.objectContaining({ status: "blocked" }) }]);
+      .where(eq(issueComments.issueId, observed.id))).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
     expect(enqueueWakeup).not.toHaveBeenCalled();
@@ -2067,6 +2064,59 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
     await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
+  });
+
+  async function seedSettledBlockedHold() {
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId } = fixture;
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const body = { outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects." } };
+    return { ...fixture, runId, action: action!, body };
+  }
+
+  it("clears a settled no-replay hold without naming the action", async () => {
+    const { sourceIssueId, action, body } = await seedSettledBlockedHold();
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+  });
+
+  it("does not report a replay when a settled hold is resolved without reconciliation evidence or actionId", async () => {
+    const { sourceIssueId } = await seedSettledBlockedHold();
+    const res = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ outcome: "restored", sourceIssueStatus: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+  });
+
+  it("lets the assignee's manager agent clear a settled no-replay hold but not an unrelated agent", async () => {
+    const { companyId, managerId, sourceIssueId, action, body } = await seedSettledBlockedHold();
+    const strangerId = randomUUID();
+    await db.insert(agents).values({ id: strangerId, companyId, name: "Stranger", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const resolveAs = async (agentId: string) => {
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId, runId, issueId: sourceIssueId });
+      return request(createApp({ type: "agent", agentId, companyId, runId, source: "agent_key" }))
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).set("X-Paperclip-Run-Id", runId).send(body);
+    };
+    const denied = await resolveAs(strangerId);
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(denied.body.error).toContain("another owner's recovery action");
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    const allowed = await resolveAs(managerId);
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("todo");
+    expect(action.id).toBeTruthy();
   });
 
   async function seedReconciledDelivery() {

@@ -7,6 +7,7 @@ import { isConversation } from "../agent-conversations.js";
 import { chatCompletionInstruction } from "../chat-completion-delivery.js";
 import { getConversationConfirmationContext } from "../conversation-confirmation-context.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
+import { isWakeContextCandidateEnabled } from "../wake-context-candidate.js";
 import { getIssueContinuationSummaryDocument } from "../issue-continuation-summary.js";
 import type { issueService } from "../issues.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
@@ -23,7 +24,7 @@ type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecu
 
 export interface HeartbeatTaskContextInput {
   run: Pick<typeof heartbeatRuns.$inferSelect, "id">;
-  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType" | "runtimeConfig">;
   task: {
     issueRef: Pick<IssueContext,
       "id" | "identifier" | "title" | "status" | "priority" | "workMode" |
@@ -116,6 +117,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
           previousContextRunId: taskSession?.lastRunId,
           summary: safeContinuationSummary?.body ?? null,
           exposeLowTrustRaw,
+          wakeContextCandidate: isWakeContextCandidateEnabled(agent.runtimeConfig),
         })
       : null;
   context.executionContinuation = executionContinuation;

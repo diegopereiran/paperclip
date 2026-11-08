@@ -724,6 +724,13 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
+export function shouldHoldRecoveryForPausedAgent(
+  agent: { status: string; companyId: string } | null | undefined,
+  issueCompanyId: string,
+): boolean {
+  return agent?.status === "paused" && agent.companyId === issueCompanyId;
+}
+
 export function classifyContinuationFailure(
   latestRun: LatestIssueRun,
 ): ContinuationRetryClassification {
@@ -4683,6 +4690,12 @@ export function recoveryService(
 
       const agent = await getAgent(agentId);
       if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
+        result.skipped += 1;
+        continue;
+      }
+      // A deliberate pause holds all assigned and review work. Resume returns
+      // it to the normal sweep.
+      if (shouldHoldRecoveryForPausedAgent(agent, issue.companyId)) {
         result.skipped += 1;
         continue;
       }

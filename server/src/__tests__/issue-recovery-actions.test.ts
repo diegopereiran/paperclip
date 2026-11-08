@@ -682,23 +682,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     },
   );
 
-  it("escalates an unchanged paused-assignee snapshot and publishes its committed notice", async () => {
+  it("holds an unchanged paused-assignee snapshot instead of escalating it (#14528)", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const observed = (await issueService(db).update(sourceIssue.id, { status: "todo" }))!;
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
     const enqueueWakeup = vi.fn(async () => null);
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
-    expect(result).toMatchObject({ escalated: 1, issueIds: [observed.id] });
+    // Queue port of #14596: a deliberate pause holds assigned work until resume.
+    expect(result).toMatchObject({ escalated: 0, issueIds: [] });
     expect(await db.select().from(issues).where(eq(issues.id, observed.id)))
-      .toMatchObject([{ status: "blocked", assigneeAgentId: coderId }]);
+      .toMatchObject([{ status: "todo", assigneeAgentId: coderId }]);
     expect(await db.select().from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, observed.id)))
-      .toMatchObject([{ status: "active", previousOwnerAgentId: coderId }]);
+      .where(eq(issueRecoveryActions.sourceIssueId, observed.id))).toEqual([]);
     expect(await db.select().from(issueComments)
-      .where(eq(issueComments.issueId, observed.id))).toHaveLength(1);
-    expect(await db.select().from(activityLog)
-      .where(eq(activityLog.entityId, observed.id)))
-      .toMatchObject([{ details: expect.objectContaining({ status: "blocked" }) }]);
+      .where(eq(issueComments.issueId, observed.id))).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
     expect(enqueueWakeup).not.toHaveBeenCalled();

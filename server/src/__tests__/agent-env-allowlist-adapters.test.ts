@@ -13,6 +13,8 @@ const SERVER_SECRETS = {
 };
 
 const FAKE_COMMAND = `#!/usr/bin/env node
+// The release probes claude --version before the run.
+if (process.argv.includes("--version")) { console.log("2.1.284 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 fs.readFileSync(0, "utf8");
 fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify(process.env), "utf8");

@@ -4,11 +4,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { runAdapterExecutionTargetProcess } = vi.hoisted(() => ({
-  runAdapterExecutionTargetProcess: vi.fn(async () => ({
+  // The release probes `claude --version` before the run; answer it so the run proceeds.
+  runAdapterExecutionTargetProcess: vi.fn(async (_runId: string, _target: unknown, _command: string, args: string[] = []) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
-    stdout: "",
+    stdout: args.includes("--version") ? "2.1.284 (Claude Code)" : "",
     stderr: "",
     pid: 123,
     startedAt: new Date().toISOString(),

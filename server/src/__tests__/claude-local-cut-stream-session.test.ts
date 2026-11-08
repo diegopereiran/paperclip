@@ -13,6 +13,8 @@ async function writeStreamClaudeCommand(
   options: { withResult: boolean; hang?: boolean; staleResume?: boolean },
 ): Promise<void> {
   const script = `#!/usr/bin/env node
+// The release probes claude --version before the run.
+if (process.argv.includes("--version")) { console.log("2.1.284 (Claude Code)"); process.exit(0); }
 require("node:fs").readFileSync(0, "utf8");
 const emit = (event) => console.log(JSON.stringify(event));
 ${options.staleResume

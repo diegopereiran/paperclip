@@ -412,6 +412,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     })();
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let remoteRuntimeRootDir: string | null = null;
+    // Where Pi sessions live: outlives the run on a stable SSH folder, else beside the runtime assets.
+    let remoteSessionRootDir: string | null = null;
     let localSkillsDir: string | null = null;
     let remoteSkillsDir: string | null = null;
     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
@@ -468,6 +470,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           env.HOME = preparedRemoteRuntime.runtimeRootDir;
         }
         remoteRuntimeRootDir = preparedRemoteRuntime.runtimeRootDir;
+        remoteSessionRootDir = preparedRemoteRuntime.persistentStateDir ?? preparedRemoteRuntime.runtimeRootDir;
         remoteSkillsDir = preparedRemoteRuntime.assetDirs.skills ?? null;
         if (localAgentConfigDir && preparedRemoteRuntime.assetDirs.agentConfig) {
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
@@ -538,8 +541,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionHeaderCwdMatches;
     const sessionPath = canResumeSession
       ? runtimeSessionId
-      : executionTargetIsRemote && remoteRuntimeRootDir
-        ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
+      : executionTargetIsRemote && remoteSessionRootDir
+        ? buildRemoteSessionPath(remoteSessionRootDir, agent.id, new Date().toISOString())
         : buildSessionPath(agent.id, new Date().toISOString());
 
     if (runtimeSessionId && !canResumeSession) {
@@ -865,8 +868,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] Pi session "${runtimeSessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
-          ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
+        const newSessionPath = executionTargetIsRemote && remoteSessionRootDir
+          ? buildRemoteSessionPath(remoteSessionRootDir, agent.id, new Date().toISOString())
           : buildSessionPath(agent.id, new Date().toISOString());
         if (executionTargetIsRemote) {
           await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {

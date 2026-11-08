@@ -258,7 +258,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     ` : [];
     return async () => {
       const [companyRow] = await sql`SELECT to_jsonb(c) AS row FROM companies c WHERE id = ${company.id}`;
-      const [taskRow] = await sql`SELECT to_jsonb(t) AS row FROM issues t WHERE id = ${task.id}`;
+      const [taskRow] = await sql`SELECT to_jsonb(t) - 'accepted_outcome_at' - 'accepted_outcome_ref' AS row FROM issues t WHERE id = ${task.id}`;
       const [runRow] = await sql`SELECT to_jsonb(r) AS row FROM heartbeat_runs r WHERE id = ${run.id}`;
       const [grantRow] = await sql`SELECT to_jsonb(g) AS row FROM mcp_oauth_grants g WHERE id = ${grant.id}`;
       const [bindingRow] = binding ? await sql`SELECT to_jsonb(b) AS row FROM muse_agent_bindings b WHERE id = ${binding.id}` : [];

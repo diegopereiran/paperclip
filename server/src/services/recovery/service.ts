@@ -727,7 +727,10 @@ type ContinuationRetryClassification = {
 export function shouldHoldRecoveryForPausedAgent(
   agent: { status: string; companyId: string } | null | undefined,
   issueCompanyId: string,
+  latestRun?: { status: string; errorCode?: string | null } | null,
 ): boolean {
+  // A crash is not part of the pause: the stranded task must stay visible.
+  if (latestRun?.status === "failed" && latestRun.errorCode === "process_lost") return false;
   return agent?.status === "paused" && agent.companyId === issueCompanyId;
 }
 
@@ -4695,7 +4698,7 @@ export function recoveryService(
       }
       // A deliberate pause holds all assigned and review work. Resume returns
       // it to the normal sweep.
-      if (shouldHoldRecoveryForPausedAgent(agent, issue.companyId)) {
+      if (shouldHoldRecoveryForPausedAgent(agent, issue.companyId, latestRun)) {
         result.skipped += 1;
         continue;
       }

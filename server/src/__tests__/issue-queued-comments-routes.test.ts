@@ -119,7 +119,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       (req as any).actor = {
         type: agentActor ? "agent" : "board",
         ...(agentActor ? { ...agentActor, companyId } : {}),
-        source: "session",
+        source: agentActor ? "agent_jwt" : "session",
         userId,
         companyIds: [companyId],
         memberships: [{ companyId, status: "active", membershipRole: "operator" }],

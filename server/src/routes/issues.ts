@@ -7277,11 +7277,22 @@ export function issueRoutes(
    * Returns false for every other run, which keeps the stop.
    */
   async function markSelfHandoffRun(
-    run: { id: string; companyId: string; agentId: string },
+    run: {
+      id: string;
+      companyId: string;
+      agentId: string;
+      runtimeMode?: string | null;
+      contextSnapshot?: Record<string, unknown> | null;
+    },
     actor: { agentId?: string | null; runId?: string | null },
     reason: "issue_reassigned" | "issue_terminalized",
+    issue: { id: string; companyId: string },
+    source: string | undefined,
   ) {
     if (!actor.agentId || !actor.runId) return false;
+    // Same caller proof as the release's isHumanSelfHandoff.
+    if (source !== "agent_jwt" || run.runtimeMode !== "legacy") return false;
+    if (run.companyId !== issue.companyId || run.contextSnapshot?.issueId !== issue.id) return false;
     if (run.id !== actor.runId || run.agentId !== actor.agentId) return false;
     const marker = JSON.stringify({ selfHandoff: true, selfHandoffReason: reason });
     const [marked] = await db
@@ -14449,7 +14460,7 @@ export function issueRoutes(
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (
           runToStopForReassignment &&
-          (await markSelfHandoffRun(runToStopForReassignment, actor, "issue_reassigned"))
+          (await markSelfHandoffRun(runToStopForReassignment, actor, "issue_reassigned", existing, req.actor.source))
         ) {
           // The caller is handing off its own run: it finishes normally and
           // reports usage and session instead of being cancelled mid-turn.
@@ -14497,7 +14508,7 @@ export function issueRoutes(
         if (
           goalStopAction &&
           runToStopForTerminalization &&
-          (await markSelfHandoffRun(runToStopForTerminalization, actor, "issue_terminalized"))
+          (await markSelfHandoffRun(runToStopForTerminalization, actor, "issue_terminalized", existing, req.actor.source))
         ) {
           // Same as reassignment: a run closing its own issue ends normally.
         } else if (goalStopAction && runToStopForTerminalization) {
@@ -14847,7 +14858,7 @@ export function issueRoutes(
       if (
         runToCancelForCancelledStatus &&
         runToCancelForCancelledStatus.id !== interruptedRunId &&
-        !(await markSelfHandoffRun(runToCancelForCancelledStatus, actor, "issue_terminalized"))
+        !(await markSelfHandoffRun(runToCancelForCancelledStatus, actor, "issue_terminalized", existing, req.actor.source))
       ) {
         try {
           const cancelled = await heartbeat.cancelRun(

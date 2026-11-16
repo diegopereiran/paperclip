@@ -592,6 +592,66 @@ describe("claude remote execution", () => {
       });
     });
 
+    it("reports a failed version probe as claude_cli_probe_failed with the exit code and output", async () => {
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: 75,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "DISK GUARD: host x has 6 GB free (< 10 GB). Run not started.\n",
+        pid: 123,
+        startedAt: new Date().toISOString(),
+      });
+
+      const { args, result } = await executeWithModel("paperclip-claude-model-probe-fail-", {
+        model: "claude-opus-5-5",
+      });
+
+      expect(args).toEqual([]);
+      expect(result.errorCode).toBe("claude_cli_probe_failed");
+      expect(result.errorMessage).toContain("exited with code 75");
+      expect(result.errorMessage).toContain("DISK GUARD: host x has 6 GB free");
+      expect(result.errorMessage).not.toContain("or newer");
+    });
+
+    it("reports a timed-out version probe as claude_cli_probe_failed naming the timeout", async () => {
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        stdout: "",
+        stderr: "",
+        pid: 123,
+        startedAt: new Date().toISOString(),
+      });
+
+      const { result } = await executeWithModel("paperclip-claude-model-probe-timeout-", {
+        model: "claude-opus-5-5",
+      });
+
+      expect(result.errorCode).toBe("claude_cli_probe_failed");
+      expect(result.errorMessage).toContain("timed out");
+    });
+
+    it("reports a probe that printed no version as claude_cli_probe_failed", async () => {
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "hello\n",
+        stderr: "",
+        pid: 123,
+        startedAt: new Date().toISOString(),
+      });
+
+      const { result } = await executeWithModel("paperclip-claude-model-probe-noversion-", {
+        model: "claude-opus-5-5",
+      });
+
+      expect(result.errorCode).toBe("claude_cli_probe_failed");
+      expect(result.errorMessage).toContain("no parseable version");
+    });
+
     it("leaves Fable compatibility to explicitly configured custom CLI wrappers", async () => {
       const { args, result } = await executeWithModel("paperclip-claude-model-wrapper-", {
         command: "/opt/paperclip/claude-wrapper",

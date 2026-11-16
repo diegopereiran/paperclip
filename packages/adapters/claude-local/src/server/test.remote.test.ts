@@ -221,4 +221,28 @@ describe("claude CLI model compatibility check", () => {
     ];
     expect(versionCall[3]).toEqual(["--version"]);
   });
+
+  it("reports a failing version probe as claude_cli_probe_failed in the environment test", async () => {
+    probeResult.value = {
+      exitCode: 75,
+      stdout: "",
+      stderr: "DISK GUARD: host x has 6 GB free. Run not started.\n",
+    };
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "claude_local",
+      config: { engine: "cli", command: "/opt/operator/claude", model: "claude-opus-5-5" },
+      executionTarget: sandboxTarget,
+      environmentName: "Daytona",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      code: "claude_cli_probe_failed",
+      level: "error",
+      detail: expect.stringContaining("exited with code 75: DISK GUARD: host x has 6 GB free"),
+    }));
+    expect(result.checks.some((check) => check.code === "claude_cli_version_incompatible")).toBe(false);
+  });
 });

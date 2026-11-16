@@ -2,7 +2,7 @@ import type { AdapterEnvironmentCheck } from "@paperclipai/adapter-utils";
 import { maybeRunSandboxInstallCommand, type AdapterSandboxInstallCommandCheck } from "@paperclipai/adapter-utils/execution-target";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import path from "node:path";
-import { claudeCliVersionAtLeast, readClaudeCommandVersion } from "./cli-capabilities.js";
+import { claudeCliVersionAtLeast, probeClaudeCommandVersionDetailed, readClaudeCommandVersion } from "./cli-capabilities.js";
 
 function installationFailureDetail(check: AdapterSandboxInstallCommandCheck | null): string {
   if (check?.message.includes("timed out")) return "The package installation timed out.";
@@ -17,9 +17,9 @@ function installationFailureDetail(check: AdapterSandboxInstallCommandCheck | nu
 
 export async function prepareCompatibleClaudeCommand(
   input: Parameters<typeof readClaudeCommandVersion>[0] & { minimumVersion: string },
-): Promise<{ command: string; version: string | null; check?: AdapterEnvironmentCheck }> {
-  const detected = await readClaudeCommandVersion(input);
-  const original = { command: input.command, version: detected };
+): Promise<{ command: string; version: string | null; probeFailure: string | null; check?: AdapterEnvironmentCheck }> {
+  const { version: detected, failure: probeFailure } = await probeClaudeCommandVersionDetailed(input);
+  const original = { command: input.command, version: detected, probeFailure };
   if (
     !detected || claudeCliVersionAtLeast(detected, input.minimumVersion) ||
     input.target?.kind !== "remote" || input.target.transport !== "sandbox" ||
@@ -29,7 +29,7 @@ export async function prepareCompatibleClaudeCommand(
   const prefix = path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "claude-cli", input.minimumVersion);
   const command = path.posix.join(prefix, "bin", "claude");
   const existing = await readClaudeCommandVersion({ ...input, command });
-  if (existing && claudeCliVersionAtLeast(existing, input.minimumVersion)) return { command, version: existing };
+  if (existing && claudeCliVersionAtLeast(existing, input.minimumVersion)) return { command, version: existing, probeFailure: null };
 
   const installation = await maybeRunSandboxInstallCommand({
     runId: input.runId,
@@ -54,7 +54,7 @@ export async function prepareCompatibleClaudeCommand(
     message: "Paperclip installed the Claude runtime but could not verify a compatible version.",
     detail: version ? `The prepared runtime reported Claude Code ${version}.` : "The prepared runtime did not report its version.",
   } };
-  return { command, version, check: {
+  return { command, version, probeFailure: null, check: {
     code: "claude_runtime_prepared", level: "info",
     message: `Paperclip prepared Claude Code ${version} for the selected model.`,
   } };

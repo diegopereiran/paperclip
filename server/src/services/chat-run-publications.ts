@@ -668,6 +668,14 @@ export async function enqueueChatRunMilestones(
 ): Promise<number> {
   const since = input.since ?? new Date(Date.now() - 24 * 60 * 60_000);
   const limit = Math.max(1, Math.min(input.limit ?? 200, 1_000));
+  // Without an open conversation no run can match the join below, and the
+  // heartbeat_runs scan costs about a second per tick (ALP-6369).
+  const [openConversation] = await db
+    .select({ id: chatConversations.id })
+    .from(chatConversations)
+    .where(inArray(chatConversations.state, ["active", "waiting"]))
+    .limit(1);
+  if (!openConversation) return 0;
   const issueIdFromContext = boundRunIssueIdSql();
   const explicitlyAuthoredCommentReason = sql<boolean>`(
     ${issueComments.metadata} ->> 'authorizationReason' = 'paperclip_runner_protocol'

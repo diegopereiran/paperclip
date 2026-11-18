@@ -1341,6 +1341,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resolvedCommand,
       });
       const detectedCliVersion = prepared.version;
+      if (!detectedCliVersion && prepared.probeFailure) {
+        const errorMessage =
+          `Could not verify the Claude Code version for ${model}: ${prepared.probeFailure}. ` +
+          "Fix the host or CLI problem above and retry.";
+        await onLog("stderr", `[paperclip] ${errorMessage}\n`);
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage,
+          errorCode: "claude_cli_probe_failed",
+          provider: "anthropic",
+          biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+          model,
+          billingType,
+          resultJson: {
+            stopReason: "claude_cli_probe_failed",
+            requiredClaudeCodeVersion: minimumCliVersion,
+          },
+        };
+      }
       if (
         !detectedCliVersion ||
         !claudeCliVersionAtLeast(detectedCliVersion, minimumCliVersion)

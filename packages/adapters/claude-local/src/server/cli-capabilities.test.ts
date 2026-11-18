@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   claudeCommandSupportsEffortFlag,
+  probeClaudeCommandVersionDetailed,
   readClaudeCommandVersion,
   resetClaudeCliCapabilitiesCacheForTests,
 } from "./cli-capabilities.js";
@@ -39,4 +40,33 @@ describe.skipIf(process.platform === "win32")("Claude CLI capability probe budge
     await expect(readClaudeCommandVersion(input)).resolves.toBeNull();
     await expect(claudeCommandSupportsEffortFlag(input)).resolves.toBeNull();
   }, 30_000);
+});
+
+describe.skipIf(process.platform === "win32")("Claude CLI version probe outcome", () => {
+  function fakeClaude(body: string) {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "paperclip-probe-claude-"));
+    directories.push(cwd);
+    const command = path.join(cwd, "claude");
+    writeFileSync(command, `#!${process.execPath}\n${body}\n`);
+    chmodSync(command, 0o755);
+    return { runId: "probe-outcome", command, target: null, cwd, env: {}, timeoutSec: 1, graceSec: 1 };
+  }
+
+  it("reports the exit code and stderr of a failing probe", async () => {
+    const input = fakeClaude(`console.error("DISK GUARD: host x has 6 GB free. Run not started."); process.exit(75);`);
+    const probe = await probeClaudeCommandVersionDetailed(input);
+    expect(probe.version).toBeNull();
+    expect(probe.failure).toContain("exited with code 75");
+    expect(probe.failure).toContain("DISK GUARD: host x has 6 GB free");
+  });
+
+  it("reports a timeout", async () => {
+    const probe = await probeClaudeCommandVersionDetailed(fakeClaude(`setTimeout(() => {}, 10000);`));
+    expect(probe).toEqual({ version: null, failure: expect.stringContaining("timed out after 1s") });
+  }, 15_000);
+
+  it("returns a real old version without a failure", async () => {
+    const probe = await probeClaudeCommandVersionDetailed(fakeClaude(`console.log("2.1.100 (Claude Code)");`));
+    expect(probe).toEqual({ version: "2.1.100", failure: null });
+  });
 });

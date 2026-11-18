@@ -287,7 +287,16 @@ export async function testEnvironment(
     if (prepared.check) checks.push(prepared.check);
     command = prepared.command;
     const detectedCliVersion = prepared.version;
-    if (
+    if (!detectedCliVersion && prepared.probeFailure) {
+      configuredModelIsCompatible = false;
+      checks.push({
+        code: "claude_cli_probe_failed",
+        level: "error",
+        message: `Could not verify the Claude Code version for ${configuredModel}.`,
+        detail: prepared.probeFailure,
+        hint: "Fix the host or CLI problem above, then retry the Test.",
+      });
+    } else if (
       !detectedCliVersion ||
       !claudeCliVersionAtLeast(detectedCliVersion, minimumCliVersion)
     ) {

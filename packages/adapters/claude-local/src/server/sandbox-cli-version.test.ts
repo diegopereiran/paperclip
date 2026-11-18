@@ -68,7 +68,7 @@ describe("managed sandbox Claude CLI compatibility", () => {
 
   it.each(["2.1.280", "2.1.286"])("keeps a compatible CLI %s without installing", async version => {
     const { input, receipt } = await fixture(version);
-    expect(await prepareCompatibleClaudeCommand(input)).toEqual({ command: "claude", version });
+    expect(await prepareCompatibleClaudeCommand(input)).toEqual({ command: "claude", version, probeFailure: null });
     await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -96,19 +96,19 @@ describe("managed sandbox Claude CLI compatibility", () => {
 
   it("does not replace a caller's custom command", async () => {
     const { input, receipt } = await fixture("2.1.263");
-    expect(await prepareCompatibleClaudeCommand({ ...input, command: path.join(input.cwd, "claude") })).toEqual({ command: path.join(input.cwd, "claude"), version: "2.1.263" });
+    expect(await prepareCompatibleClaudeCommand({ ...input, command: path.join(input.cwd, "claude") })).toEqual({ command: path.join(input.cwd, "claude"), version: "2.1.263", probeFailure: null });
     await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not install when the CLI version is unknown", async () => {
     const { input, receipt } = await fixture("unknown");
-    expect(await prepareCompatibleClaudeCommand(input)).toEqual({ command: "claude", version: null });
+    expect(await prepareCompatibleClaudeCommand(input)).toMatchObject({ command: "claude", version: null, probeFailure: expect.stringContaining("no parseable version") });
     await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not install into a local execution target", async () => {
     const { input, receipt } = await fixture("2.1.263");
-    expect(await prepareCompatibleClaudeCommand({ ...input, target: null })).toEqual({ command: "claude", version: "2.1.263" });
+    expect(await prepareCompatibleClaudeCommand({ ...input, target: null })).toEqual({ command: "claude", version: "2.1.263", probeFailure: null });
     await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

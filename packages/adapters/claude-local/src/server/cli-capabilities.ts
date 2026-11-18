@@ -68,6 +68,12 @@ export function claudeCliVersionAtLeast(version: string, minimum: string): boole
   return true;
 }
 
+export type ClaudeVersionProbe = { version: string | null; failure: string | null };
+
+function firstLines(text: string): string {
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 3).join(" | ").slice(0, 400);
+}
+
 async function probeClaudeCommandVersion(input: {
   runId: string;
   command: string;
@@ -76,7 +82,8 @@ async function probeClaudeCommandVersion(input: {
   env: Record<string, string>;
   timeoutSec: number;
   graceSec: number;
-}): Promise<string | null> {
+}): Promise<ClaudeVersionProbe> {
+  const timeoutSec = input.timeoutSec > 0 ? Math.max(1, Math.min(input.timeoutSec, 20)) : 20;
   const version = await runAdapterExecutionTargetProcess(
     input.runId,
     input.target,
@@ -85,29 +92,40 @@ async function probeClaudeCommandVersion(input: {
     {
       cwd: input.cwd,
       env: input.env,
-      timeoutSec: input.timeoutSec > 0 ? Math.max(1, Math.min(input.timeoutSec, 20)) : 20,
+      timeoutSec,
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
     },
   );
 
-  if (version.timedOut || version.exitCode !== 0) return null;
-  return parseClaudeCliVersion(`${version.stdout}\n${version.stderr}`);
+  if (version.timedOut) return { version: null, failure: `\`${input.command} --version\` timed out after ${timeoutSec}s` };
+  const output = firstLines(`${version.stderr}\n${version.stdout}`);
+  const suffix = output ? `: ${output}` : "";
+  if (version.exitCode !== 0) {
+    return { version: null, failure: `\`${input.command} --version\` exited with code ${version.exitCode ?? "unknown"}${suffix}` };
+  }
+  const parsed = parseClaudeCliVersion(`${version.stdout}\n${version.stderr}`);
+  return parsed
+    ? { version: parsed, failure: null }
+    : { version: null, failure: `\`${input.command} --version\` printed no parseable version${suffix}` };
 }
 
-export async function readClaudeCommandVersion(input: {
-  runId: string;
-  command: string;
-  target: AdapterExecutionTarget | null | undefined;
-  cwd: string;
-  env: Record<string, string>;
-  timeoutSec: number;
-  graceSec: number;
-}): Promise<string | null> {
+export async function probeClaudeCommandVersionDetailed(
+  input: Parameters<typeof probeClaudeCommandVersion>[0],
+): Promise<ClaudeVersionProbe> {
   // Do not cache this probe: an operator may upgrade Claude Code while the
   // Paperclip server is running, and the next Test/run should recover without
   // requiring a server restart.
-  return probeClaudeCommandVersion(input).catch(() => null);
+  return probeClaudeCommandVersion(input).catch((error) => ({
+    version: null,
+    failure: `\`${input.command} --version\` could not run: ${firstLines(error instanceof Error ? error.message : String(error))}`,
+  }));
+}
+
+export async function readClaudeCommandVersion(
+  input: Parameters<typeof probeClaudeCommandVersion>[0],
+): Promise<string | null> {
+  return (await probeClaudeCommandVersionDetailed(input)).version;
 }
 
 async function probeClaudeCommandSupportsEffortFlag(input: {

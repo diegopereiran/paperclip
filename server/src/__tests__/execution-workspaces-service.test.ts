@@ -3,6 +3,7 @@ import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -53,15 +54,27 @@ import {
 import { prepareHeartbeatRunScratch } from "../services/run-scratch.js";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
 import { rescuePushWorkspace } from "../services/workspace-rescue.js";
+import { buildGitAuthInvocation, type GitRemoteAuthProvider } from "../services/git-credentials.js";
 
 const mockSshRemoval = vi.hoisted(() => ({
   removeSshWorkspaceFolders: vi.fn(async () => ({ removed: 1, warnings: [] as string[] })),
 }));
 
+const mockGitAuth = vi.hoisted(() => ({ provider: null as GitRemoteAuthProvider | null }));
+
 vi.mock("../services/environment-execution-target.js", async (importActual) => ({
   ...await importActual<typeof import("../services/environment-execution-target.js")>(),
   removeSshWorkspaceFolders: mockSshRemoval.removeSshWorkspaceFolders,
 }));
+
+vi.mock("../services/git-credentials.js", async (importActual) => {
+  const actual = await importActual<typeof import("../services/git-credentials.js")>();
+  return {
+    ...actual,
+    createGitRemoteAuthProvider: (...args: Parameters<typeof actual.createGitRemoteAuthProvider>) =>
+      mockGitAuth.provider ?? actual.createGitRemoteAuthProvider(...args),
+  };
+});
 
 const execFileAsync = promisify(execFile);
 
@@ -657,13 +670,14 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const hooks = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rescue-hooks-"));
       tempDirs.add(hooks);
       const marker = path.join(hooks, "marker");
-      await fs.writeFile(path.join(hooks, "pre-push"), "#!/bin/sh\necho \"$RESCUE_TEST_ENV\" > \"$RESCUE_TEST_MARKER\"\n", { mode: 0o755 });
+      const receivePack = path.join(hooks, "receive-pack");
+      await fs.writeFile(receivePack, "#!/bin/sh\necho \"$RESCUE_TEST_ENV\" > \"$RESCUE_TEST_MARKER\"\nexec git receive-pack \"$@\"\n", { mode: 0o755 });
       await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
       await rescuePushWorkspace({
         worktreePath: seed.worktreePath,
         identifier: seed.identifier,
         resolveGitAuth: async () => ({
-          configArgs: ["-c", `core.hooksPath=${hooks}`],
+          configArgs: ["-c", `remote.origin.receivepack=${receivePack}`],
           env: { RESCUE_TEST_ENV: "from-provider", RESCUE_TEST_MARKER: marker },
           source: "company_secret",
           secretName: null,
@@ -682,21 +696,59 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect((await readGit(bare, ["branch", "--list"])) ?? "").toBe("");
     });
 
-    it("keeps the worktree and comments once when the rescue push hangs past the timeout", async () => {
+    it("does not let a failing pre-push hook stop the rescue", async () => {
       const seed = await seedTerminalWorkspace();
-      await addBareOrigin(seed.repoRoot);
+      const bare = await addBareOrigin(seed.repoRoot);
       const hooks = path.join(seed.repoRoot, ".git", "hooks");
       await fs.mkdir(hooks, { recursive: true });
-      await fs.writeFile(path.join(hooks, "pre-push"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+      await fs.writeFile(path.join(hooks, "pre-push"), "#!/bin/sh\necho 'pre-push: BLOCKED' >&2\nexit 1\n", { mode: 0o755 });
       await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
-      const service = executionWorkspaceService(db, {
-        workspaceReaperCooldownDays: 0, cleanupOnClose: true, rescuePushTimeoutMs: 500,
-      });
-      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
-      await fs.access(path.join(seed.worktreePath, "unsaved.txt"));
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
-      expect(comments).toHaveLength(1);
-      expect(comments[0]!.body).toMatch(/^CLEANUP: KEPT /);
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await readGit(bare, ["show", `rescue/${seed.identifier}:unsaved.txt`])).toBe("keep this work");
+    });
+
+    it("keeps the worktree and comments once when the remote stalls past the timeout", async () => {
+      // A remote that accepts the connection and never answers.
+      const sockets = new Set<net.Socket>();
+      const server = net.createServer((socket) => { sockets.add(socket); });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const seed = await seedTerminalWorkspace();
+        const { port } = server.address() as net.AddressInfo;
+        await runGit(seed.repoRoot, ["remote", "add", "origin", `http://127.0.0.1:${port}/repo.git`]);
+        await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+        const service = executionWorkspaceService(db, {
+          workspaceReaperCooldownDays: 0, cleanupOnClose: true, rescuePushTimeoutMs: 500,
+        });
+        expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+        await fs.access(path.join(seed.worktreePath, "unsaved.txt"));
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
+        expect(comments).toHaveLength(1);
+        expect(comments[0]!.body).toMatch(/^CLEANUP: KEPT .*git ls-remote timed out after 0\.5 s/s);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+
+    it("puts git's error, not the credential helper, in the KEPT comment", async () => {
+      const seed = await seedTerminalWorkspace();
+      const bare = await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(bare, "hooks", "pre-receive"), "#!/bin/sh\necho 'rescue refused by test' >&2\nexit 1\n", { mode: 0o755 });
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      mockGitAuth.provider = async () => buildGitAuthInvocation({ token: "test-token", source: "company_secret", secretName: "GITHUB_TOKEN" });
+      try {
+        const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+        expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      } finally {
+        mockGitAuth.provider = null;
+      }
+      const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
+      expect(comment!.body).toContain("git push failed:");
+      expect(comment!.body).toContain("pre-receive hook declined");
+      expect(comment!.body).not.toContain("credential.helper");
+      expect(comment!.body).not.toContain("test-token");
     });
 
     it("leaves a dirty worktree alone unless cleanup on close is on", async () => {

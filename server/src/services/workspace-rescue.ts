@@ -18,13 +18,23 @@ async function git(
   args: string[],
   extra: { env?: NodeJS.ProcessEnv; configArgs?: string[]; timeout?: number; signal?: AbortSignal } = {},
 ) {
-  const { stdout } = await execFileAsync("git", [...(extra.configArgs ?? []), "-C", cwd, ...args], {
-    env: { ...process.env, ...extra.env, GIT_TERMINAL_PROMPT: "0" },
-    maxBuffer: 32 * 1024 * 1024,
-    timeout: extra.timeout,
-    signal: extra.signal,
-  });
-  return stdout.trim();
+  try {
+    const { stdout } = await execFileAsync("git", [...(extra.configArgs ?? []), "-C", cwd, ...args], {
+      env: { ...process.env, ...extra.env, GIT_TERMINAL_PROMPT: "0" },
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: extra.timeout,
+      signal: extra.signal,
+    });
+    return stdout.trim();
+  } catch (error) {
+    if (extra.signal?.aborted) throw error;
+    // execFile's message starts with the whole argv, credential helper
+    // included, so the reason is built from the step and git's stderr only.
+    const failure = error as { killed?: boolean; stderr?: string };
+    if (failure.killed && extra.timeout) throw new Error(`git ${args[0]} timed out after ${extra.timeout / 1000} s`);
+    const stderr = (failure.stderr ?? "").trim().split("\n").slice(-3).join("\n");
+    throw new Error(`git ${args[0]} failed: ${stderr || "no error output"}`);
+  }
 }
 
 const SNAPSHOT_IDENTITY = {
@@ -58,9 +68,10 @@ export async function snapshotWorkspaceTree(worktreePath: string): Promise<strin
  * the caller can verify the worktree is unchanged before it deletes it. When
  * the branch already exists on the remote (an earlier rescue of the same
  * issue) the push goes to `rescue/<identifier>-<sha7>`; it never forces.
- * The push uses the company's git credentials, never prompts, and ends at the
- * timeout or the signal. Throws when the push fails: the caller keeps the
- * workspace.
+ * The push uses the company's git credentials, skips repo hooks, never
+ * prompts, and ends at the timeout or the signal. Throws when the push fails,
+ * with the failed git step and git's last error lines (or the timeout) as the
+ * message: the caller keeps the workspace.
  */
 export async function rescuePushWorkspace(input: {
   worktreePath: string;
@@ -94,6 +105,9 @@ export async function rescuePushWorkspace(input: {
   let branch = `rescue/${input.identifier.replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   const existing = await git(input.worktreePath, ["ls-remote", "--heads", remote, `refs/heads/${branch}`], net);
   if (existing.length > 0 && existing.split(/\s+/)[0] !== sha) branch = `${branch}-${sha.slice(0, 7)}`;
-  await git(input.worktreePath, ["push", remote, `${sha}:refs/heads/${branch}`], net);
+  // --no-verify: a rescue branch is the server's own safety copy, never a PR
+  // head or a delivery, so the repo's pre-push delivery gate does not apply,
+  // and repo hook scripts do not run with the company token in their env.
+  await git(input.worktreePath, ["push", "--no-verify", remote, `${sha}:refs/heads/${branch}`], net);
   return { status: "pushed", branch, sha, remote, tree };
 }

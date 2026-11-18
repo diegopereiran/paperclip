@@ -2582,9 +2582,11 @@ Environment overrides:
   even when it holds dirty files or commits no remote has. It first pushes that
   work to `rescue/<issue identifier>` on `origin` (`rescue/<identifier>-<sha7>`
   when that branch already exists), using the company's git credentials and a
-  60 s timeout. If the push fails, the worktree stays and the issue gets a
-  `CLEANUP: KEPT <path> <reason>` comment. The worktree is deleted only if it
-  still matches what was pushed. The same sweep removes the run scratch dirs of
+  60 s timeout, without running repo hooks. Files that `.gitignore` matches are
+  not rescued; they are removed with the worktree. If the push fails, the
+  worktree stays and the issue gets a `CLEANUP: KEPT <path> <reason>` comment,
+  where the reason is the failed git step and git's error. The worktree is
+  deleted only if it still matches what was pushed. The same sweep removes the run scratch dirs of
   a closed issue once none of its runs is live. The startup sweep skips both
   steps; a later sweep runs them.
 - `PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS=<hours>` sets how long the reaper

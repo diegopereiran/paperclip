@@ -1939,6 +1939,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ))
       .limit(1);
     if (existing) return;
+    // rescuePushWorkspace builds git failures from the step and stderr, never argv.
     const reason = scrubGitCredentialText(error instanceof Error ? error.message : String(error)).slice(0, 500);
     const { issueService } = await import("./issues.js");
     await issueService(db).addComment(

@@ -49,6 +49,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
+import { prepareHeartbeatRunScratch } from "../services/run-scratch.js";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
 
 const mockSshRemoval = vi.hoisted(() => ({
@@ -580,6 +581,72 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
     expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(await fs.readFile(path.join(seed.worktreePath, "unsaved.txt"), "utf8")).toBe("keep this work\n");
+  });
+
+  describe("cleanup on close", () => {
+    async function addBareOrigin(repoRoot: string, url?: string) {
+      const bare = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rescue-origin-"));
+      tempDirs.add(bare);
+      await runGit(bare, ["init", "--bare"]);
+      await runGit(repoRoot, ["remote", "add", "origin", url ?? bare]);
+      return bare;
+    }
+
+    it("pushes unsaved work to a rescue branch, then removes the worktree", async () => {
+      const seed = await seedTerminalWorkspace();
+      const bare = await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      await expect(fs.access(seed.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const branch = `rescue/${seed.identifier}`;
+      expect(await readGit(bare, ["show", `${branch}:unsaved.txt`])).toBe("keep this work");
+      expect(await readGit(bare, ["show", `${branch}:delivered.txt`])).toBe("delivered");
+    });
+
+    it("keeps the worktree and comments CLEANUP: KEPT once when the rescue push fails", async () => {
+      const seed = await seedTerminalWorkspace();
+      await addBareOrigin(seed.repoRoot, path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`));
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      expect(await fs.readFile(path.join(seed.worktreePath, "unsaved.txt"), "utf8")).toBe("keep this work\n");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
+      expect(comments.map((comment) => comment.body.split(" ").slice(0, 3).join(" "))).toEqual([
+        `CLEANUP: KEPT ${seed.worktreePath}`,
+      ]);
+    });
+
+    it("leaves a dirty worktree alone unless cleanup on close is on", async () => {
+      const seed = await seedTerminalWorkspace();
+      await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0 });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+      await fs.access(seed.worktreePath);
+    });
+
+    it("removes the scratch dirs of a closed issue and keeps those of a live run", async () => {
+      const closed = await seedTerminalWorkspace({ mergedPr: true });
+      const live = await seedTerminalWorkspace({ activeRun: true });
+      const [liveRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, live.companyId));
+      const mk = (seed: typeof closed, runId: string) => prepareHeartbeatRunScratch({
+        companyId: seed.companyId, agentId: randomUUID(), runId, issueId: seed.sourceIssueId, issueIdentifier: seed.identifier,
+      });
+      const closedA = await mk(closed, randomUUID());
+      const closedB = await mk(closed, randomUUID());
+      const liveScratch = await mk(live, liveRun!.id);
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+      try {
+        await service.sweepTerminalWorkspaces();
+        await expect(fs.access(closedA.dir)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.access(closedB.dir)).rejects.toMatchObject({ code: "ENOENT" });
+        await fs.access(liveScratch.dir);
+      } finally {
+        await fs.rm(liveScratch.dir, { recursive: true, force: true });
+      }
+    });
   });
 
   it("shares compatible Git inspections within a batch while keeping branch and company decisions separate", async () => {

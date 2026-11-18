@@ -2577,6 +2577,13 @@ Environment overrides:
   the work inside this window. The default is `1`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE=false` turns cleanup on close off. Any
+  other value keeps it on. With it on, the reaper removes a closed git worktree
+  even when it holds dirty files or commits no remote has. It first pushes that
+  work to `rescue/<issue identifier>` on `origin`. If the push fails, the
+  worktree stays and the issue gets a `CLEANUP: KEPT <path> <reason>` comment.
+  The same sweep removes the run scratch dirs of a closed issue once none of
+  its runs is live.
 - `PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS=<hours>` sets how long the reaper
   waits after an issue tree becomes terminal before it removes regenerable files
   from the workspace (see "Terminal workspace compaction" below). The default is

@@ -83,6 +83,7 @@ export interface Config {
   gitBaseExpirationEnabled: boolean;
   gitCacheExpirationDryRun: boolean;
   workspaceReaperCooldownDays: number;
+  workspaceCleanupOnClose: boolean;
   workspaceCompactionDelayHours: number | null;
   skillVersionRetentionEnabled: boolean;
   skillVersionRetentionDryRun: boolean;
@@ -393,6 +394,9 @@ export function loadConfig(): Config {
     gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",
     workspaceReaperCooldownDays,
+    // Instance-wide, on unless an operator sets it to "false": every company
+    // inherits it, including companies created later.
+    workspaceCleanupOnClose: process.env.PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE !== "false",
     workspaceCompactionDelayHours,
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
     skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",

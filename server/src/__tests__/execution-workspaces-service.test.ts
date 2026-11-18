@@ -745,6 +745,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         mockGitAuth.provider = null;
       }
       const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
+      // paperclip:allow-git-push: asserts the KEPT reason text only
       expect(comment!.body).toContain("git push failed:");
       expect(comment!.body).toContain("pre-receive hook declined");
       expect(comment!.body).not.toContain("credential.helper");

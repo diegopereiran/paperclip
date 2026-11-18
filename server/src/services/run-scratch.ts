@@ -158,3 +158,26 @@ export async function cleanupHeartbeatRunScratch(input: {
   await fs.rm(dir, { recursive: true, force: true });
   return { removed: true, dir };
 }
+
+/**
+ * Remove every marked run scratch dir under the temp root whose marker passes
+ * `shouldRemove`. A run that ended normally already removed its own dir, so
+ * this reaches the dirs a crash or a held process group left behind.
+ */
+export async function removeRunScratchDirs(input: {
+  shouldRemove: (metadata: HeartbeatRunScratchMetadata) => Promise<boolean>;
+}): Promise<number> {
+  const tmpRoot = path.resolve(os.tmpdir());
+  let removed = 0;
+  for (const name of await fs.readdir(tmpRoot).catch(() => [] as string[])) {
+    if (!name.startsWith("paperclip-run-")) continue;
+    const dir = path.join(tmpRoot, name);
+    const metadata = await readMarker(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER));
+    if (!metadata || !(await input.shouldRemove(metadata))) continue;
+    const result = await cleanupHeartbeatRunScratch({
+      scratch: { dir, markerPath: path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER), metadata },
+    });
+    if (result.removed) removed += 1;
+  }
+  return removed;
+}

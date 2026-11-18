@@ -1,7 +1,7 @@
 import { effectiveProjectWorkspacePolicy } from "./project-workspace-provider.js";
 import { inspectPluginWorkspace, removePluginWorkspace, restorePluginWorkspace, type WorkspaceWorkers } from "./plugin-workspaces.js";
 import { acquireExecutionWorkspaceLifecycleLock, withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
-import { rescuePushWorkspace } from "./workspace-rescue.js";
+import { rescuePushWorkspace, snapshotWorkspaceTree } from "./workspace-rescue.js";
 import { removeRunScratchDirs } from "./run-scratch.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
@@ -92,7 +92,7 @@ import {
   type PullRequestMergeDetailsResolver,
 } from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { createGitRemoteAuthProvider, scrubGitCredentialText } from "./git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { removeSshWorkspaceFolders } from "./environment-execution-target.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
@@ -320,6 +320,8 @@ export type ExecutionWorkspaceServiceOptions = {
   // dirs of a closed issue with no live run. Unset or false keeps the
   // delivered-and-clean gate.
   cleanupOnClose?: boolean;
+  // Timeout of the rescue push; default 60 s.
+  rescuePushTimeoutMs?: number;
   // The reaper removes regenerable files (installed dependencies, build output,
   // tool caches) from a terminal workspace this long after its issue tree
   // becomes terminal. The worktree, its branch, its commits, and every source
@@ -1937,7 +1939,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ))
       .limit(1);
     if (existing) return;
-    const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    const reason = scrubGitCredentialText(error instanceof Error ? error.message : String(error)).slice(0, 500);
     const { issueService } = await import("./issues.js");
     await issueService(db).addComment(
       workspace.sourceIssueId,
@@ -1974,7 +1976,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function assertTerminalCleanupGitStateUnchanged(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
-    allowDirty = false,
+    rescuedTree: string | null = null,
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
@@ -1992,11 +1994,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
     if (
       !current.git?.repoRoot
-      || (!allowDirty && (current.git.hasDirtyTrackedFiles || current.git.hasUntrackedFiles))
+      || (!rescuedTree && (current.git.hasDirtyTrackedFiles || current.git.hasUntrackedFiles))
       || currentHeadSha !== expectedHeadSha
       || (workspace.branchName && currentBranchName !== workspace.branchName)
     ) {
       throw new Error("Refusing terminal workspace cleanup because the git worktree changed after delivery was verified");
+    }
+    // After a rescue the dirty files are allowed, but only the ones that were
+    // pushed: anything written since the snapshot is in no commit.
+    if (rescuedTree && (await snapshotWorkspaceTree(workspacePath).catch(() => null)) !== rescuedTree) {
+      throw new Error("Refusing terminal workspace cleanup because the worktree changed after the rescue push");
     }
   }
 
@@ -2381,7 +2388,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
     capturedGeneration: number,
-    rescued = false,
+    rescuedTree: string | null = null,
   ): Promise<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }> {
     // The gateway holds the per-workspace lifecycle lock across the destructive
     // actions. A reopen takes the same lock, so a reopen cannot rebuild the
@@ -2400,13 +2407,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, rescued),
+      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, rescuedTree),
     });
   }
 
-  // `rescued` means the work was pushed to a rescue branch, so dirty files may
-  // go with the worktree.
-  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null, rescued = false) {
+  // `rescuedTree` is the tree pushed to a rescue branch: dirty files may go with
+  // the worktree only while the worktree still matches it.
+  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null, rescuedTree: string | null = null) {
     if (workspace.providerType === "plugin") {
       if (await workspaceHasActiveRun(workspace)) throw conflict("Workspace still has active execution");
       await removePluginWorkspace(db, opts.pluginWorkerManager, workspace, expectedHeadSha);
@@ -2446,9 +2453,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
       : null;
     try {
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescued);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescuedTree);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescued);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescuedTree);
       await stopRuntimeServicesForExecutionWorkspace({
         db,
         executionWorkspaceId: workspace.id,
@@ -2463,7 +2470,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           companyId: workspace.companyId,
           executionWorkspaceId: workspace.id,
         }),
-        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescued),
+        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, rescuedTree),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
@@ -2471,7 +2478,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // after non-forced worktree removal, then deletion is anchored to the
         // verified HEAD so a raced ref update fails closed.
         runCleanupCommands: false,
-        forceWorktreeRemoval: rescued,
+        forceWorktreeRemoval: rescuedTree !== null,
       });
       if (cleanup.cleaned) {
         const remote = await removeSshWorkspaceFolders({
@@ -3547,7 +3554,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedNonTerminalTree += 1;
           continue;
         }
-        const rescueOnClose = opts.cleanupOnClose === true && workspace.providerType === "git_worktree";
+        // The readiness sweep (`compact: false`) never makes network calls: server
+        // readiness waits for it.
+        const rescueOnClose = opts.cleanupOnClose === true && options.compact !== false
+          && workspace.providerType === "git_worktree";
         const delivered = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
         if (assessment.workspaceDirty && !rescueOnClose) {
@@ -3654,15 +3664,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // Cleanup on close: push unsaved work to a rescue branch before the
         // worktree goes. When the push fails the workspace stays and the issue
         // gets a KEPT comment.
-        let rescued = false;
+        let rescuedTree: string | null = null;
         if (rescueOnClose && workspacePath && (assessment.workspaceDirty || !delivered)) {
           try {
-            await rescuePushWorkspace({
+            const rescue = await rescuePushWorkspace({
               worktreePath: workspacePath,
               identifier: await readIssueIdentifier(workspace),
+              resolveGitAuth: createGitRemoteAuthProvider(db, workspace.companyId, {
+                ...(workspace.sourceIssueId ? { issueId: workspace.sourceIssueId } : {}),
+              }),
+              signal,
+              timeoutMs: opts.rescuePushTimeoutMs,
             });
-            rescued = assessment.workspaceDirty;
+            rescuedTree = rescue.status === "pushed" ? rescue.tree : null;
           } catch (error) {
+            if (signal?.aborted) throw error;
             result.cleanupFailed += 1;
             await postCleanupKeptComment(workspace, workspacePath, error);
             continue;
@@ -3789,7 +3805,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, rescued);
+          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, rescuedTree);
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
           else result.archived += 1;
@@ -3818,7 +3834,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           });
         }
       }
-      if (opts.cleanupOnClose) {
+      if (opts.cleanupOnClose && options.compact !== false) {
         await removeClosedIssueScratch().catch((err) => {
           logger.warn({ err }, "closed issue scratch cleanup failed; a later sweep retries");
         });

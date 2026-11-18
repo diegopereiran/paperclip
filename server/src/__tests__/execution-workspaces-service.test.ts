@@ -15,6 +15,7 @@ import {
   companies,
   createDb,
   databaseWorkPending,
+  reconcileDatabaseWork,
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
@@ -51,6 +52,7 @@ import {
 } from "../services/workspace-runtime.ts";
 import { prepareHeartbeatRunScratch } from "../services/run-scratch.js";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
+import { rescuePushWorkspace } from "../services/workspace-rescue.js";
 
 const mockSshRemoval = vi.hoisted(() => ({
   removeSshWorkspaceFolders: vi.fn(async () => ({ removed: 1, warnings: [] as string[] })),
@@ -616,6 +618,85 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(comments.map((comment) => comment.body.split(" ").slice(0, 3).join(" "))).toEqual([
         `CLEANUP: KEPT ${seed.worktreePath}`,
       ]);
+    });
+
+    it("keeps the worktree when a file appears after the rescue push", async () => {
+      const seed = await seedTerminalWorkspace();
+      await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: 0,
+        cleanupOnClose: true,
+        beforeTerminalWorkspaceCleanup: async () => {
+          await fs.writeFile(path.join(seed.worktreePath, "late.txt"), "written after the push\n");
+        },
+      });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      expect(await fs.readFile(path.join(seed.worktreePath, "late.txt"), "utf8")).toBe("written after the push\n");
+      // The failed-cleanup write leaves the terminal-workspace queue pending; settle it so it cannot leak into the next test.
+      await reconcileDatabaseWork(db, DELIVERY_QUEUES.terminalWorkspaces);
+    });
+
+    it("rescues the same issue twice to two branches on origin", async () => {
+      const seed = await seedTerminalWorkspace();
+      const bare = await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(seed.worktreePath, "one.txt"), "first\n");
+      const first = await rescuePushWorkspace({ worktreePath: seed.worktreePath, identifier: seed.identifier });
+      await fs.writeFile(path.join(seed.worktreePath, "two.txt"), "second\n");
+      const second = await rescuePushWorkspace({ worktreePath: seed.worktreePath, identifier: seed.identifier });
+      if (first.status !== "pushed" || second.status !== "pushed") throw new Error("expected two pushes");
+      expect(first.branch).toBe(`rescue/${seed.identifier}`);
+      expect(second.branch).toBe(`rescue/${seed.identifier}-${second.sha.slice(0, 7)}`);
+      expect(await readGit(bare, ["show", `${first.branch}:one.txt`])).toBe("first");
+      expect(await readGit(bare, ["show", `${second.branch}:two.txt`])).toBe("second");
+    });
+
+    it("pushes with the git credentials the auth provider returns", async () => {
+      const seed = await seedTerminalWorkspace();
+      await addBareOrigin(seed.repoRoot);
+      const hooks = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rescue-hooks-"));
+      tempDirs.add(hooks);
+      const marker = path.join(hooks, "marker");
+      await fs.writeFile(path.join(hooks, "pre-push"), "#!/bin/sh\necho \"$RESCUE_TEST_ENV\" > \"$RESCUE_TEST_MARKER\"\n", { mode: 0o755 });
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      await rescuePushWorkspace({
+        worktreePath: seed.worktreePath,
+        identifier: seed.identifier,
+        resolveGitAuth: async () => ({
+          configArgs: ["-c", `core.hooksPath=${hooks}`],
+          env: { RESCUE_TEST_ENV: "from-provider", RESCUE_TEST_MARKER: marker },
+          source: "company_secret",
+          secretName: null,
+        }) as never,
+      });
+      expect((await fs.readFile(marker, "utf8")).trim()).toBe("from-provider");
+    });
+
+    it("skips the rescue push in the readiness sweep", async () => {
+      const seed = await seedTerminalWorkspace();
+      const bare = await addBareOrigin(seed.repoRoot);
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, cleanupOnClose: true });
+      expect(await service.sweepTerminalWorkspaces(50, undefined, { compact: false })).toMatchObject({ archived: 0 });
+      await fs.access(seed.worktreePath);
+      expect((await readGit(bare, ["branch", "--list"])) ?? "").toBe("");
+    });
+
+    it("keeps the worktree and comments once when the rescue push hangs past the timeout", async () => {
+      const seed = await seedTerminalWorkspace();
+      await addBareOrigin(seed.repoRoot);
+      const hooks = path.join(seed.repoRoot, ".git", "hooks");
+      await fs.mkdir(hooks, { recursive: true });
+      await fs.writeFile(path.join(hooks, "pre-push"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+      await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+      const service = executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: 0, cleanupOnClose: true, rescuePushTimeoutMs: 500,
+      });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      await fs.access(path.join(seed.worktreePath, "unsaved.txt"));
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toMatch(/^CLEANUP: KEPT /);
     });
 
     it("leaves a dirty worktree alone unless cleanup on close is on", async () => {

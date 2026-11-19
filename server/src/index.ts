@@ -23,11 +23,7 @@ import type { createDeliveryWorkCoordinator } from "./services/delivery-work-coo
 import { registerTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./services/terminal-workspace-work.js";
 import { isIdleTaskDrainActive, beginIdleTrackedWork, trackIdleWork } from "./services/task-admission.js";
 import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/idle-local-work.js";
-import {
-  INSTANCE_DISK_REAPER_INTERVAL_MS,
-  INSTANCE_DISK_REAPER_STARTUP_DELAY_MS,
-  instanceDiskReaperRunner,
-} from "./services/instance-disk-reaper-runner.js";
+import { instanceDiskReaperRunner, registerInstanceDiskReaperWork } from "./services/instance-disk-reaper-runner.js";
 import { clearIdleBackupWakeRequired, idleBackupWakeMarker, markIdleBackupWakeRequired, verifyIdleDatabaseBackup } from "./services/idle-database-backup.js";
 import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.js";
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
@@ -1283,27 +1279,6 @@ async function startServerWithDatabaseTeardown(
   nativeHarnessBackupExpirationInterval.unref?.();
   const nativeHarnessBackupExpirationStartup = setTimeout(sweepNativeHarnessBackups, NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS);
   nativeHarnessBackupExpirationStartup.unref?.();
-  // Daily instance disk reaper: old temp dirs, dead isolated attempts, run logs
-  // and surplus database dumps, then the disk-usage alert. Limits and dry run
-  // are instance settings (general.diskReaper).
-  const diskReaper = instanceDiskReaperRunner(db as any, { backupDir: config.databaseBackupDir });
-  let diskReaperInFlight = false;
-  const sweepInstanceDiskUsage = () => {
-    if (diskReaperInFlight || isIdleTaskDrainActive() || heartbeatSchedulerStopped || isWarmStandby()) return;
-    diskReaperInFlight = true;
-    trackHeartbeatSchedulerWork(diskReaper.run()
-      .then((result) => {
-        logger.info({ dryRun: result.report.dryRun, alert: result.alert }, result.text);
-      })
-      .catch((err) => {
-        logger.error({ err }, "instance disk reaper failed");
-      })
-      .finally(() => { diskReaperInFlight = false; }));
-  };
-  const diskReaperInterval = setInterval(sweepInstanceDiskUsage, INSTANCE_DISK_REAPER_INTERVAL_MS);
-  diskReaperInterval.unref?.();
-  const diskReaperStartup = setTimeout(sweepInstanceDiskUsage, INSTANCE_DISK_REAPER_STARTUP_DELAY_MS);
-  diskReaperStartup.unref?.();
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
@@ -1370,6 +1345,17 @@ async function startServerWithDatabaseTeardown(
   const accountingWorker = registerCostAccountingWork(db, deliveryWork, accountingHeartbeat.reconcileCostAccounting);
   server.on("close", accountingWorker.stop);
   skillSourceSync.start(deliveryWork);
+  // Daily instance disk reaper: old temp dirs, dead isolated attempts, run logs
+  // and surplus database dumps, then the disk-usage alert. Limits and dry run
+  // are instance settings (general.diskReaper).
+  const diskReaper = instanceDiskReaperRunner(db as any, { backupDir: config.databaseBackupDir });
+  registerInstanceDiskReaperWork(db as any, deliveryWork, {
+    pass: async () => {
+      const result = await diskReaper.run();
+      if (result.enabled) logger.info({ dryRun: result.report.dryRun, alert: result.alert }, result.text);
+      return result;
+    },
+  });
   const caseHandoffDeliveries = caseHandoffDeliveryService(db as any, { heartbeat: environmentLeaseCleanupHeartbeat });
   deliveryWork.register(DELIVERY_QUEUES.caseHandoffs, {
     retryMs: 5_000,
@@ -2092,8 +2078,6 @@ async function startServerWithDatabaseTeardown(
     clearTimeout(skillVersionRetentionStartup);
     clearTimeout(skillVersionRetentionContinuation);
     clearInterval(nativeHarnessBackupExpirationInterval);
-    clearInterval(diskReaperInterval);
-    clearTimeout(diskReaperStartup);
     clearTimeout(nativeHarnessBackupExpirationStartup);
     clearTimeout(nativeHarnessBackupExpirationContinuation);
     await skillVersionRetention.dispose();

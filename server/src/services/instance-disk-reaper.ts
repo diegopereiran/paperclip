@@ -5,7 +5,7 @@ import { HEARTBEAT_RUN_SCRATCH_MARKER } from "./run-scratch.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
-const MAX_COMMENT_PATHS = 20;
+const MAX_LOG_PATHS = 20;
 const TMP_PREFIXES = ["paperclip-ai-", "paperclip-run-", "paperclip-ssh-", "paperclip-bridge-"] as const;
 // `paperclip-pre-fork-<stamp>.dump` is the one marked dump on record; the board
 // names a dump to keep through the same `-pre-` word.
@@ -41,8 +41,8 @@ export interface DiskReaperDeps {
   backupDir: string;
   runLogRoot: string;
   liveRuns(): Promise<DiskReaperLiveRun[]>;
-  /** True when the attempt id resolves to an execution workspace that is still in use. */
-  attemptWorkspaceActive(attemptId: string): Promise<boolean>;
+  /** True when an execution workspace still in use has the attempt id, or its dir holds the workspace. */
+  attemptWorkspaceActive(attemptId: string, attemptDir: string): Promise<boolean>;
   /** Paths the current process uses; a dir that is or holds one is never removed. */
   protectedPaths: string[];
 }
@@ -191,7 +191,7 @@ async function sweepAttempts(deps: DiskReaperDeps, liveRuns: DiskReaperLiveRun[]
         if (!stat?.isDirectory() || holdsProtectedPath(dir, deps.protectedPaths)) continue;
         const { bytes, newestMtimeMs } = await footprint(dir);
         if (deps.now.getTime() - newestMtimeMs < idleMs) { keep(report, "modified within the idle window"); continue; }
-        if (liveIds.has(attempt) || await deps.attemptWorkspaceActive(attempt)) { keep(report, "owned by a live run or active workspace"); continue; }
+        if (liveIds.has(attempt) || await deps.attemptWorkspaceActive(attempt, dir)) { keep(report, "owned by a live run or active workspace"); continue; }
         await removeCandidate(report, { path: dir, bytes, reason: "idle attempt with no live run or workspace" }, deps.settings.dryRun);
       }
       if (!deps.settings.dryRun) await pruneEmptyParents(path.join(root, company, issue), root);
@@ -257,7 +257,7 @@ const CATEGORY_LABELS: Record<DiskReaperCategory, string> = {
   backups: "database dumps",
 };
 
-export function formatDiskReaperReport(report: DiskReaperReport, maxPaths = MAX_COMMENT_PATHS): string {
+export function formatDiskReaperReport(report: DiskReaperReport, maxPaths = MAX_LOG_PATHS): string {
   const lines = [report.dryRun ? "Disk reaper dry run: nothing was deleted." : "Disk reaper run complete."];
   let total = 0;
   for (const [category, label] of Object.entries(CATEGORY_LABELS) as Array<[DiskReaperCategory, string]>) {
@@ -269,7 +269,7 @@ export function formatDiskReaperReport(report: DiskReaperReport, maxPaths = MAX_
     lines.push(`- ${label}: ${outcome}`);
     for (const [reason, count] of Object.entries(entry.kept)) lines.push(`  - kept ${count}: ${reason}`);
     for (const item of entry.entries.slice(0, maxPaths)) lines.push(`  - ${item.path} (${formatBytes(item.bytes)})`);
-    if (entry.entries.length > maxPaths) lines.push(`  - ... and ${entry.entries.length - maxPaths} more`);
+    if (maxPaths > 0 && entry.entries.length > maxPaths) lines.push(`  - ... and ${entry.entries.length - maxPaths} more`);
   }
   lines.push(`Total ${report.dryRun ? "reclaimable" : "freed"}: ${formatBytes(total)}`);
   return lines.join("\n");

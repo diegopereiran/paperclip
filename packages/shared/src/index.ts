@@ -883,6 +883,7 @@ export type {
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
   BackupRetentionPolicy,
+  DiskReaperSettings,
   Agent,
   AgentAccessState,
   AgentChainOfCommandEntry,
@@ -1747,6 +1748,7 @@ export {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_DISK_REAPER_SETTINGS,
   PAPERCLIP_CLOUD_MANAGED_BY,
 } from "./types/instance.js";
 

@@ -5,7 +5,7 @@ import { HEARTBEAT_RUN_SCRATCH_MARKER } from "./run-scratch.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
-const MAX_LISTED_ENTRIES = 25;
+const MAX_COMMENT_PATHS = 20;
 const TMP_PREFIXES = ["paperclip-ai-", "paperclip-run-", "paperclip-ssh-", "paperclip-bridge-"] as const;
 // `paperclip-pre-fork-<stamp>.dump` is the one marked dump on record; the board
 // names a dump to keep through the same `-pre-` word.
@@ -20,7 +20,10 @@ export interface DiskReaperCategoryReport {
   bytes: number;
   freedBytes: number;
   failed: number;
+  /** Every candidate; the report formatter caps what it prints. */
   entries: DiskReaperEntry[];
+  /** Items looked at and left alone, by reason. */
+  kept: Record<string, number>;
 }
 export interface DiskReaperReport {
   dryRun: boolean;
@@ -134,13 +137,17 @@ async function liveOwnerOfTmpDir(dir: string, name: string, newestMtimeMs: numbe
 }
 
 function emptyReport(): DiskReaperCategoryReport {
-  return { candidates: 0, bytes: 0, freedBytes: 0, failed: 0, entries: [] };
+  return { candidates: 0, bytes: 0, freedBytes: 0, failed: 0, entries: [], kept: {} };
+}
+
+function keep(report: DiskReaperCategoryReport, reason: string) {
+  report.kept[reason] = (report.kept[reason] ?? 0) + 1;
 }
 
 async function removeCandidate(report: DiskReaperCategoryReport, entry: DiskReaperEntry, dryRun: boolean) {
   report.candidates += 1;
   report.bytes += entry.bytes;
-  if (report.entries.length < MAX_LISTED_ENTRIES) report.entries.push(entry);
+  report.entries.push(entry);
   if (dryRun) return;
   try {
     await fs.rm(entry.path, { recursive: true, force: true });
@@ -166,8 +173,8 @@ async function sweepTmp(deps: DiskReaperDeps, liveRuns: DiskReaperLiveRun[], rep
     const stat = await fs.lstat(dir).catch(() => null);
     if (!stat?.isDirectory() || holdsProtectedPath(dir, deps.protectedPaths)) continue;
     const { bytes, newestMtimeMs } = await footprint(dir);
-    if (deps.now.getTime() - newestMtimeMs < idleMs) continue;
-    if (await liveOwnerOfTmpDir(dir, name, newestMtimeMs, liveRuns)) continue;
+    if (deps.now.getTime() - newestMtimeMs < idleMs) { keep(report, "modified within the idle window"); continue; }
+    if (await liveOwnerOfTmpDir(dir, name, newestMtimeMs, liveRuns)) { keep(report, "owned by a live run"); continue; }
     await removeCandidate(report, { path: dir, bytes, reason: "idle temp dir with no live run" }, deps.settings.dryRun);
   }
 }
@@ -183,8 +190,8 @@ async function sweepAttempts(deps: DiskReaperDeps, liveRuns: DiskReaperLiveRun[]
         const stat = await fs.lstat(dir).catch(() => null);
         if (!stat?.isDirectory() || holdsProtectedPath(dir, deps.protectedPaths)) continue;
         const { bytes, newestMtimeMs } = await footprint(dir);
-        if (deps.now.getTime() - newestMtimeMs < idleMs) continue;
-        if (liveIds.has(attempt) || await deps.attemptWorkspaceActive(attempt)) continue;
+        if (deps.now.getTime() - newestMtimeMs < idleMs) { keep(report, "modified within the idle window"); continue; }
+        if (liveIds.has(attempt) || await deps.attemptWorkspaceActive(attempt)) { keep(report, "owned by a live run or active workspace"); continue; }
         await removeCandidate(report, { path: dir, bytes, reason: "idle attempt with no live run or workspace" }, deps.settings.dryRun);
       }
       if (!deps.settings.dryRun) await pruneEmptyParents(path.join(root, company, issue), root);
@@ -196,9 +203,11 @@ async function sweepRunLogs(deps: DiskReaperDeps, liveRuns: DiskReaperLiveRun[],
   const cutoff = deps.now.getTime() - deps.settings.runLogRetentionDays * DAY_MS;
   const liveIds = new Set(liveRuns.map((run) => run.id));
   for (const file of await walkFiles(deps.runLogRoot)) {
-    if (!file.endsWith(".ndjson") || liveIds.has(path.basename(file, ".ndjson"))) continue;
+    if (!file.endsWith(".ndjson")) continue;
+    if (liveIds.has(path.basename(file, ".ndjson"))) { keep(report, "log of a live run"); continue; }
     const stat = await fs.lstat(file).catch(() => null);
-    if (!stat || stat.mtimeMs >= cutoff) continue;
+    if (!stat) continue;
+    if (stat.mtimeMs >= cutoff) { keep(report, "within the retention window"); continue; }
     await removeCandidate(report, { path: file, bytes: stat.size, reason: "run log past retention" }, deps.settings.dryRun);
     if (!deps.settings.dryRun) await pruneEmptyParents(path.dirname(file), deps.runLogRoot);
   }
@@ -212,13 +221,16 @@ async function sweepRunLogs(deps: DiskReaperDeps, liveRuns: DiskReaperLiveRun[],
 async function sweepBackups(deps: DiskReaperDeps, report: DiskReaperCategoryReport) {
   const dumps: Array<{ file: string; bytes: number; mtimeMs: number }> = [];
   for (const name of await readdirSafe(deps.backupDir)) {
-    if (!DUMP_FILE.test(name) || isPreMigrationDump(name)) continue;
+    if (!DUMP_FILE.test(name)) continue;
+    if (isPreMigrationDump(name)) { keep(report, "pre-migration dump"); continue; }
     const file = path.join(deps.backupDir, name);
     const stat = await fs.lstat(file).catch(() => null);
     if (stat?.isFile()) dumps.push({ file, bytes: stat.size, mtimeMs: stat.mtimeMs });
   }
   dumps.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const dump of dumps.slice(Math.max(1, deps.settings.backupKeepCount))) {
+  const keepCount = Math.max(1, deps.settings.backupKeepCount);
+  if (dumps.length > 0) report.kept["among the newest dumps"] = Math.min(keepCount, dumps.length);
+  for (const dump of dumps.slice(keepCount)) {
     await removeCandidate(report, { path: dump.file, bytes: dump.bytes, reason: "beyond the newest dumps" }, deps.settings.dryRun);
   }
 }
@@ -245,7 +257,7 @@ const CATEGORY_LABELS: Record<DiskReaperCategory, string> = {
   backups: "database dumps",
 };
 
-export function formatDiskReaperReport(report: DiskReaperReport): string {
+export function formatDiskReaperReport(report: DiskReaperReport, maxPaths = MAX_COMMENT_PATHS): string {
   const lines = [report.dryRun ? "Disk reaper dry run: nothing was deleted." : "Disk reaper run complete."];
   let total = 0;
   for (const [category, label] of Object.entries(CATEGORY_LABELS) as Array<[DiskReaperCategory, string]>) {
@@ -255,8 +267,9 @@ export function formatDiskReaperReport(report: DiskReaperReport): string {
       ? `${entry.candidates} would be removed, ${formatBytes(entry.bytes)}`
       : `${formatBytes(entry.freedBytes)} freed from ${entry.candidates} (${entry.failed} failed)`;
     lines.push(`- ${label}: ${outcome}`);
-    for (const item of entry.entries) lines.push(`  - ${item.path} (${formatBytes(item.bytes)})`);
-    if (entry.candidates > entry.entries.length) lines.push(`  - ... and ${entry.candidates - entry.entries.length} more`);
+    for (const [reason, count] of Object.entries(entry.kept)) lines.push(`  - kept ${count}: ${reason}`);
+    for (const item of entry.entries.slice(0, maxPaths)) lines.push(`  - ${item.path} (${formatBytes(item.bytes)})`);
+    if (entry.entries.length > maxPaths) lines.push(`  - ... and ${entry.entries.length - maxPaths} more`);
   }
   lines.push(`Total ${report.dryRun ? "reclaimable" : "freed"}: ${formatBytes(total)}`);
   return lines.join("\n");

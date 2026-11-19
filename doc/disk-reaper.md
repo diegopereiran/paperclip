@@ -17,5 +17,6 @@ A live run is a heartbeat run in `queued`, `running` or `scheduled_retry`.
 Limits are `general.diskReaper` instance settings: `enabled`, `dryRun`, `idleHours` (24), `runLogRetentionDays` (14), `backupKeepCount` (7), `diskAlertPercent` (85).
 `dryRun` defaults to `true`: the first runs only log what they would delete, with bytes per category. Set `dryRun: false` to delete.
 Every run logs the report: bytes freed per category (or reclaimable bytes in a dry run).
+Every pass, dry run or real, also comments the report on the standing "Disk space alert" issue (the one the alert card uses): mode, per category the count, bytes freed or reclaimable, what was kept and why, and at most 20 paths (comment cut at 8000 characters). The full path list is the issue document `disk-reaper-<YYYY-MM-DD>`, replaced by a second pass on the same day. A failed comment or card is logged as a warning.
 
 When data-disk use passes `diskAlertPercent`, the job posts one `request_confirmation` card (board user, `human_only`) with the top consumers on a standing "Disk space alert" issue (`originKind: instance_disk_alert`) in the oldest active company. No new card is posted while one is pending there.

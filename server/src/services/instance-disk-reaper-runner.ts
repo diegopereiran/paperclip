@@ -9,6 +9,7 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import {
   formatDiskReaperReport,
@@ -21,6 +22,7 @@ import {
   type DiskReaperDeps,
   type DiskReaperReport,
 } from "./instance-disk-reaper.js";
+import { documentService } from "./documents.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
@@ -29,6 +31,7 @@ import { resolveRunLogBasePath } from "./run-log-store.js";
 export const INSTANCE_DISK_REAPER_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const INSTANCE_DISK_REAPER_STARTUP_DELAY_MS = 10 * 60 * 1000;
 export const DISK_ALERT_ORIGIN_KIND = "instance_disk_alert";
+const MAX_COMMENT_CHARS = 8000;
 const LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 
 /** Paths the server process itself writes to while it runs. */
@@ -40,32 +43,59 @@ function currentProcessPaths(): string[] {
   ];
 }
 
+/** The standing instance-level issue in the oldest active company; created on first use and kept open. */
+async function findOrCreateStandingIssue(db: Db): Promise<{ id: string; companyId: string }> {
+  const [company] = await db.select({ id: companies.id }).from(companies)
+    .where(ne(companies.status, "archived")).orderBy(asc(companies.createdAt)).limit(1);
+  if (!company) throw new Error("No active company can hold the disk alert card");
+  const [standing] = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues)
+    .where(and(
+      eq(issues.companyId, company.id),
+      eq(issues.originKind, DISK_ALERT_ORIGIN_KIND),
+      inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+    )).limit(1);
+  if (standing) return standing;
+  const created = await issueService(db).create(company.id, {
+    title: "Disk space alert",
+    description: "Instance-wide disk reaper reports and disk usage alerts. The disk reaper comments here after every pass and posts a card when disk use passes the limit in instance settings.",
+    status: "todo",
+    priority: "high",
+    originKind: DISK_ALERT_ORIGIN_KIND,
+  });
+  return { id: created.id, companyId: company.id };
+}
+
+/** Posts a pass report as a comment on the standing issue; the full path list goes to a linked document. */
+export function createDiskReaperReportPoster(db: Db) {
+  return async (report: DiskReaperReport, now: Date = new Date()): Promise<void> => {
+    const standing = await findOrCreateStandingIssue(db);
+    const key = `disk-reaper-${now.toISOString().slice(0, 10)}`;
+    const documentsSvc = documentService(db);
+    // A second pass on the same day replaces that day's document.
+    const existing = await documentsSvc.getIssueDocumentByKey(standing.id, key);
+    await documentsSvc.upsertIssueDocument({
+      issueId: standing.id,
+      baseRevisionId: existing?.latestRevisionId ?? null,
+      key,
+      title: `Disk reaper ${report.dryRun ? "dry run" : "run"} ${key.slice("disk-reaper-".length)}`,
+      format: "markdown",
+      body: formatDiskReaperReport(report, Infinity),
+      changeSummary: "Disk reaper full path list",
+    });
+    const link = `\n\nFull path list: [${key}](#document-${key})`;
+    const text = formatDiskReaperReport(report);
+    const body = (text.length > MAX_COMMENT_CHARS ? `${text.slice(0, MAX_COMMENT_CHARS)}\n... (cut)` : text) + link;
+    await issueService(db).addComment(standing.id, body, {});
+  };
+}
+
 /**
- * Posts one board card on a standing instance-level issue in the oldest active
- * company, and none while an earlier card there is still unanswered.
+ * Posts one board card on the standing issue, and none while an earlier card
+ * there is still unanswered.
  */
 export function createDiskAlertCardPoster(db: Db) {
   return async (card: DiskPressureCard): Promise<"posted" | "pending_exists"> => {
-    const [company] = await db.select({ id: companies.id }).from(companies)
-      .where(ne(companies.status, "archived")).orderBy(asc(companies.createdAt)).limit(1);
-    if (!company) throw new Error("No active company can hold the disk alert card");
-    const issueSvc = issueService(db);
-    let [standing] = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues)
-      .where(and(
-        eq(issues.companyId, company.id),
-        eq(issues.originKind, DISK_ALERT_ORIGIN_KIND),
-        inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-      )).limit(1);
-    if (!standing) {
-      const created = await issueSvc.create(company.id, {
-        title: "Disk space alert",
-        description: "Instance-wide disk usage alerts. The disk reaper posts a card here when disk use passes the limit in instance settings.",
-        status: "todo",
-        priority: "high",
-        originKind: DISK_ALERT_ORIGIN_KIND,
-      });
-      standing = { id: created.id, companyId: company.id };
-    }
+    const standing = await findOrCreateStandingIssue(db);
     const [pending] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
       .where(and(
         eq(issueThreadInteractions.issueId, standing.id),
@@ -129,6 +159,11 @@ export function instanceDiskReaperRunner(db: Db, options: { backupDir: string; t
     async run(): Promise<InstanceDiskReaperResult> {
       const settings = resolveDiskReaperSettings((await instanceSettingsService(db).getGeneral()).diskReaper);
       const report = await sweepInstanceDisk(deps(settings));
+      if (settings.enabled) {
+        await createDiskReaperReportPoster(db)(report).catch((err) => {
+          logger.warn({ err }, "disk reaper could not post its report comment");
+        });
+      }
       let alert: InstanceDiskReaperResult["alert"] = "below_threshold";
       if (settings.enabled) {
         try {
@@ -139,7 +174,8 @@ export function instanceDiskReaperRunner(db: Db, options: { backupDir: string; t
             consumers: usedPercent > settings.diskAlertPercent ? await measureTopConsumers({ instanceRoot, tmpRoot }) : [],
             post: createDiskAlertCardPoster(db),
           });
-        } catch {
+        } catch (err) {
+          logger.warn({ err }, "disk reaper could not post the disk usage alert card");
           alert = "failed";
         }
       }

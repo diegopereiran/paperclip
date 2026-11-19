@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { companies, createDb, instanceUserRoles, issueThreadInteractions, issues } from "@paperclipai/db";
+import { companies, createDb, issueComments, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
-import { DISK_ALERT_ORIGIN_KIND, createDiskAlertCardPoster } from "./instance-disk-reaper-runner.js";
+import { DISK_ALERT_ORIGIN_KIND, createDiskAlertCardPoster, createDiskReaperReportPoster } from "./instance-disk-reaper-runner.js";
 
 describe("disk alert card poster", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -40,5 +40,35 @@ describe("disk alert card poster", () => {
     expect(await post(card)).toBe("posted");
     const standing = await db.select().from(issues).where(eq(issues.originKind, DISK_ALERT_ORIGIN_KIND));
     expect(standing.length).toBeGreaterThan(0);
+  });
+
+  it("comments each pass on the one standing issue and links a document with the full path list", async () => {
+    const entries = Array.from({ length: 30 }, (_, i) => ({ path: `/var/tmp/paperclip-run-${i}`, bytes: 1024, reason: "idle" }));
+    const empty = { candidates: 0, bytes: 0, freedBytes: 0, failed: 0, entries: [], kept: {} };
+    const report = (dryRun: boolean) => ({
+      dryRun,
+      categories: {
+        tmp: { ...empty, candidates: 30, bytes: 30 * 1024, freedBytes: dryRun ? 0 : 30 * 1024, entries, kept: { "owned by a live run": 2 } },
+        isolatedAttempts: empty, runLogs: empty, backups: empty,
+      },
+    });
+    const post = createDiskReaperReportPoster(db);
+    await post(report(true), new Date("2026-11-19T04:00:00Z"));
+    await post(report(false), new Date("2026-11-19T04:00:00Z"));
+
+    const standing = await db.select().from(issues).where(eq(issues.originKind, DISK_ALERT_ORIGIN_KIND));
+    expect(standing).toHaveLength(1);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, standing[0]!.id));
+    expect(comments).toHaveLength(2);
+    const [dry, real] = comments.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    expect(dry!.body).toContain("dry run: nothing was deleted");
+    expect(real!.body).toContain("run complete");
+    expect(real!.body).toContain("kept 2: owned by a live run");
+    expect(real!.body).toContain("... and 10 more");
+    expect(real!.body).not.toContain("paperclip-run-25");
+    expect(real!.body).toContain("#document-disk-reaper-2026-11-19");
+    expect(real!.body.length).toBeLessThan(8200);
+    const docs = await db.select().from(issueDocuments).where(eq(issueDocuments.issueId, standing[0]!.id));
+    expect(docs.map((d) => d.key)).toEqual(["disk-reaper-2026-11-19"]);
   });
 });

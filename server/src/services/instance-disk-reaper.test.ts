@@ -74,7 +74,7 @@ describe("backups", () => {
   it("keeps the newest N dumps and removes the rest, counting bytes", async () => {
     await dumps(10);
     const report = await sweepInstanceDisk(deps());
-    expect(report.categories.backups).toMatchObject({ candidates: 3, bytes: 300, freedBytes: 300 });
+    expect(report.categories.backups).toMatchObject({ candidates: 3, bytes: 300, freedBytes: 300, kept: { "among the newest dumps": 7 } });
     const left = await fs.readdir(backupDir);
     expect(left).toHaveLength(7);
     // The three oldest are gone, the newest stays.

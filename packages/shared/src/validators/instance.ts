@@ -22,6 +22,15 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+export const diskReaperSettingsSchema = z.object({
+  enabled: z.boolean(),
+  dryRun: z.boolean(),
+  idleHours: z.number().int().min(1).max(24 * 365),
+  runLogRetentionDays: z.number().int().min(1).max(3650),
+  backupKeepCount: z.number().int().min(1).max(1000),
+  diskAlertPercent: z.number().int().min(1).max(100),
+}).partial().strict();
+
 // An environment variable name, or a `PREFIX_*` prefix. PAPERCLIP_* is the
 // reserved runtime namespace and can never be inherited from the server.
 export const agentEnvPatternSchema = z
@@ -45,6 +54,7 @@ export const instanceGeneralSettingsSchema = z.object({
   // built-in default list in adapter-utils, for every company, present and
   // future. An agent can add to it (runtimeConfig.inheritEnv), never opt out.
   agentEnvAllowlist: z.array(agentEnvPatternSchema).max(256).optional(),
+  diskReaper: diskReaperSettingsSchema.optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

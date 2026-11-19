@@ -108,6 +108,7 @@ export type {
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
   BackupRetentionPolicy,
+  DiskReaperSettings,
 } from "./instance.js";
 export type {
   SmokeLabServiceStatus,
@@ -129,6 +130,7 @@ export {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_DISK_REAPER_SETTINGS,
   PAPERCLIP_CLOUD_MANAGED_BY,
 } from "./instance.js";
 export {

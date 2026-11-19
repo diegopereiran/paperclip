@@ -15,6 +15,32 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
   monthlyMonths: 1,
 };
 
+/** Limits for the daily instance disk reaper. Every field is optional in storage; absent = default. */
+export interface DiskReaperSettings {
+  /** Master switch for the daily sweep and the disk-usage alert. */
+  enabled: boolean;
+  /** List what would be deleted and the bytes per category; delete nothing. */
+  dryRun: boolean;
+  /** Temp dirs under the OS temp root and dead isolated-workspace attempts idle this long are removable. */
+  idleHours: number;
+  /** Run logs older than this many days are removable. */
+  runLogRetentionDays: number;
+  /** Keep this many newest database dumps (the newest and pre-migration dumps are never removed). */
+  backupKeepCount: number;
+  /** Post a board card when the data disk is fuller than this percentage. */
+  diskAlertPercent: number;
+}
+
+export const DEFAULT_DISK_REAPER_SETTINGS: DiskReaperSettings = {
+  enabled: true,
+  // Ships listing-only: the board reviews one dry run on the host, then turns this off.
+  dryRun: true,
+  idleHours: 24,
+  runLogRetentionDays: 14,
+  backupKeepCount: 7,
+  diskAlertPercent: 85,
+};
+
 /**
  * Instance-wide execution policy.
  *
@@ -42,6 +68,8 @@ export interface InstanceGeneralSettings {
    * spawned agent processes inherit. Absent = the built-in default list.
    */
   agentEnvAllowlist?: string[];
+  /** Daily disk reaper limits. Absent = `DEFAULT_DISK_REAPER_SETTINGS`. */
+  diskReaper?: Partial<DiskReaperSettings>;
 }
 
 export interface InstanceExperimentalSettings {

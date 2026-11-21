@@ -79,6 +79,7 @@ import {
   materializePaperclipSkillCopy,
   parseObject,
   isPaperclipSkillSourceMissing,
+  managedAiHomeEnvironment,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
@@ -109,6 +110,7 @@ import {
   type AcpRuntimeTurnResult,
   type AcpRuntimeUsageBreakdown,
   type AcpRuntimeUsageCost,
+  type AcpSessionStore,
 } from "acpx/runtime";
 import {
   ACP_TOOL_KINDS,
@@ -481,6 +483,9 @@ interface AcpxPreparedRuntime {
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
   sessionKey: string;
   fingerprint: string;
+  // Short hash per fingerprint field, so a later run can name (never show) the
+  // fields that changed.
+  fingerprintFields: Record<string, string>;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
@@ -1565,6 +1570,40 @@ function isCompatibleSession(
   return stableJson(savedRemote) === stableJson(runtime.remoteExecutionIdentity ?? {});
 }
 
+export async function evictStaleSessionRecord(store: AcpSessionStore, sessionKey: string): Promise<void> {
+  const stale = await store.load(sessionKey);
+  if (!stale || stale.acpx?.reset_on_next_ensure === true) return;
+  await store.save({ ...stale, acpx: { ...stale.acpx, reset_on_next_ensure: true } });
+}
+
+/**
+ * Names (never values) of the identity parts that differ between a saved session
+ * and the current run, for the "starting fresh" log line.
+ */
+export function describeSessionMismatch(
+  params: Record<string, unknown>,
+  runtime: Pick<AcpxPreparedRuntime, "fingerprintFields" | "sessionKey" | "cwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity">,
+): string {
+  const saved = parseObject(params.fingerprintFields);
+  if (Object.keys(saved).length === 0) return "fields: unknown (legacy session)";
+  const changed = new Set(
+    Object.entries(runtime.fingerprintFields)
+      .filter(([key, hash]) => saved[key] !== hash)
+      .map(([key]) => key),
+  );
+  for (const key of Object.keys(saved)) if (!(key in runtime.fingerprintFields)) changed.add(key);
+  if (asString(params.agent, "") !== runtime.acpxAgent) changed.add("acpxAgent");
+  if (asString(params.mode, "") !== runtime.mode) changed.add("mode");
+  const savedCwd = asString(params.cwd, "");
+  if (!savedCwd || path.resolve(savedCwd) !== path.resolve(runtime.cwd)) changed.add("cwd");
+  if (stableJson(parseObject(params.remoteExecution)) !== stableJson(runtime.remoteExecutionIdentity ?? {})) {
+    changed.add("remoteExecutionIdentity");
+  }
+  // The key embeds the fingerprint, so it only names itself when nothing else does.
+  if (changed.size === 0 && asString(params.sessionKey, "") !== runtime.sessionKey) changed.add("sessionKey");
+  return changed.size > 0 ? `fields: ${[...changed].sort().join(", ")}` : "fields: none";
+}
+
 function buildSessionParams(input: {
   prepared: AcpxPreparedRuntime;
   handle: AcpRuntimeHandle;
@@ -1581,6 +1620,7 @@ function buildSessionParams(input: {
     mode: prepared.mode,
     stateDir: prepared.stateDir,
     configFingerprint: prepared.fingerprint,
+    fingerprintFields: prepared.fingerprintFields,
     mcpFingerprint: shortHash(prepared.mcpIdentity),
     ...(prepared.requestedModel ? { model: prepared.requestedModel } : {}),
     ...(prepared.requestedThinkingEffort ? { thinkingEffort: prepared.requestedThinkingEffort } : {}),
@@ -2037,6 +2077,8 @@ async function buildRuntime(input: {
       ...(Array.isArray(scratch.tempKeysApplied) ? scratch.tempKeysApplied.filter((key): key is string =>
         typeof key === "string" && ["TMPDIR", "TEMP", "TMP"].includes(key)) : [])])
     : new Set<string>();
+  const managedAiRetainedHome = typeof context.managedAiRetainedHome === "string" ? context.managedAiRetainedHome : undefined;
+  const managedAiHomeEnv = managedAiRetainedHome ? managedAiHomeEnvironment(managedAiRetainedHome) : undefined;
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -2047,6 +2089,7 @@ async function buildRuntime(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
+    if (managedAiHomeEnv?.[key] === value) continue;
     // The server rotates run-owned scratch paths on every wake. Still forward
     // them, but only hash actual adapter settings. User-supplied temp overrides
     // are absent from tempKeysApplied and keep their compatibility protection.
@@ -2289,6 +2332,9 @@ async function buildRuntime(input: {
     adapterEnvHash: shortHash(resolvedAdapterEnv),
   };
   const fingerprint = buildSessionFingerprint(fingerprintIdentity);
+  const fingerprintFields = Object.fromEntries(
+    Object.entries(fingerprintIdentity).map(([key, value]) => [key, shortHash(value ?? null)]),
+  );
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
   // Company, agent, and task identity for the outer session key. These parts
   // stay out of the fingerprint hash.
@@ -2656,6 +2702,7 @@ async function buildRuntime(input: {
     timeoutResolution,
     sessionKey,
     fingerprint,
+    fingerprintFields,
     agentCommand,
     agentRegistry,
     processSessionBridge,
@@ -4522,7 +4569,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (!canResume && asString(previousParams.runtimeSessionName, "")) {
           await ctx.onLog(
             "stdout",
-            `[paperclip] ACPX session "${asString(previousParams.runtimeSessionName, "")}" does not match the current agent/cwd/mode/runtime identity; starting fresh in "${prepared.cwd}".\n`,
+            `[paperclip] ACPX session "${asString(previousParams.runtimeSessionName, "")}" does not match the current agent/cwd/mode/runtime identity (${describeSessionMismatch(previousParams, prepared)}); starting fresh in "${prepared.cwd}".\n`,
           );
         }
 
@@ -4572,6 +4619,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
         try {
           if (!handle) {
+            if (!resumeSessionId) await evictStaleSessionRecord(runtimeStore, prepared.sessionKey);
             try {
               // Step 7 — acp.handshake: ACP session establishment (session/new or
               // resume). A throwing handshake still reports its duration before the
@@ -4613,6 +4661,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 "stdout",
                 `[paperclip] ACPX resume session "${resumeSessionId}" is unavailable; retrying with a fresh session.\n`,
               );
+              await evictStaleSessionRecord(runtimeStore, prepared.sessionKey);
               // Fresh-session retry: the runtime was already constructed on the
               // first attempt (never re-created), so this event reports only its
               // own `ensureSessionMs` — no `createRuntimeMs`.

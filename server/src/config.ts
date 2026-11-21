@@ -83,6 +83,7 @@ export interface Config {
   gitBaseExpirationEnabled: boolean;
   gitCacheExpirationDryRun: boolean;
   workspaceReaperCooldownDays: number;
+  workspaceCleanupOnClose: boolean;
   workspaceCompactionDelayHours: number | null;
   skillVersionRetentionEnabled: boolean;
   skillVersionRetentionDryRun: boolean;
@@ -95,6 +96,7 @@ export interface Config {
   gitRestorePointsEnabled: boolean;
   gitRestorePointTerminalDelayDays: number;
   gitRestorePointIdleDays: number;
+  managedClaudeTranscriptRetentionDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -344,6 +346,7 @@ export function loadConfig(): Config {
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
+  const managedClaudeTranscriptRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_DAYS", 7));
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -393,6 +396,9 @@ export function loadConfig(): Config {
     gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",
     workspaceReaperCooldownDays,
+    // Instance-wide, on unless an operator sets it to "false": every company
+    // inherits it, including companies created later.
+    workspaceCleanupOnClose: process.env.PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE !== "false",
     workspaceCompactionDelayHours,
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
     skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",
@@ -405,6 +411,7 @@ export function loadConfig(): Config {
     gitRestorePointsEnabled: process.env.PAPERCLIP_GIT_RESTORE_POINTS_ENABLED === "true",
     gitRestorePointTerminalDelayDays,
     gitRestorePointIdleDays,
+    managedClaudeTranscriptRetentionDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

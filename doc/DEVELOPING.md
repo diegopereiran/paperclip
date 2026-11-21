@@ -2577,6 +2577,18 @@ Environment overrides:
   the work inside this window. The default is `1`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE=false` turns cleanup on close off. Any
+  other value keeps it on. With it on, the reaper removes a closed git worktree
+  even when it holds dirty files or commits no remote has. It first pushes that
+  work to `rescue/<issue identifier>` on `origin` (`rescue/<identifier>-<sha7>`
+  when that branch already exists), using the company's git credentials and a
+  60 s timeout, without running repo hooks. Files that `.gitignore` matches are
+  not rescued; they are removed with the worktree. If the push fails, the
+  worktree stays and the issue gets a `CLEANUP: KEPT <path> <reason>` comment,
+  where the reason is the failed git step and git's error. The worktree is
+  deleted only if it still matches what was pushed. The same sweep removes the run scratch dirs of
+  a closed issue once none of its runs is live. The startup sweep skips both
+  steps; a later sweep runs them.
 - `PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS=<hours>` sets how long the reaper
   waits after an issue tree becomes terminal before it removes regenerable files
   from the workspace (see "Terminal workspace compaction" below). The default is
@@ -2609,6 +2621,13 @@ Environment overrides:
 - `PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS=<days>` sets how long a git workspace
   restore point is kept after its issue tree closes (see
   `doc/recoverable-disk-cleanup.md`). The default is `90` and the minimum is `1`. A
+  negative, empty, or non-numeric value falls back to the default.
+- `PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_ENABLED=true` keeps managed Claude
+  transcripts between runs of a task so the session can resume (see
+  `doc/connections/AI-CONNECTIONS.md`). It is off by default.
+  `PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_DAYS=<days>` sets how long an issue
+  stays closed before its transcripts are deleted (see
+  `doc/recoverable-disk-cleanup.md`). The default is `7` and the minimum is `1`. A
   negative, empty, or non-numeric value falls back to the default.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for

@@ -2336,6 +2336,29 @@ describe("shared ACPX engine runtime behavior", () => {
     expect((await store.load(sessionKey))?.acpx?.reset_on_next_ensure).toBe(true);
   });
 
+  it("names the changed fingerprint fields, never their values, when a saved session does not match", async () => {
+    const root = await makeTempRoot();
+    const config = { agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root };
+    const first = await runExecutor({ ...config, env: { ANTHROPIC_MODEL: "model-secret-a" } });
+    const savedParams = first.result.sessionParams as Record<string, unknown>;
+    expect(savedParams.fingerprintFields).toBeDefined();
+
+    const changed = await runExecutor(
+      { ...config, env: { ANTHROPIC_MODEL: "model-secret-b" } },
+      { runtime: { sessionParams: savedParams } },
+    );
+    const line = changed.logs.map((entry) => entry.text).find((text) => text.includes("starting fresh"));
+    expect(line).toContain("(fields: adapterEnvHash)");
+    expect(line).not.toContain("model-secret");
+
+    const { fingerprintFields: _omitted, ...legacy } = savedParams;
+    const legacyRun = await runExecutor(
+      { ...config, env: { ANTHROPIC_MODEL: "model-secret-b" } },
+      { runtime: { sessionParams: legacy } },
+    );
+    expect(legacyRun.logs.map((entry) => entry.text).join("")).toContain("(fields: unknown (legacy session))");
+  });
+
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

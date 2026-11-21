@@ -14,6 +14,10 @@ import {
 } from "./services/native-runtime/native-harness-backup-expiration.js";
 import { gitRestorePointRetentionService, registerGitRestorePointWork } from "./services/git-restore-point-ledger.js";
 import { markGitRestorePointExpired } from "./services/git-restore-point-storage.js";
+import {
+  managedClaudeTranscriptExpirationService,
+  registerManagedClaudeTranscriptCleanupWork,
+} from "./services/managed-claude-transcripts.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
 import { registerBudgetEnforcementWork, registerCostAccountingWork } from "./services/budget-enforcement-worker.js";
@@ -1344,6 +1348,13 @@ async function startServerWithDatabaseTeardown(
   });
   const accountingWorker = registerCostAccountingWork(db, deliveryWork, accountingHeartbeat.reconcileCostAccounting);
   server.on("close", accountingWorker.stop);
+  registerManagedClaudeTranscriptCleanupWork(
+    deliveryWork,
+    managedClaudeTranscriptExpirationService(db as any, { retentionDays: config.managedClaudeTranscriptRetentionDays }),
+    (result) => {
+      if (result.expired > 0 || result.failed > 0) logger.info({ ...result }, "managed Claude transcript expiration");
+    },
+  );
   skillSourceSync.start(deliveryWork);
   // Daily instance disk reaper: old temp dirs, dead isolated attempts, run logs
   // and surplus database dumps, then the disk-usage alert. Limits and dry run

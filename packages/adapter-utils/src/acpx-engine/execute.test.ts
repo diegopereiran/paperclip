@@ -2201,6 +2201,49 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(changed.result.sessionParams?.configFingerprint).not.toBe(first.result.sessionParams?.configFingerprint);
   });
 
+  it("keeps run-varying data out of session identity when the server retains the managed home", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwdA = path.join(root, "cwd-a");
+    const cwdB = path.join(root, "cwd-b");
+    await fs.mkdir(cwdA);
+    await fs.mkdir(cwdB);
+    // Same keys the server's managed AI home puts into the adapter env.
+    const managedHomeEnv = (home: string) => ({
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, "config"),
+      XDG_DATA_HOME: path.join(home, "data"),
+      CLAUDE_CONFIG_DIR: path.join(home, "provider"),
+    });
+    async function fingerprint(run: number, opts: { model?: string; cwd?: string } = {}) {
+      const home = path.join(root, `managed-home-${run}`);
+      const result = await runExecutor(
+        {
+          agentCommand: "node ./fake-acp.js",
+          stateDir,
+          cwd: opts.cwd ?? cwdA,
+          env: { ...managedHomeEnv(home), ANTHROPIC_MODEL: opts.model ?? "claude-opus-4-7" },
+        },
+        {
+          context: {
+            taskId: "issue-1",
+            runId: `run-${run}`,
+            wakeReason: run === 1 ? "issue_assigned" : "comment",
+            wakeCommentId: `c-${run}`,
+            wakeTimestamp: `2026-11-0${run}T00:00:00.000Z`,
+            managedAiRetainedHome: home,
+          },
+        },
+      );
+      return result.result.sessionParams?.configFingerprint;
+    }
+    const first = await fingerprint(1);
+    expect(first).toBeDefined();
+    expect(await fingerprint(2)).toBe(first);
+    expect(await fingerprint(3, { model: "claude-sonnet-5" })).not.toBe(first);
+    expect(await fingerprint(4, { cwd: cwdB })).not.toBe(first);
+  });
+
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

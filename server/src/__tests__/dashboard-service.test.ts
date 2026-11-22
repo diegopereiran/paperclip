@@ -48,6 +48,7 @@ describeEmbeddedPostgres("dashboard service", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

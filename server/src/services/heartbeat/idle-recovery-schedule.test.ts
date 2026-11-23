@@ -234,9 +234,10 @@ describe("owned recovery deadline inspection", () => {
       return query;
     }, execute: async () => subtree } as unknown as Pick<Db, "select" | "execute">;
     const service = taskWatchdogService(reader as Db);
-    expect(await service.readIdleSchedule(reader, now, owner)).toMatchObject({ blocked: false, deadlines: [now + 15_000] });
-    expect(await service.readIdleSchedule(reader, now + 1000, owner)).toMatchObject({ blocked: false, deadlines: [now + 15_000] });
-    expect((await service.readIdleSchedule(reader, now + 15_000, owner)).blocked).toBe(true);
+    // Fork: first-run grace is 45 s (task-watchdogs.ts TASK_WATCHDOG_FIRST_RUN_GRACE_MS), not the release's 15 s.
+    expect(await service.readIdleSchedule(reader, now, owner)).toMatchObject({ blocked: false, deadlines: [now + 45_000] });
+    expect(await service.readIdleSchedule(reader, now + 1000, owner)).toMatchObject({ blocked: false, deadlines: [now + 45_000] });
+    expect((await service.readIdleSchedule(reader, now + 45_000, owner)).blocked).toBe(true);
   });
   it("keeps first-run grace scoped to the run and issue company across batched watchdogs", async () => {
     const watchdogs = ["A", "B"].map(key => ({ id: `watchdog${key}`, companyId: `company${key}`,
@@ -257,7 +258,7 @@ describe("owned recovery deadline inspection", () => {
     }, execute: async () => subtree } as unknown as Pick<Db, "select" | "execute">;
     const result = await taskWatchdogService(reader as Db).readIdleSchedule(reader, now, owner);
     expect(result.blocked).toBe(false);
-    expect(result.deadlines).toEqual([now + 15_000, now + 15_000]);
+    expect(result.deadlines).toEqual([now + 45_000, now + 45_000]); // fork: 45 s first-run grace
   });
   it("does not certify a first producer during drain, failed reconstruction, or a changed revision", async () => {
     let revision = "1";

@@ -14,6 +14,8 @@ permissions:
 jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Fork: pinned to the release commit this queue is based on (v2026.1117.0,
+    # c0f132898), so the trusted workflow matches this tree's scripts. Upstream
+    # master's pr-trusted.yml moves ahead of the release and can call scripts this
+    # tree does not have. Move the pin at the next rebase onto a release.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@c0f132898d2a2677312d8c72096187b27a3d9a38

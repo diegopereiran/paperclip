@@ -221,8 +221,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
 
   it("does not activate inheritEnv names that the pending hire row never carried", async () => {
     const companyId = await seedCompany();
-    const agentSvc = agentService(db);
-    const pending = await agentSvc.create(companyId, {
+    const pending = await createAgentLifecycle(db).requestHire(companyId, {
       name: "Env Coder",
       role: "engineer",
       adapterType: "process",
@@ -235,16 +234,34 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       permissions: {},
       lastHeartbeatAt: null,
     });
-
-    const activated = await agentSvc.activatePendingApproval(pending.id, {
-      name: "Env Coder",
-      adapterType: "process",
-      adapterConfig: { command: "echo safe" },
-      runtimeConfig: { inheritEnv: ["GH_TOKEN", "DATABASE_URL", "BETTER_AUTH_SECRET"] },
+    const approvalSvc = approvalService(db);
+    // The approval payload is writable below instance-admin level, so it may name more variables.
+    const approval = await approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: {
+        name: "Env Coder",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: { command: "echo safe" },
+        runtimeConfig: { inheritEnv: ["GH_TOKEN", "DATABASE_URL", "BETTER_AUTH_SECRET"] },
+        budgetMonthlyCents: 0,
+        metadata: {},
+        agentId: pending.id,
+        appearance: pending.appearance,
+      },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
     });
 
-    expect(activated?.activated).toBe(true);
-    expect((activated?.agent.runtimeConfig as Record<string, unknown>).inheritEnv).toEqual(["GH_TOKEN"]);
+    await approvalSvc.approve(approval.id, "board-user", "Approved env hire");
+
+    const activated = await agentService(db).getById(pending.id);
+    expect((activated?.runtimeConfig as Record<string, unknown>).inheritEnv).toEqual(["GH_TOKEN"]);
   });
 
 });

@@ -935,16 +935,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         pullRequestPoll: { fetch: fakeFetch, getToken: async () => "token-value" },
       });
 
-      await heartbeat.tickTimers(new Date("2026-04-11T12:00:00.000Z"));
+      await heartbeat.tickPullRequestMonitors(new Date("2026-04-11T12:00:00.000Z"));
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
 
       state.headSha = "sha-2";
       // The poller wakes only once the pull request has stayed unchanged for PULL_REQUEST_SETTLE_MS (2 min):
       // the tick that first sees the new head records the change, the next one wakes.
-      await heartbeat.tickTimers(new Date("2026-04-11T12:04:00.000Z"));
+      await heartbeat.tickPullRequestMonitors(new Date("2026-04-11T12:04:00.000Z"));
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
 
-      await heartbeat.tickTimers(new Date("2026-04-11T12:08:00.000Z"));
+      await heartbeat.tickPullRequestMonitors(new Date("2026-04-11T12:08:00.000Z"));
       const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       expect(wakeups).toHaveLength(1);
       expect(wakeups[0]?.payload).toMatchObject({
@@ -952,7 +952,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         source: "pull_request_event",
       });
 
-      await heartbeat.tickTimers(new Date("2026-04-11T12:12:00.000Z"));
+      await heartbeat.tickPullRequestMonitors(new Date("2026-04-11T12:12:00.000Z"));
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
 
       const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);

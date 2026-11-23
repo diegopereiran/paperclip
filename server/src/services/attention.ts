@@ -2001,13 +2001,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const feed = await list(companyId, { ...options, all: true, allowUnscopedAll: true }, issueIds);
       return feed.items;
     },
-    summary: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor"> = {}): Promise<AttentionSummary> => {
+    summary: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor" | "decidableOnly"> = {}): Promise<AttentionSummary> => {
       const { items: _items, nextCursor: _cursor, ...summary } = await list(companyId, {
         ...options, all: true, allowUnscopedAll: true, summaryOnly: true,
       });
       return summary;
     },
-    taskIndex: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor"> = {}): Promise<AttentionTaskIndex> => {
+    taskIndex: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor" | "decidableOnly"> = {}): Promise<AttentionTaskIndex> => {
       const { items, nextCursor: _cursor, ...summary } = await list(companyId, {
         ...options, all: true, allowUnscopedAll: true, summaryOnly: true,
       });

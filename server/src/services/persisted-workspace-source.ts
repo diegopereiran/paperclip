@@ -50,6 +50,29 @@ async function readOrigin(cwd: string): Promise<string | null> {
   }).catch(() => null);
 }
 
+async function readRemote(cwd: string, remote: "origin" | "upstream"): Promise<string | null> {
+  return exec("git", ["config", "--local", "--null", "--get-all", `remote.${remote}.url`], {
+    cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, timeout: 10_000, maxBuffer: 16 * 1024,
+  }).then(result => {
+    const urls = result.stdout.split("\0");
+    if (urls.at(-1) === "") urls.pop();
+    return urls.length === 1 ? urls[0]!.trim() || null : null;
+  }).catch(() => null);
+}
+
+function sameRepositoryUrl(left: string | null, right: string): boolean {
+  const normalize = (url: string) => url.trim().replace(/\/+$/u, "").replace(/\.git$/u, "");
+  return left !== null && normalize(left) === normalize(right);
+}
+
+// Fork: the AlpacaBridge VM clone fetches the fork as origin and records the shared repository, the one its
+// workspaces name, as a single `upstream` URL. Either identity proves the recorded repository; the origin rule
+// (one stored URL, no transport rewrites) applies to both.
+async function matchesRecordedRepository(cwd: string, repoUrl: string): Promise<boolean> {
+  if (await readOrigin(cwd) === repoUrl.trim()) return true;
+  return sameRepositoryUrl(await readRemote(cwd, "upstream"), repoUrl);
+}
+
 async function gitDirectory(cwd: string, flag: "--absolute-git-dir" | "--git-common-dir"): Promise<string | null> {
   const directory = await exec("git", ["rev-parse", "--path-format=absolute", flag], {
     cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, timeout: 10_000, maxBuffer: 16 * 1024,
@@ -163,7 +186,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
       const inspection = await inspectManagedGitWorktreeBranch({ worktreePath: existing, repoRoot: owner, expectedBranchName: null });
       if (inspection.inspectionDiagnostic) failedInspection ??= inspection.inspectionDiagnostic;
       if (!inspection.valid || !await hasLinkedWorktreeStorage(existing, owner)) continue;
-      if (workspace.repoUrl && await readOrigin(owner) !== workspace.repoUrl.trim()) {
+      if (workspace.repoUrl && !await matchesRecordedRepository(owner, workspace.repoUrl)) {
         repositoryMismatch = true;
         continue;
       }
@@ -181,7 +204,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
   // primary is never a fallback for a missing historical worktree.
   let failedInspection: ManagedGitInspectionDiagnostic | null = null;
   for (const candidate of knownRoots) {
-    if (workspace.repoUrl && await readOrigin(candidate) !== workspace.repoUrl.trim()) continue;
+    if (workspace.repoUrl && !await matchesRecordedRepository(candidate, workspace.repoUrl)) continue;
     const inspection = await inspectManagedGitWorktreeBranch({ worktreePath: candidate, repoRoot: candidate, expectedBranchName: null });
     if (inspection.valid) return candidate;
     if (inspection.inspectionDiagnostic) failedInspection ??= inspection.inspectionDiagnostic;
@@ -194,7 +217,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
     const materialized = await input.materializeOriginalRepository();
     const owner = await canonicalDirectory(materialized);
     const expectedRoots = await roots();
-    if (owner && expectedRoots.has(owner) && await readOrigin(owner) === workspace.repoUrl.trim()) return owner;
+    if (owner && expectedRoots.has(owner) && await matchesRecordedRepository(owner, workspace.repoUrl)) return owner;
   }
   fail(workspace, "source_repository_unavailable");
 }

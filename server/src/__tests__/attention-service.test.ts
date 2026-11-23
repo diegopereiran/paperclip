@@ -2028,7 +2028,7 @@ describeEmbeddedPostgres("attention service", () => {
     expect(approvalItems[0]?.subject.metadata?.issueId).toBe(firstIssueId);
   });
 
-  it("does not add a review row when a linked pending approval is the only review path", async () => {
+  it("keeps a review row whose only path is a linked pending approval off the board, not out of the feed", async () => {
     const { companyId, reviewerId } = await seedCompany("ATL");
     const issueId = await insertIssue({
       companyId,
@@ -2048,10 +2048,17 @@ describeEmbeddedPostgres("attention service", () => {
     });
     await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
 
-    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    // The board asks for decidable rows only: the approval row already carries the decision, so
+    // one card must not show twice there.
+    const board = await attentionService(db).list(companyId, { userId: "board-user", decidableOnly: true });
+    expect(board.items.filter((item) => item.dedupKey === `approval:${approvalId}`)).toHaveLength(1);
+    expect(board.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(0);
 
+    // The full feed keeps the review row, so retention can archive it (v2026.1117.0
+    // attention-retention-work "excludes maintained reviews until a pending approval ...").
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
     expect(feed.items.filter((item) => item.dedupKey === `approval:${approvalId}`)).toHaveLength(1);
-    expect(feed.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(0);
+    expect(feed.items.filter((item) => item.dedupKey === `review:${issueId}`)).toHaveLength(1);
   });
 
   it("hides snoozed attention rows until snoozedUntil passes, then returns them unconditionally", async () => {

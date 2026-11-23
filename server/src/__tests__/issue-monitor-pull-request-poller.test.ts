@@ -7,7 +7,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
-import { createPullRequestMonitorPoller } from "../services/issue-monitor-pull-request-poller.ts";
+import { createPullRequestMonitorPoller, type PullRequestMonitorPollerOptions } from "../services/issue-monitor-pull-request-poller.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -217,7 +217,7 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
   ) {
     const github = createFakeGitHub();
     github.set("open/repo#12");
-    const triggerMonitor = vi.fn(async () => ({ outcome: "triggered" as const }));
+    const triggerMonitor = vi.fn<PullRequestMonitorPollerOptions["triggerMonitor"]>(async () => ({ outcome: "triggered" as const }));
     const log = createLog();
     const getToken = options.getToken ?? (async () => TOKEN);
     const poller = createPullRequestMonitorPoller(db, {
@@ -525,7 +525,7 @@ describeEmbeddedPostgres("pull request monitor poller", () => {
     const healthy = await seedCompany();
     await seedMonitor(limited, "https://github.com/limited/repo/pull/1");
     await seedMonitor(healthy, "https://github.com/healthy/repo/pull/2");
-    const tokens = new Map([[limited.companyId, "limited-token"], [healthy.companyId, "healthy-token"]]);
+    const tokens = new Map<string, string>([[limited.companyId, "limited-token"], [healthy.companyId, "healthy-token"]]);
     const { poller, github, triggerMonitor, log } = setup({ getToken: async (id) => tokens.get(id) ?? null });
     github.set("limited/repo#1");
     github.set("healthy/repo#2");

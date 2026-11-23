@@ -1066,10 +1066,17 @@ export function createHeartbeatScheduling(
     }
   }
 
-  // Polled on a fixed cadence: GitHub cannot notify this instance (no org webhooks), so there is no deadline to wait for.
-  async function nextPullRequestMonitorPollAt(): Promise<number | null> {
-    if ((await getSchedulingSuppression(true)).suppressed) return null;
-    return Date.now() + (pullRequestPoll?.intervalMs ?? PULL_REQUEST_POLL_INTERVAL_MS);
+  // GitHub cannot notify this instance (no org webhooks), so pull requests are polled on the issue-monitor
+  // deadline: every interval while a monitor names one, and not at all otherwise, so an idle server stays quiet.
+  const pullRequestPollIntervalMs = pullRequestPoll?.intervalMs ?? PULL_REQUEST_POLL_INTERVAL_MS;
+  let pullRequestsWatched = false;
+  let lastPullRequestPollAt = 0;
+
+  async function pollPullRequestsIfDue(now: Date) {
+    if (now.getTime() - lastPullRequestPollAt < pullRequestPollIntervalMs) return;
+    const result = await tickPullRequestMonitors(now);
+    lastPullRequestPollAt = now.getTime();
+    if (result.watching !== undefined) pullRequestsWatched = result.watching > 0;
   }
 
   async function tickDueIssueMonitors(now: Date, canContinue: () => boolean) {
@@ -1163,7 +1170,9 @@ export function createHeartbeatScheduling(
     if (!canContinue() || (await getSchedulingSuppression(true)).suppressed) {
       return { checked: 0, triggered: 0, skipped: 0 };
     }
-    return tickDueIssueMonitors(now, canContinue);
+    const result = await tickDueIssueMonitors(now, canContinue);
+    if (canContinue()) await pollPullRequestsIfDue(now);
+    return result;
   }
 
   async function nextIssueMonitorAt(): Promise<number | null> {
@@ -1176,7 +1185,10 @@ export function createHeartbeatScheduling(
         sql`${issues.assigneeAgentId} is not null`, inArray(issues.status, ["in_progress", "in_review"])));
 
 
-    return row?.at == null ? null : new Date(row.at).getTime();
+    const monitorAt = row?.at == null ? null : new Date(row.at).getTime();
+    if (!pullRequestsWatched) return monitorAt;
+    const pollAt = lastPullRequestPollAt + pullRequestPollIntervalMs;
+    return monitorAt === null ? pollAt : Math.min(monitorAt, pollAt);
   }
 
   async function recoverActiveSessionGoals() {
@@ -1433,7 +1445,6 @@ export function createHeartbeatScheduling(
     tickIssueMonitors,
     nextIssueMonitorAt,
     tickPullRequestMonitors,
-    nextPullRequestMonitorPollAt,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   };

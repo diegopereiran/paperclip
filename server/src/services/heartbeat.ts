@@ -1639,7 +1639,6 @@ export function heartbeatService(
     tickIssueMonitors,
     nextIssueMonitorAt,
     tickPullRequestMonitors,
-    nextPullRequestMonitorPollAt,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   } = createHeartbeatScheduling(db, {
@@ -4514,7 +4513,6 @@ export function heartbeatService(
     tickIssueMonitors,
     nextIssueMonitorAt,
     tickPullRequestMonitors,
-    nextPullRequestMonitorPollAt,
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),

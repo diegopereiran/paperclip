@@ -65,6 +65,8 @@ export interface PullRequestPollResult {
   polled: number;
   baselined: number;
   woken: number;
+  /** Pull requests named by scheduled monitors; 0 lets the scheduler stop polling. Absent on an overlapped tick. */
+  watching?: number;
 }
 
 interface CachedResponse<T> {
@@ -385,6 +387,8 @@ export function createPullRequestMonitorPoller(db: Db, options: PullRequestMonit
       }
     }
 
+    result.watching = 0;
+    for (const refs of byCompany.values()) result.watching += refs.size;
     const watchedCacheKeys = new Set<string>();
     for (const [companyId, refs] of byCompany) {
       for (const key of refs.keys()) watchedCacheKeys.add(`${companyId}|${key}`);

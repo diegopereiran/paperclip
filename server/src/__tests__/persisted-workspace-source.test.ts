@@ -118,6 +118,23 @@ describe("persisted Git workspace source", () => {
     } } });
   });
 
+  // Fork: the AlpacaBridge VM clone fetches the fork as origin and records the shared repository as `upstream`.
+  it("accepts a fork clone whose upstream remote is the recorded repository", async () => {
+    const { original, input } = await fixture();
+    await exec("git", ["-C", original, "remote", "set-url", "origin", "https://example.invalid/fork.git"]);
+    await exec("git", ["-C", original, "remote", "add", "upstream", input.workspace.repoUrl.replace(/\.git$/u, "")]);
+    expect(await resolvePersistedGitWorkspaceSource(input)).toBe(original);
+  });
+
+  it("still rejects a fork clone whose upstream remote is another repository", async () => {
+    const { original, input } = await fixture();
+    await exec("git", ["-C", original, "remote", "set-url", "origin", "https://example.invalid/fork.git"]);
+    await exec("git", ["-C", original, "remote", "add", "upstream", "https://example.invalid/other.git"]);
+    await expect(resolvePersistedGitWorkspaceSource(input)).rejects.toMatchObject({ resultJson: { workspaceValidation: {
+      reasonCode: "source_repository_mismatch",
+    } } });
+  });
+
   it("refuses an independent clone masquerading as the selected linked worktree", async () => {
     const { root, original, input } = await fixture();
     const clone = path.join(root, "clone");

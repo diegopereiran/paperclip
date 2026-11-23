@@ -110,23 +110,22 @@ describeIssueRecovery("issue recovery production producers and deadlines", () =>
     expect(new Set(checked).size).toBe(1000);
     await quiet();
   });
-  it("uses ordinary watchdog configuration and subtree closure to dispatch a reusable review", async () => {
+  // Fork: a watched subtree that is fully done or cancelled is not stopped work, so the watchdog never wakes for it
+  // (task-watchdogs.ts classifier, "Every issue in the watched subtree is terminal"). The release dispatched a review
+  // here; on the fork's instance that woke the CTO once per finished watched issue (fork PR #75, 2026-11-23).
+  it("does not dispatch a watchdog review when the watched subtree is fully terminal", async () => {
     const f = await fixture();
     const source = await issueService(state.db).create(f.companyId, { title: "Finished subtree", status: "done" });
     const failures = await completingProvider(f, () => taskWatchdogService(state.db).disableForIssue(f.companyId, source.id));
     await start(); await quiet();
     await compete();
     const watchdog = await taskWatchdogService(state.db).upsertForIssue(f.companyId, source.id, { agentId: f.agentId });
-    let reviewId: string | undefined;
-    await vi.waitFor(async () => {
-      const [row] = await state.db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog.watchdog.id));
-      expect(row.watchdogIssueId).toBeTruthy(); reviewId = row.watchdogIssueId!;
-    }, { timeout: 15_000 });
-    await completed(reviewId!);
+    await quiet();
+    const [row] = await state.db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog.watchdog.id));
+    expect(row.watchdogIssueId).toBeNull();
     expect(failures).toEqual([]);
     expect(await state.db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
-      sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' = 'task_watchdog_stopped_subtree'`))).toHaveLength(1);
-    await finish(reviewId!);
+      sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' = 'task_watchdog_stopped_subtree'`))).toHaveLength(0);
     await taskWatchdogService(state.db).disableForIssue(f.companyId, source.id);
     if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] }); await quiet();
   }, 90_000);
@@ -148,7 +147,8 @@ describeIssueRecovery("issue recovery production producers and deadlines", () =>
     const source = await issueService(state.db).create(f.companyId, { title: "Fresh unassigned subtree", status: "todo" });
     await start(); await quiet();
     await taskWatchdogService(state.db).upsertForIssue(f.companyId, source.id, { agentId: f.agentId });
-    await vi.waitFor(() => expect(state.coordinator.nextWakeAt()).toBe(source.createdAt.getTime() + 15_000), { timeout: 5_000 });
+    // Fork: 45 s first-run grace (task-watchdogs.ts TASK_WATCHDOG_FIRST_RUN_GRACE_MS), not the release's 15 s.
+    await vi.waitFor(() => expect(state.coordinator.nextWakeAt()).toBe(source.createdAt.getTime() + 45_000), { timeout: 5_000 });
     expect(await state.db.select().from(issues).where(eq(issues.originKind, "task_watchdog"))).toHaveLength(0);
     await taskWatchdogService(state.db).disableForIssue(f.companyId, source.id);
     if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] }); await quiet();

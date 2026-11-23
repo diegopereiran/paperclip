@@ -22,7 +22,7 @@ export function attentionRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     assertBoard(req);
     if (!req.actor.userId) { res.status(403).json({ error: "Board user context required" }); return; }
-    res.json(await svc.summary(companyId, { userId: req.actor.userId, actor: req.actor }));
+    res.json(await svc.summary(companyId, { userId: req.actor.userId, actor: req.actor, decidableOnly: true }));
   });
 
   router.get("/companies/:companyId/attention/tasks", async (req, res) => {
@@ -30,7 +30,7 @@ export function attentionRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     assertBoard(req);
     if (!req.actor.userId) { res.status(403).json({ error: "Board user context required" }); return; }
-    res.json(await svc.taskIndex(companyId, { userId: req.actor.userId, actor: req.actor }));
+    res.json(await svc.taskIndex(companyId, { userId: req.actor.userId, actor: req.actor, decidableOnly: true }));
   });
 
   router.get("/companies/:companyId/attention/history", async (req, res) => {
@@ -84,6 +84,7 @@ export function attentionRoutes(db: Db) {
       cursor,
       sort: sortValue as AttentionSortMode | undefined,
       limit,
+      decidableOnly: true,
     });
     res.json(feed);
   });

@@ -166,7 +166,20 @@ type AttentionListOptions = AttentionFeedQuery & {
   excludeSources?: readonly AttentionSourceKind[];
   /** Count the canonical complete set without card bodies or presentation reads. */
   summaryOnly?: boolean;
+  /** Board view: drop rows the board cannot decide in place (see NON_DECIDABLE_BOARD_KINDS). */
+  decidableOnly?: boolean;
 };
+
+// Rows with nothing to decide on the Decisions board: they only offer Open or
+// Dismiss. The Inbox already shows each of them (Blocked tab, failed runs,
+// alerts), so the board route leaves them out; other callers still get them.
+const NON_DECIDABLE_BOARD_KINDS: ReadonlySet<AttentionSourceKind> = new Set<AttentionSourceKind>([
+  "recovery_action",
+  "blocker_attention",
+  "failed_run",
+  "agent_error_alert",
+  "budget_alert",
+]);
 
 type AttentionServiceOptions = {
   openDecisionLimit?: number;
@@ -1098,6 +1111,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const collected: AttentionItem[] = [];
 
       const add = (item: AttentionItem) => {
+        if (options.decidableOnly && NON_DECIDABLE_BOARD_KINDS.has(item.sourceKind)) return;
         const dismissal = activeDismissalState(dismissals, item.dismissalKey, item.activityAt, now);
         if (!includeDismissed && dismissal?.isActive) return;
         collected.push({ ...item, dismissal });
@@ -1643,8 +1657,12 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const pendingApprovalId = pendingApprovalByIssueId.get(review.id) ?? null;
         const reviewAttention = reviewAttentionByIssueId.get(review.id);
         const stalled = reviewAttention?.state === "stalled";
-        if (!requiresReviewAttention({ hasHumanParticipant, hasUserAssignee: Boolean(review.assigneeUserId),
-          hasPendingApproval: Boolean(pendingApprovalId), stalled })) continue;
+        const reviewPath = { hasHumanParticipant, hasUserAssignee: Boolean(review.assigneeUserId), stalled };
+        if (!requiresReviewAttention({ ...reviewPath, hasPendingApproval: Boolean(pendingApprovalId) })) continue;
+        // Board view: a linked pending approval alone is not a reason for a second row there; the
+        // approval row already carries that decision, so the board would show one card twice. The
+        // full feed keeps the row, so retention can still archive it.
+        if (options.decidableOnly && !requiresReviewAttention({ ...reviewPath, hasPendingApproval: false })) continue;
         const issue = reviewIssueMap.get(review.id);
         if (!issue) continue;
         const dedupKey = `review:${review.id}`;
@@ -1984,13 +2002,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const feed = await list(companyId, { ...options, all: true, allowUnscopedAll: true }, issueIds);
       return feed.items;
     },
-    summary: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor"> = {}): Promise<AttentionSummary> => {
+    summary: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor" | "decidableOnly"> = {}): Promise<AttentionSummary> => {
       const { items: _items, nextCursor: _cursor, ...summary } = await list(companyId, {
         ...options, all: true, allowUnscopedAll: true, summaryOnly: true,
       });
       return summary;
     },
-    taskIndex: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor"> = {}): Promise<AttentionTaskIndex> => {
+    taskIndex: async (companyId: string, options: Pick<AttentionListOptions, "userId" | "actor" | "decidableOnly"> = {}): Promise<AttentionTaskIndex> => {
       const { items, nextCursor: _cursor, ...summary } = await list(companyId, {
         ...options, all: true, allowUnscopedAll: true, summaryOnly: true,
       });

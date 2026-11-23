@@ -42,12 +42,22 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../recovery/review-path-recovery.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
+import { ISSUE_MONITOR_STALE_CLAIM_MS } from "../task-watchdogs.js";
 import {
   normalizeIssueExecutionPolicy,
   buildIssueMonitorClearedPatch,
   parseIssueExecutionState,
   buildIssueMonitorTriggeredPatch,
 } from "../issue-execution-policy.js";
+import {
+  sanitizeIssueMonitorTrigger,
+  type IssueMonitorTrigger,
+} from "../issue-monitor-pull-requests.js";
+import {
+  createPullRequestMonitorPoller,
+  PULL_REQUEST_POLL_INTERVAL_MS,
+  type PullRequestMonitorPollerOptions,
+} from "../issue-monitor-pull-request-poller.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
 import { EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON } from "./run-state.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -76,7 +86,12 @@ export interface HeartbeatSchedulingDependencies
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: (fresh?: boolean) => Promise<{ suppressed: boolean }>;
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: Pick<PullRequestMonitorPollerOptions, "fetch" | "getToken" | "intervalMs">;
 }
+
+/** Why an issue monitor was dispatched; a pull request event is neither a person's check-now nor the due timer. */
+type IssueMonitorActivitySource = "manual" | "scheduled" | "pull_request_event";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -142,6 +157,7 @@ export function createHeartbeatScheduling(
     parseHeartbeatPolicy,
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
+    pullRequestPoll,
   } = dependencies;
 
   const issueMonitorDispatchColumns = {
@@ -223,7 +239,7 @@ export function createHeartbeatScheduling(
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     monitor: IssueExecutionMonitorPolicy | null;
-    source: "manual" | "scheduled";
+    source: IssueMonitorActivitySource;
   }) {
     return {
       identifier: input.claimed.identifier,
@@ -295,7 +311,7 @@ export function createHeartbeatScheduling(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -483,7 +499,7 @@ export function createHeartbeatScheduling(
     actorId: string;
     agentId: string | null;
     runId: string | null;
-    activitySource: "manual" | "scheduled";
+    activitySource: IssueMonitorActivitySource;
   }) {
     const recover = () => performIssueMonitorRecovery(input);
     if (input.recoveryPolicy === "wake_owner") {
@@ -652,7 +668,8 @@ export function createHeartbeatScheduling(
       agentId: string | null;
       runId: string | null;
       clearOnClientError: boolean;
-      activitySource: "manual" | "scheduled";
+      activitySource: IssueMonitorActivitySource;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -660,7 +677,10 @@ export function createHeartbeatScheduling(
     }
 
     const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
-    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + 1;
+    // An event-driven trigger is real work, not a poll, so it keeps the attempt count.
+    const trigger = input.trigger ? sanitizeIssueMonitorTrigger(input.trigger) : null;
+    const consumeAttempt = trigger === null;
+    const nextAttemptCount = (claimed.monitorAttemptCount ?? 0) + (consumeAttempt ? 1 : 0);
     const policy = normalizeIssueExecutionPolicy(
       claimed.executionPolicy ?? null,
     );
@@ -801,6 +821,7 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...(trigger ? { trigger } : {}),
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -816,7 +837,8 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
-            manualTrigger: input.activitySource === "manual",
+            ...(trigger ? { trigger } : {}),
+            manualTrigger: input.activitySource === "manual" && trigger === null,
           },
         });
         if (!wake) {
@@ -840,6 +862,7 @@ export function createHeartbeatScheduling(
             issue: claimed,
             policy,
             triggeredAt: input.now,
+            consumeAttempt,
           })),
           updatedAt: new Date(),
         })
@@ -864,6 +887,7 @@ export function createHeartbeatScheduling(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          ...(trigger ? { trigger } : {}),
           source: input.activitySource,
         },
       });
@@ -939,6 +963,7 @@ export function createHeartbeatScheduling(
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
+      trigger?: IssueMonitorTrigger | null;
     },
   ) {
     const now = input?.now ?? new Date();
@@ -981,7 +1006,7 @@ export function createHeartbeatScheduling(
       );
     }
 
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const claimed = await db.transaction(async (tx) => {
       await notifyStatusCardIssueChange(tx, issue.companyId);
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
@@ -1023,12 +1048,40 @@ export function createHeartbeatScheduling(
       agentId: input?.agentId ?? null,
       runId: input?.runId ?? null,
       clearOnClientError: false,
-      activitySource: "manual",
+      activitySource: input?.trigger ? "pull_request_event" : "manual",
+      trigger: input?.trigger ?? null,
     });
   }
 
+  const pullRequestMonitorPoller = createPullRequestMonitorPoller(db, {
+    ...pullRequestPoll,
+    triggerMonitor: (issueId, input) => triggerIssueMonitor(issueId, input),
+  });
+
+  async function tickPullRequestMonitors(now: Date) {
+    try {
+      return await pullRequestMonitorPoller.poll(now);
+    } catch (err) {
+      logger.error({ err }, "pull request monitor polling failed");
+      return { polled: 0, baselined: 0, woken: 0 };
+    }
+  }
+
+  // GitHub cannot notify this instance (no org webhooks), so pull requests are polled on the issue-monitor
+  // deadline: every interval while a monitor names one, and not at all otherwise, so an idle server stays quiet.
+  const pullRequestPollIntervalMs = pullRequestPoll?.intervalMs ?? PULL_REQUEST_POLL_INTERVAL_MS;
+  let pullRequestsWatched = false;
+  let lastPullRequestPollAt = 0;
+
+  async function pollPullRequestsIfDue(now: Date) {
+    if (now.getTime() - lastPullRequestPollAt < pullRequestPollIntervalMs) return;
+    const result = await tickPullRequestMonitors(now);
+    lastPullRequestPollAt = now.getTime();
+    if (result.watching !== undefined) pullRequestsWatched = result.watching > 0;
+  }
+
   async function tickDueIssueMonitors(now: Date, canContinue: () => boolean) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const staleClaimThreshold = new Date(now.getTime() - ISSUE_MONITOR_STALE_CLAIM_MS);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -1118,7 +1171,9 @@ export function createHeartbeatScheduling(
     if (!canContinue() || (await getSchedulingSuppression(true)).suppressed) {
       return { checked: 0, triggered: 0, skipped: 0 };
     }
-    return tickDueIssueMonitors(now, canContinue);
+    const result = await tickDueIssueMonitors(now, canContinue);
+    if (canContinue()) await pollPullRequestsIfDue(now);
+    return result;
   }
 
   async function nextIssueMonitorAt(): Promise<number | null> {
@@ -1131,7 +1186,10 @@ export function createHeartbeatScheduling(
         sql`${issues.assigneeAgentId} is not null`, inArray(issues.status, ["in_progress", "in_review"])));
 
 
-    return row?.at == null ? null : new Date(row.at).getTime();
+    const monitorAt = row?.at == null ? null : new Date(row.at).getTime();
+    if (!pullRequestsWatched) return monitorAt;
+    const pollAt = lastPullRequestPollAt + pullRequestPollIntervalMs;
+    return monitorAt === null ? pollAt : Math.min(monitorAt, pollAt);
   }
 
   async function recoverActiveSessionGoals() {
@@ -1387,6 +1445,7 @@ export function createHeartbeatScheduling(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    tickPullRequestMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   };

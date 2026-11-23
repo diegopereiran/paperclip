@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -678,6 +679,14 @@ async function streamLocalFileToSsh(input: {
       settled = true;
       source.destroy();
       ssh.kill("SIGTERM");
+      // A destination EPIPE usually means the remote script exited early; if
+      // it left a diagnostic on stderr, surface that instead of the bare
+      // EPIPE so the run log shows the real cause.
+      const remoteStderr = sshStderr.trim();
+      if ((error as NodeJS.ErrnoException).code === "EPIPE" && remoteStderr) {
+        reject(new Error(remoteStderr));
+        return;
+      }
       reject(error);
     };
 
@@ -686,6 +695,10 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    // pipe() does not forward destination errors: when the remote script exits
+    // early, the kernel answers our continued writes with EPIPE on ssh.stdin,
+    // which crashes the whole server process as an unhandled 'error' event.
+    ssh.stdin?.on("error", fail);
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -732,34 +745,66 @@ async function streamSshToLocalFile(input: {
       if (settled) return;
       settled = true;
       ssh.kill("SIGTERM");
+      // Destroy the sink so a stuck pipeline rejects instead of hanging;
+      // do not call sink.end() here — pipeline() owns the sink lifecycle.
       sink.destroy();
       reject(error);
     };
 
-    if (input.progress) {
-      input.progress.counter.on("error", fail);
-      ssh.stdout?.pipe(input.progress.counter).pipe(sink);
-    } else {
-      ssh.stdout?.pipe(sink);
-    }
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
     ssh.on("error", fail);
     sink.on("error", fail);
-    ssh.on("close", (code) => {
-      sink.end(() => {
-        if (settled) return;
-        settled = true;
-        if ((code ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
-          return;
-        }
-        resolve();
-      });
+
+    // Drain stdout through the (optional) progress counter with pipeline() so
+    // every byte lands in the sink before we resolve. The old
+    // pipe()+close→sink.end() shape could end the sink while the counter still
+    // held buffered chunks, truncating the bundle under backpressure.
+    const counter = input.progress?.counter;
+    if (counter) counter.on("error", fail);
+    const drained = ssh.stdout
+      ? (counter ? pipeline(ssh.stdout, counter, sink) : pipeline(ssh.stdout, sink))
+      : Promise.resolve();
+
+    // The child's exit code, resolved once it closes. A spawn "error" without a
+    // later "close" still unblocks settle(); fail() above already rejected.
+    const exitCodePromise = new Promise<number>((resolveExit) => {
+      ssh.on("error", () => resolveExit(-1));
+      ssh.on("close", (code) => resolveExit(code ?? 0));
     });
+
+    // Resolve only after BOTH the pipeline drained (sink finish) AND the
+    // child exited 0. Either side failing rejects; fail() above wins the race
+    // on transport errors via the settled flag.
+    const settle = async () => {
+      let drainError: Error | null = null;
+      try {
+        await drained;
+      } catch (error) {
+        drainError = error instanceof Error ? error : new Error(String(error));
+      }
+      const exitCode = await exitCodePromise;
+      if (settled) return;
+      settled = true;
+      if (drainError) {
+        ssh.kill("SIGTERM");
+        sink.destroy();
+        reject(drainError);
+        return;
+      }
+      if (exitCode !== 0) {
+        reject(new Error(sshStderr.trim() || `ssh exited with code ${exitCode}`));
+        return;
+      }
+      resolve();
+    };
+    void settle();
   }).finally(auth.cleanup);
 }
+
+/** Test-only. Drive the SSH download path with a caller-supplied progress counter. */
+export const streamSshToLocalFileForTest = streamSshToLocalFile;
 
 async function importGitWorkspaceToSsh(input: {
   spec: SshRemoteExecutionSpec;
@@ -845,6 +890,13 @@ async function importGitWorkspaceToSsh(input: {
   }
 }
 
+// Matches the fetch-side signature of a truncated bundle download: the
+// tail of the pack never arrived, so index-pack hits EOF while inflating.
+function isTruncatedBundleFetchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /early EOF|index-pack (died|failed)|did not end with a hash|not a bundle|unexpected end/i.test(message);
+}
+
 async function exportGitWorkspaceFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
@@ -871,33 +923,57 @@ async function exportGitWorkspaceFromSsh(input: {
 
     // The remote bundle size isn't known before streaming, so report bytes
     // received (MB mode) with a terminal completion line.
-    const progress = input.onProgress
-      ? createTransferProgress({
-        onProgress: input.onProgress,
-        phase: "Exporting git history",
-        direction: "from",
-        totalBytes: null,
-        estimated: false,
-      })
-      : null;
+    // Created fresh per attempt: pipeline() ends the counter it drains, so a
+    // retried stream needs a new one. Annotated (not inferred) so closure
+    // assignment doesn't narrow the later finish/fail calls to never.
+    let progress: TransferProgress | null | undefined;
+    const createProgress = () => {
+      progress = input.onProgress
+        ? createTransferProgress({
+          onProgress: input.onProgress,
+          phase: "Exporting git history",
+          direction: "from",
+          totalBytes: null,
+          estimated: false,
+        })
+        : null;
+      return progress ?? undefined;
+    };
 
     try {
-      await streamSshToLocalFile({
-        spec: input.spec,
-        remoteScript: exportScript,
-        localFile: bundlePath,
-        progress: progress ?? undefined,
-      });
+      // A truncated stream surfaces at fetch time as `fatal: early EOF` /
+      // `error: index-pack died`. `git bundle verify` cannot gate this — it
+      // only reads the ref header, so it reports "okay" on a truncated file.
+      // Re-stream once on that signature instead.
+      let retriedTruncatedFetch = false;
+      for (;;) {
+        await streamSshToLocalFile({
+          spec: input.spec,
+          remoteScript: exportScript,
+          localFile: bundlePath,
+          progress: createProgress(),
+        });
+        try {
+          await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
+            timeout: 60_000,
+            maxBuffer: 1024 * 1024,
+          });
+          break;
+        } catch (error) {
+          if (!retriedTruncatedFetch && isTruncatedBundleFetchError(error)) {
+            retriedTruncatedFetch = true;
+            // Close out this attempt's progress line before the retry replaces it.
+            await progress?.fail();
+            continue;
+          }
+          throw error;
+        }
+      }
       await progress?.finish();
     } catch (error) {
       await progress?.fail();
       throw error;
     }
-
-    await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {
         timeout: 60_000,
@@ -1488,9 +1564,19 @@ export async function syncDirectoryToSsh(input: {
       settled = true;
       tar.kill("SIGTERM");
       ssh.kill("SIGTERM");
+      // Prefer the remote diagnostic over a bare EPIPE (see
+      // streamLocalFileToSsh).
+      const remoteStderr = sshStderr.trim();
+      if ((error as NodeJS.ErrnoException).code === "EPIPE" && remoteStderr) {
+        reject(new Error(remoteStderr));
+        return;
+      }
       reject(error);
     };
 
+    // pipe() does not forward destination errors: an early ssh exit surfaces
+    // as EPIPE on ssh.stdin and would crash the server if left unhandled.
+    ssh.stdin?.on("error", fail);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1599,9 +1685,20 @@ export async function syncDirectoryFromSsh(input: {
         settled = true;
         ssh.kill("SIGTERM");
         tar.kill("SIGTERM");
+        // The EPIPE destination is the local tar, but the actual failure is
+        // usually the remote side (ssh stderr), so prefer that diagnostic
+        // over the bare EPIPE (see streamLocalFileToSsh).
+        const remoteStderr = sshStderr.trim();
+        if ((error as NodeJS.ErrnoException).code === "EPIPE" && remoteStderr) {
+          reject(new Error(remoteStderr));
+          return;
+        }
         reject(error);
       };
 
+      // pipe() does not forward destination errors: an early tar exit surfaces
+      // as EPIPE on tar.stdin and would crash the server if left unhandled.
+      tar.stdin?.on("error", fail);
       if (progress) {
         progress.counter.on("error", fail);
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);

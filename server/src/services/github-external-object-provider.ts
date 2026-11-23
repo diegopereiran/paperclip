@@ -125,7 +125,7 @@ function displayKeyFor(identity: Pick<GitHubObjectIdentity, "objectType">) {
   return identity.objectType === "pull_request" ? "GitHub Pull Request" : "GitHub Issue";
 }
 
-function retryAfterSeconds(response: Response) {
+export function retryAfterSeconds(response: Response) {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter && /^[0-9]+$/.test(retryAfter)) return Number(retryAfter);
 

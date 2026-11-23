@@ -65,6 +65,7 @@ export {
 import {
   createHeartbeatScheduling,
   formatIssueIdentifierLink,
+  type HeartbeatSchedulingDependencies,
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
@@ -781,6 +782,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
 >;
 
 export interface HeartbeatServiceOptions {
+  /** Test seam for the pull request polling fallback (GitHub transport and company token lookup). */
+  pullRequestPoll?: HeartbeatSchedulingDependencies["pullRequestPoll"];
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
@@ -1635,6 +1638,7 @@ export function heartbeatService(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    tickPullRequestMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   } = createHeartbeatScheduling(db, {
@@ -1650,6 +1654,7 @@ export function heartbeatService(
     parseHeartbeatPolicy,
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
+    pullRequestPoll: options.pullRequestPoll,
   });
 
   const {
@@ -4174,7 +4179,10 @@ export function heartbeatService(
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
     await cancelInvocationsForAgentsInternal(agentIds, reason, options);
-    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+    const runs = await db.select({
+      id: heartbeatRuns.id, status: heartbeatRuns.status, companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+    }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),
@@ -4504,6 +4512,7 @@ export function heartbeatService(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    tickPullRequestMonitors,
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),

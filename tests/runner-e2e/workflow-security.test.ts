@@ -77,8 +77,11 @@ describe("public repository paid workflow security", () => {
     expect(trustedWorkflowCalls[0]?.[1]).toBe(
       "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
     );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
-      ordinaryPrTrustedWorkflowRevision,
+    // Fork: pr.yml pins pr-trusted.yml to the release commit the patch queue is based on, so
+    // upstream master's workflow (which moves ahead of the release and can build targets this tree
+    // lacks) cannot break the fork's CI. Accept master or a full 40-hex commit SHA, nothing else.
+    expect(trustedWorkflowCalls[0]?.[2]).toMatch(
+      new RegExp(`^(?:${ordinaryPrTrustedWorkflowRevision}|[0-9a-f]{40})$`, "u"),
     );
   });
 

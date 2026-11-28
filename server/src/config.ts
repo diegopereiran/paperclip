@@ -91,6 +91,7 @@ export interface Config extends StorageConfig {
   nestedCloneMigrationEnabled: boolean;
   nestedCloneMigrationDryRun: boolean;
   workspaceReaperCooldownDays: number;
+  workspaceCleanupOnClose: boolean;
   workspaceCompactionDelayHours: number | null;
   skillVersionRetentionEnabled: boolean;
   skillVersionRetentionDryRun: boolean;
@@ -396,6 +397,9 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     nestedCloneMigrationEnabled: process.env.PAPERCLIP_NESTED_CLONE_MIGRATION_ENABLED === "true",
     nestedCloneMigrationDryRun: process.env.PAPERCLIP_NESTED_CLONE_MIGRATION_DRY_RUN === "true",
     workspaceReaperCooldownDays,
+    // Instance-wide, on unless an operator sets it to "false": every company
+    // inherits it, including companies created later.
+    workspaceCleanupOnClose: process.env.PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE !== "false",
     workspaceCompactionDelayHours,
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
     skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",

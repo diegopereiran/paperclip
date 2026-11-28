@@ -89,3 +89,16 @@ describe("workspace compaction config parsing", () => {
     expect(loadConfig().workspaceCompactionDelayHours).toBe(1);
   });
 });
+
+describe("workspace cleanup on close config", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("is on by default and off only for the value false", () => {
+    vi.stubEnv("PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE", undefined);
+    expect(loadConfig().workspaceCleanupOnClose).toBe(true);
+    vi.stubEnv("PAPERCLIP_WORKSPACE_CLEANUP_ON_CLOSE", "false");
+    expect(loadConfig().workspaceCleanupOnClose).toBe(false);
+  });
+});

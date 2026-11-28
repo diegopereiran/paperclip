@@ -1568,6 +1568,7 @@ async function startServerWithDatabaseTeardown(
         orphanGraceMs: config.taskDirectoryOrphanGraceDays * 24 * 60 * 60 * 1000,
       } : undefined,
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      cleanupOnClose: config.workspaceCleanupOnClose,
       workspaceCompactionDelayMs: config.workspaceCompactionDelayHours === null
         ? null
         : config.workspaceCompactionDelayHours * 60 * 60 * 1000,
